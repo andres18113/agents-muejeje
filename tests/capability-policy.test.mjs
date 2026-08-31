@@ -232,6 +232,26 @@ test("temporary settings are unique, task-free, and hook-enabled only for Bash p
   assert.match(payload.hooks.PreToolUse[0].hooks[0].command, /--policy task/);
 });
 
+test("runtime settings cleanup remains retryable after a removal failure", async () => {
+  let removalAttempts = 0;
+  const settings = await createRuntimeSettings(
+    { executionId: "retryable-cleanup", shellPolicy: "none", tempDirectory: "C:\\temp" },
+    {
+      mkdtempFn: async () => "C:\\temp\\claude-agents-retryable-cleanup-test",
+      writeFileFn: async () => {},
+      rmFn: async () => {
+        removalAttempts += 1;
+        if (removalAttempts === 1) throw new Error("temporary access denied");
+      }
+    }
+  );
+
+  await assert.rejects(settings.cleanup(), /temporary access denied/);
+  await settings.cleanup();
+  await settings.cleanup();
+  assert.equal(removalAttempts, 2, "only successful cleanup marks the settings as cleaned");
+});
+
 test("canonical roots use real paths, Git boundaries, and a deterministic non-Git fallback", async () => {
   assert.equal(
     canonicalRepositoryKey("C:\\Workspace\\Root", { platform: "win32" }),

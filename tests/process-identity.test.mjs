@@ -182,6 +182,30 @@ test("an abandoned identity query terminates the exact child and awaits its clos
   assert.equal(overflowed.status, PROCESS_IDENTITY_STATUS.AMBIGUOUS);
   assert.equal(overflowed.reason, "query-output-invalid");
   assert.equal(overflowed.queryTerminationProven, true);
+
+  // A kill-triggered ChildProcess error is diagnostic after abandonment. It
+  // must not cancel the bounded close wait and settle before close arrives.
+  const erroring = stubQueryChild();
+  const erroringResult = inspectProcessIdentity(4321, {
+    platform: "win32",
+    spawnProcess: () => erroring,
+    timeoutMs: 5,
+    terminationTimeoutMs: 5_000
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  let settled = false;
+  erroringResult.then(() => {
+    settled = true;
+  });
+  erroring.emit("error", new Error("kill reported an error"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "the abandoned query remains in its bounded close wait");
+  erroring.emit("close", 1);
+  const errored = await erroringResult;
+  assert.equal(errored.status, PROCESS_IDENTITY_STATUS.AMBIGUOUS);
+  assert.equal(errored.reason, "query-timeout");
+  assert.equal(errored.queryTerminationProven, true);
+  assert.equal(errored.queryError.message, "kill reported an error");
 });
 
 test("a healthy stubbed query is unaffected by the termination path", async () => {

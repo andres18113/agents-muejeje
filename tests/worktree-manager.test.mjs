@@ -742,6 +742,7 @@ test("Windows Git termination targets the exact PID tree and never a process nam
     platform: "win32",
     timeoutMs: 10,
     terminationTimeoutMs: 50,
+    inspectProcess: async (pid) => liveObservation(pid),
     spawnTerminator: (command, args, options) => {
       invocation = { command, args, options };
       return terminator;
@@ -775,6 +776,7 @@ test("Windows Git termination targets the exact PID tree and never a process nam
     platform: "win32",
     timeoutMs: 10,
     terminationTimeoutMs: 5_000,
+    inspectProcess: async (pid) => liveObservation(pid),
     spawnTerminator: () => {
       setImmediate(() => {
         closingTerminator.emit("close", 0);

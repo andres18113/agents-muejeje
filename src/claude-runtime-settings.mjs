@@ -87,8 +87,9 @@ export async function createRuntimeSettings(
       settingsPath,
       async cleanup() {
         if (cleaned) return;
-        cleaned = true;
         await rmFn(directory, { recursive: true, force: true });
+        // A failed removal is still live cleanup work and must remain retryable.
+        cleaned = true;
       }
     });
   } catch (error) {

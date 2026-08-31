@@ -191,12 +191,11 @@ function queryWindowsProcessStartTime(
         finish({
           status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
           reason,
-          queryTerminationProven: false
+          queryTerminationProven: false,
+          ...(abandoned?.error ? { queryError: abandoned.error } : {})
         });
       }, terminationTimeoutMs);
     };
-
-    queryTimer = schedule(() => abandonQuery("query-timeout"), timeoutMs);
 
     child.stdout?.on?.("data", (chunk) => {
       if (settled || abandoned) return;
@@ -208,7 +207,15 @@ function queryWindowsProcessStartTime(
       }
       stdout.push(buffer);
     });
-    child.once?.("error", () => {
+    child.once?.("error", (error) => {
+      if (settled) return;
+      if (abandoned) {
+        // child.kill() can itself cause ChildProcess to emit an error. The
+        // query is already abandoned, so that error is diagnostic only: the
+        // exact query child still gets its full bounded chance to close.
+        abandoned.error = error;
+        return;
+      }
       finish({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-process-error" });
     });
     child.once?.("close", (code) => {
@@ -218,7 +225,8 @@ function queryWindowsProcessStartTime(
         finish({
           status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
           reason: abandoned.reason,
-          queryTerminationProven: true
+          queryTerminationProven: true,
+          ...(abandoned.error ? { queryError: abandoned.error } : {})
         });
         return;
       }
@@ -241,6 +249,10 @@ function queryWindowsProcessStartTime(
         identity: Object.freeze({ pid, startTime, source: WINDOWS_IDENTITY_SOURCE })
       });
     });
+    // Arm the deadline only after every lifecycle listener is present. A
+    // deterministic scheduler may invoke a zero-delay callback immediately,
+    // and child.kill() is allowed to emit an error synchronously.
+    queryTimer = schedule(() => abandonQuery("query-timeout"), timeoutMs);
   });
 }
 

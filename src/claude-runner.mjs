@@ -13,6 +13,8 @@ import {
 } from "./process-identity.mjs";
 
 const STDERR_SUMMARY_BYTES = 16 * 1024;
+// A bounded proof-of-death grace used only once the absolute profile deadline
+// has elapsed (or for an earlier interruption's remaining profile budget).
 export const PROCESS_TREE_TERMINATION_TIMEOUT_MS = 5_000;
 export const MAX_CLAUDE_TIMEOUT_MS = 2_147_483_647;
 
@@ -29,6 +31,11 @@ export class ClaudeRunnerError extends Error {
     this.terminalProof = options.terminalProof;
     this.terminationResult = options.terminationResult;
     this.processStarted = options.processStarted;
+    // Cleanup is housekeeping evidence, not a replacement for the process
+    // outcome that caused it. Keeping both lets custody consume a close proof
+    // even when removing temporary settings later fails.
+    this.processOutcome = options.processOutcome;
+    this.cleanupFailure = options.cleanupFailure;
   }
 }
 
@@ -214,8 +221,15 @@ function createProcessIdentityCandidate({ child, executionId, agentType, reposit
   };
 }
 
-function finalizeProcessIdentity(candidate, processObservation) {
+function finalizeProcessIdentity(candidate, processObservation, terminalObserver) {
   if (!candidate) return undefined;
+  // The independent PID query can race a very short-lived child. Once the
+  // exact ChildProcess has reported exit or close, a later PID observation may
+  // already describe a reused PID, so it must never become durable ownership.
+  if (
+    terminalObserver?.getExitObservation?.() ||
+    terminalObserver?.getTerminalProof?.()
+  ) return undefined;
   if (processObservation?.status !== PROCESS_IDENTITY_STATUS.ALIVE) return undefined;
   let durableIdentity;
   try {
@@ -248,9 +262,18 @@ function finalizeProcessIdentity(candidate, processObservation) {
 export function observeClaudeChildTerminal(child, processIdentity, { now = Date.now } = {}) {
   let closeProof;
   let exitObservation;
+  let errorObservation;
   let resolveTerminal;
+  let resolveExit;
+  let resolveError;
   const terminalPromise = new Promise((resolve) => {
     resolveTerminal = resolve;
+  });
+  const exitPromise = new Promise((resolve) => {
+    resolveExit = resolve;
+  });
+  const errorPromise = new Promise((resolve) => {
+    resolveError = resolve;
   });
 
   const observe = (event, code, signal) => {
@@ -263,7 +286,10 @@ export function observeClaudeChildTerminal(child, processIdentity, { now = Date.
     });
     if (event === "exit") {
       // Diagnostic only. Never custody proof.
-      if (!exitObservation) exitObservation = observation;
+      if (!exitObservation) {
+        exitObservation = observation;
+        resolveExit(observation);
+      }
       return;
     }
     if (closeProof) return;
@@ -271,6 +297,19 @@ export function observeClaudeChildTerminal(child, processIdentity, { now = Date.
     resolveTerminal(observation);
   };
 
+  // This listener must be installed with exit/close immediately after spawn.
+  // It converts an asynchronous ENOENT-style spawn failure into controlled
+  // lifecycle evidence instead of an unhandled EventEmitter error.
+  child?.once?.("error", (error) => {
+    if (errorObservation) return;
+    errorObservation = Object.freeze({
+      processIdentity,
+      event: "error",
+      error,
+      observedAt: now()
+    });
+    resolveError(errorObservation);
+  });
   child?.once?.("close", (code, signal) => observe("close", code, signal));
   child?.once?.("exit", (code, signal) => observe("exit", code, signal));
   if (childIsAlreadyTerminal(child)) {
@@ -282,7 +321,10 @@ export function observeClaudeChildTerminal(child, processIdentity, { now = Date.
     getTerminalProof: () => closeProof,
     getCloseProof: () => closeProof,
     getExitObservation: () => exitObservation,
-    terminalPromise
+    getErrorObservation: () => errorObservation,
+    terminalPromise,
+    exitPromise,
+    errorPromise
   });
 }
 
@@ -313,6 +355,10 @@ function supervisedCloseProof(closeProof) {
  * event loop while the custody decision is still pending, which leaves the
  * lifecycle Promise permanently unsettled.
  */
+function remainingMs(deadlineAt, now) {
+  return Math.max(0, deadlineAt - now());
+}
+
 function waitForTerminalProof(
   terminalObserver,
   {
@@ -323,6 +369,7 @@ function waitForTerminalProof(
 ) {
   const alreadyTerminal = terminalObserver?.getTerminalProof?.();
   if (alreadyTerminal) return Promise.resolve(alreadyTerminal);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.resolve(undefined);
 
   return new Promise((resolve) => {
     let settled = false;
@@ -338,24 +385,9 @@ function waitForTerminalProof(
   });
 }
 
-/**
- * Waits for the terminator (taskkill) to settle within a bounded deadline.
- *
- * As with waitForTerminalProof, the deadline timer stays referenced: the
- * termination outcome feeds the proof-of-death decision, so the runtime must
- * remain alive until this bounded wait resolves.
- */
-function waitForTerminator(
-  terminator,
-  {
-    timeoutMs,
-    schedule = setTimeout,
-    cancelSchedule = clearTimeout
-  }
-) {
-  if (!terminator || typeof terminator.once !== "function") {
-    return Promise.resolve({ status: "spawn-failed" });
-  }
+function waitForPromiseUntil(promise, { deadlineAt, now, schedule, cancelSchedule }) {
+  const timeoutMs = remainingMs(deadlineAt, now);
+  if (timeoutMs <= 0) return Promise.resolve(Object.freeze({ timedOut: true }));
 
   return new Promise((resolve) => {
     let settled = false;
@@ -364,31 +396,154 @@ function waitForTerminator(
       if (settled) return;
       settled = true;
       cancelSchedule(timer);
-      resolve(result);
+      resolve(Object.freeze(result));
     };
-    timer = schedule(() => {
-      try {
-        terminator.kill?.();
-      } catch {
-        // The terminator may already have exited.
-      }
-      finish({ status: "timeout" });
-    }, timeoutMs);
-    terminator.once("error", (error) => finish({ status: "error", error }));
-    terminator.once("close", (code, signal) => {
-      finish({ status: code === 0 ? "completed" : "failed", code, signal });
-    });
+    timer = schedule(() => finish({ timedOut: true }), timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => finish({ value }),
+      (error) => finish({ error })
+    );
   });
+}
+
+function requestExactClaudeHandleTermination(child) {
+  let killError;
+  // terminateClaudeChild is also exported for direct use, where the caller
+  // may not yet have attached a stdin error listener.
+  child?.stdin?.once?.("error", () => {});
+  try {
+    child?.stdin?.end?.();
+  } catch {
+    // The stream may already be closed.
+  }
+  try {
+    child?.stdin?.destroy?.();
+  } catch {
+    // The stream may not expose destroy().
+  }
+  try {
+    if (typeof child?.kill !== "function") return Object.freeze({ requested: false });
+    child.kill();
+    return Object.freeze({ requested: true });
+  } catch (error) {
+    killError = error;
+  }
+  return Object.freeze({ requested: false, killError });
+}
+
+function createTerminatorWait(terminator, { deadlineAt, now, schedule, cancelSchedule }) {
+  if (!terminator || typeof terminator.once !== "function") {
+    const result = Object.freeze({ status: "spawn-failed" });
+    return Object.freeze({ getResult: () => result, cancel: () => result });
+  }
+
+  let settled = false;
+  let result;
+  let timer;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    result = Object.freeze(value);
+    cancelSchedule(timer);
+  };
+  const stop = (status) => {
+    if (settled) return result;
+    try {
+      terminator.kill?.();
+    } catch {
+      // The helper may already have exited.
+    }
+    finish({ status });
+    return result;
+  };
+
+  terminator.once("error", (error) => finish({ status: "error", error }));
+  terminator.once("close", (code, signal) => {
+    finish({ status: code === 0 ? "completed" : "failed", code, signal });
+  });
+  const timeoutMs = remainingMs(deadlineAt, now);
+  if (timeoutMs <= 0) stop("timeout");
+  else timer = schedule(() => stop("timeout"), timeoutMs);
+
+  return Object.freeze({ getResult: () => result, cancel: () => stop("cancelled") });
 }
 
 function terminalResult(status, method, terminalProof, extras = {}) {
   return Object.freeze({ status, method, terminalProof, ...extras });
 }
 
+async function compareBeforeTaskkill(
+  processIdentity,
+  { inspectProcess, deadlineAt, now, schedule, cancelSchedule }
+) {
+  const queryBudgetMs = remainingMs(deadlineAt, now);
+  if (queryBudgetMs <= 0) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-timeout"
+    });
+  }
+
+  const comparison = compareProcessIdentity(processIdentity, {
+    inspectProcess: (pid) => inspectProcess(pid, {
+      timeoutMs: queryBudgetMs,
+      terminationTimeoutMs: queryBudgetMs
+    })
+  });
+  const outcome = await waitForPromiseUntil(comparison, {
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  if (outcome.timedOut) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-timeout"
+    });
+  }
+  if (outcome.error || !outcome.value) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-failed"
+    });
+  }
+  return outcome.value;
+}
+
+async function terminateWithExactHandle(
+  child,
+  terminalObserver,
+  { deadlineAt, now, schedule, cancelSchedule, extras = {} }
+) {
+  // An `exit` is not terminal proof, but it does establish that the direct
+  // child handle is no longer live. Do not turn that diagnostic into another
+  // kill request; continue the bounded wait for its eventual `close` instead.
+  const request = terminalObserver?.getExitObservation?.()
+    ? Object.freeze({ requested: false, alreadyExited: true })
+    : requestExactClaudeHandleTermination(child);
+  const proof = await waitForTerminalProof(terminalObserver, {
+    timeoutMs: remainingMs(deadlineAt, now),
+    schedule,
+    cancelSchedule
+  });
+  if (proof) return terminalResult("terminated", "child-kill", proof, extras);
+  return terminalResult(
+    request.killError || (!request.requested && !request.alreadyExited)
+      ? "termination-failed"
+      : "termination-unproven",
+    "child-kill",
+    undefined,
+    { ...extras, ...(request.killError ? { error: request.killError } : {}) }
+  );
+}
+
 /**
  * Requests termination of exactly the supplied ChildProcess and waits for
- * bounded, identity-bound terminal evidence. Starting taskkill is never
- * considered proof that the Claude child died.
+ * bounded terminal evidence. `taskkill` is a PID-tree operation, so only a
+ * fresh SAME_PROCESS comparison immediately before it may authorize it. If
+ * identity is absent, dead, reused, or ambiguous, the exact in-memory handle
+ * is the only safe termination request.
  */
 export async function terminateClaudeChild(
   child,
@@ -400,7 +555,8 @@ export async function terminateClaudeChild(
     terminationTimeoutMs = PROCESS_TREE_TERMINATION_TIMEOUT_MS,
     terminalObserver = observeClaudeChildTerminal(child, undefined),
     processIdentity,
-    inspectProcess = inspectProcessIdentity
+    inspectProcess = inspectProcessIdentity,
+    now = Date.now
   } = {}
 ) {
   if (!runtimeTimeoutIsValid(terminationTimeoutMs)) {
@@ -426,90 +582,95 @@ export async function terminateClaudeChild(
     return terminalResult("already-terminal", "none", existingProof);
   }
 
+  const terminationDeadlineAt = now() + terminationTimeoutMs;
   const validPid = Number.isSafeInteger(child?.pid) && child.pid > 0;
-  if (platform === "win32" && validPid) {
-    const identityMatch = processIdentity
-      ? await compareProcessIdentity(processIdentity, { inspectProcess })
-      : Object.freeze({
-          status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
-          reason: "process-identity-unavailable"
-        });
-    if (identityMatch.status !== PROCESS_IDENTITY_MATCH.SAME_PROCESS) {
-      const proof = await waitForTerminalProof(terminalObserver, {
-        timeoutMs: terminationTimeoutMs,
-        schedule,
-        cancelSchedule
-      });
-      return proof
-        ? terminalResult("already-terminal", "identity-check", proof, {
-            identityStatus: identityMatch.status
-          })
-        : terminalResult("termination-unproven", "identity-check", undefined, {
-            identityStatus: identityMatch.status,
-            reason: identityMatch.reason || "process-identity-not-live"
-          });
-    }
-
-    let terminator;
-    try {
-      terminator = spawnTerminator(
-        "taskkill",
-        ["/PID", String(child.pid), "/T", "/F"],
-        { shell: false, windowsHide: true, stdio: "ignore" }
-      );
-    } catch (error) {
-      const proof = await waitForTerminalProof(terminalObserver, {
-        timeoutMs: terminationTimeoutMs,
-        schedule,
-        cancelSchedule
-      });
-      return proof
-        ? terminalResult("terminated", "taskkill", proof, { taskkillStatus: "spawn-threw" })
-        : terminalResult("termination-failed", "taskkill", undefined, {
-            taskkillStatus: "spawn-threw",
-            error
-          });
-    }
-
-    const taskkillResult = await waitForTerminator(terminator, {
-      timeoutMs: terminationTimeoutMs,
+  if (platform !== "win32" || !validPid) {
+    return await terminateWithExactHandle(child, terminalObserver, {
+      deadlineAt: terminationDeadlineAt,
+      now,
       schedule,
       cancelSchedule
     });
-    const proof = await waitForTerminalProof(terminalObserver, {
-      timeoutMs: terminationTimeoutMs,
-      schedule,
-      cancelSchedule
-    });
-    if (proof) {
-      return terminalResult(
-        taskkillResult.status === "completed" ? "terminated" : "already-terminal",
-        "taskkill",
-        proof,
-        { taskkillStatus: taskkillResult.status }
-      );
-    }
-    return terminalResult(
-      taskkillResult.status === "completed" ? "termination-unproven" : "termination-failed",
-      "taskkill",
-      undefined,
-      { taskkillStatus: taskkillResult.status }
-    );
   }
 
-  let killFailed = false;
-  try {
-    child?.kill?.();
-  } catch {
-    killFailed = true;
+  if (!processIdentity) {
+    return await terminateWithExactHandle(child, terminalObserver, {
+      deadlineAt: terminationDeadlineAt,
+      now,
+      schedule,
+      cancelSchedule,
+      extras: {
+        identityStatus: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+        reason: "process-identity-unavailable"
+      }
+    });
   }
-  const proof = await waitForTerminalProof(terminalObserver, {
-    timeoutMs: terminationTimeoutMs,
+
+  const identityMatch = await compareBeforeTaskkill(processIdentity, {
+    inspectProcess,
+    deadlineAt: terminationDeadlineAt,
+    now,
     schedule,
     cancelSchedule
   });
-  if (proof) return terminalResult("terminated", "child-kill", proof);
-  return terminalResult(killFailed ? "termination-failed" : "termination-unproven", "child-kill");
+  if (identityMatch.status !== PROCESS_IDENTITY_MATCH.SAME_PROCESS) {
+    return await terminateWithExactHandle(child, terminalObserver, {
+      deadlineAt: terminationDeadlineAt,
+      now,
+      schedule,
+      cancelSchedule,
+      extras: {
+        identityStatus: identityMatch.status,
+        ...(identityMatch.reason ? { reason: identityMatch.reason } : {})
+      }
+    });
+  }
+
+  // No await follows the comparison before taskkill: it is the final identity
+  // check for this PID-based operation.
+  let terminator;
+  try {
+    terminator = spawnTerminator(
+      "taskkill",
+      ["/PID", String(child.pid), "/T", "/F"],
+      { shell: false, windowsHide: true, stdio: "ignore" }
+    );
+  } catch (error) {
+    return await terminateWithExactHandle(child, terminalObserver, {
+      deadlineAt: terminationDeadlineAt,
+      now,
+      schedule,
+      cancelSchedule,
+      extras: { taskkillStatus: "spawn-threw", error }
+    });
+  }
+
+  const taskkill = createTerminatorWait(terminator, {
+    deadlineAt: terminationDeadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  const proof = await waitForTerminalProof(terminalObserver, {
+    timeoutMs: remainingMs(terminationDeadlineAt, now),
+    schedule,
+    cancelSchedule
+  });
+  const taskkillResult = taskkill.getResult() || taskkill.cancel();
+  if (proof) {
+    return terminalResult(
+      taskkillResult?.status === "completed" ? "terminated" : "already-terminal",
+      "taskkill",
+      proof,
+      { taskkillStatus: taskkillResult?.status || "cancelled" }
+    );
+  }
+  return terminalResult(
+    taskkillResult?.status === "completed" ? "termination-unproven" : "termination-failed",
+    "taskkill",
+    undefined,
+    { taskkillStatus: taskkillResult?.status || "timeout" }
+  );
 }
 
 function attachLifecycle(error, lifecycle) {
@@ -518,6 +679,8 @@ function attachLifecycle(error, lifecycle) {
   if (lifecycle.terminalProof) error.terminalProof = lifecycle.terminalProof;
   if (lifecycle.terminationResult) error.terminationResult = lifecycle.terminationResult;
   if (lifecycle.processStarted !== undefined) error.processStarted = lifecycle.processStarted;
+  if (lifecycle.processOutcome !== undefined) error.processOutcome = lifecycle.processOutcome;
+  if (lifecycle.cleanupFailure !== undefined) error.cleanupFailure = lifecycle.cleanupFailure;
   return error;
 }
 
@@ -539,17 +702,28 @@ async function cleanupSettings(settings, startedAt, now, pid, processStarted) {
   }
 }
 
-async function cleanupThenThrow({ settings, startedAt, now, pid, error }) {
+function attachCleanupEvidence(cleanupError, originalError, lifecycle = {}) {
+  const terminalProof =
+    originalError?.terminalProof || lifecycle.terminalObserver?.getTerminalProof?.();
+  const processOutcome = originalError || Object.freeze({ status: "completed" });
+  return attachLifecycle(cleanupError, {
+    processIdentity: originalError?.processIdentity || lifecycle.processIdentity,
+    terminalProof,
+    terminationResult: originalError?.terminationResult || lifecycle.terminationResult,
+    processStarted:
+      originalError?.processStarted !== undefined
+        ? originalError.processStarted
+        : lifecycle.processStarted,
+    processOutcome,
+    cleanupFailure: cleanupError.cause || cleanupError
+  });
+}
+
+async function cleanupThenThrow({ settings, startedAt, now, pid, error, lifecycle }) {
   try {
     await cleanupSettings(settings, startedAt, now, pid, error?.processStarted);
   } catch (cleanupError) {
-    if (error?.code === "claude_termination_unproven") throw error;
-    throw attachLifecycle(cleanupError, {
-      processIdentity: error?.processIdentity,
-      terminalProof: error?.terminalProof,
-      terminationResult: error?.terminationResult,
-      processStarted: error?.processStarted
-    });
+    throw attachCleanupEvidence(cleanupError, error, lifecycle);
   }
   throw error;
 }
@@ -563,27 +737,50 @@ async function terminateStartedChild({
   onTerminationStarted,
   terminationTimeoutMs,
   inspectProcess,
-  now
+  now,
+  schedule,
+  cancelSchedule
 }) {
   let transitionError;
   if (processIdentity && onTerminationStarted) {
     try {
-      await onTerminationStarted(processIdentity);
+      // Begin the durable transition before requesting termination, but never
+      // await an arbitrary callback indefinitely while the child remains live.
+      Promise.resolve(onTerminationStarted(processIdentity)).catch((error) => {
+        transitionError = error;
+      });
     } catch (error) {
       transitionError = error;
     }
   }
 
+  const terminationDeadlineAt = now() + terminationTimeoutMs;
+  const pendingTermination = Promise.resolve().then(() => terminateChild(child, {
+    processIdentity,
+    terminalObserver,
+    terminationTimeoutMs,
+    inspectProcess,
+    now,
+    schedule,
+    cancelSchedule
+  }));
+  const terminationOutcome = await waitForPromiseUntil(pendingTermination, {
+    deadlineAt: terminationDeadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
   let terminationResult;
-  try {
-    terminationResult = await terminateChild(child, {
-      processIdentity,
-      terminalObserver,
-      terminationTimeoutMs,
-      inspectProcess
+  if (terminationOutcome.timedOut) {
+    terminationResult = terminalResult("termination-unproven", "none", undefined, {
+      reason: "termination-timeout"
     });
-  } catch (error) {
-    terminationResult = terminalResult("termination-unproven", "none", undefined, { error });
+  } else if (terminationOutcome.error) {
+    terminationResult = terminalResult("termination-unproven", "none", undefined, {
+      error: terminationOutcome.error
+    });
+  } else {
+    terminationResult = terminationOutcome.value;
   }
 
   const terminalProof = terminationResult?.terminalProof || terminalObserver.getTerminalProof?.();
@@ -640,8 +837,11 @@ export async function runClaudeAgent({
   terminateChild = terminateClaudeChild,
   inspectProcess = inspectProcessIdentity,
   terminationTimeoutMs = PROCESS_TREE_TERMINATION_TIMEOUT_MS,
-  now = Date.now
+  now = Date.now,
+  schedule = setTimeout,
+  cancelSchedule = clearTimeout
 }) {
+  const invocationStartedAt = now();
   if (typeof prompt !== "string" || prompt.length === 0) {
     throw new ClaudeRunnerError("Claude prompt must be a non-empty string.", {
       code: "invalid_prompt"
@@ -692,22 +892,59 @@ export async function runClaudeAgent({
   }
   validateRuntimePolicy(runtime);
 
-  const startedAt = now();
-  let settings;
-  try {
-    settings = await createSettings({
-      executionId,
-      shellPolicy: runtime.shellPolicy
-    });
-  } catch (error) {
-    const settingsError = error instanceof ClaudeRuntimeSettingsError
-      ? error
-      : new ClaudeRuntimeSettingsError(String(error), { cause: error });
+  const startedAt = invocationStartedAt;
+  const deadlineAt = startedAt + runtime.timeoutMs;
+  const durationMs = () => Math.max(0, now() - startedAt);
+  const profileTimeoutBeforeSpawn = () => new ClaudeTimeoutError(runtime.timeoutMs, {
+    durationMs: durationMs(),
+    processStarted: false
+  });
+
+  const settingsPromise = Promise.resolve().then(() => createSettings({
+    executionId,
+    shellPolicy: runtime.shellPolicy
+  }));
+  const settingsOutcome = await waitForPromiseUntil(settingsPromise, {
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  if (settingsOutcome.timedOut) {
+    // A late settings result must still clean itself up, but it can never make
+    // the invocation wait beyond the one profile deadline.
+    void settingsPromise.then(
+      async (lateSettings) => {
+        try {
+          await lateSettings?.cleanup?.();
+        } catch {
+          // The timed-out invocation has already reported its bounded result.
+        }
+      },
+      () => {}
+    );
+    throw profileTimeoutBeforeSpawn();
+  }
+  if (settingsOutcome.error) {
+    const settingsError = settingsOutcome.error instanceof ClaudeRuntimeSettingsError
+      ? settingsOutcome.error
+      : new ClaudeRuntimeSettingsError(String(settingsOutcome.error), { cause: settingsOutcome.error });
     throw new ClaudeRunnerError(settingsError.message, {
       code: settingsError.code || "claude_runtime_settings_failed",
       cause: settingsError,
-      durationMs: Math.max(0, now() - startedAt),
+      durationMs: durationMs(),
       processStarted: false
+    });
+  }
+  const settings = settingsOutcome.value;
+  if (remainingMs(deadlineAt, now) <= 0) {
+    await cleanupThenThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      error: profileTimeoutBeforeSpawn(),
+      lifecycle: { processStarted: false }
     });
   }
 
@@ -715,12 +952,24 @@ export async function runClaudeAgent({
   try {
     args = buildClaudeArgs(runtime, settings.settingsPath);
   } catch (error) {
-    try {
-      await cleanupSettings(settings, startedAt, now, undefined, false);
-    } catch (cleanupError) {
-      throw cleanupError;
-    }
-    throw attachLifecycle(error, { processStarted: false });
+    await cleanupThenThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      error: attachLifecycle(error, { processStarted: false }),
+      lifecycle: { processStarted: false }
+    });
+  }
+  if (remainingMs(deadlineAt, now) <= 0) {
+    await cleanupThenThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      error: profileTimeoutBeforeSpawn(),
+      lifecycle: { processStarted: false }
+    });
   }
 
   let child;
@@ -733,17 +982,23 @@ export async function runClaudeAgent({
       stdio: ["pipe", "pipe", "pipe"]
     });
   } catch (error) {
-    await cleanupSettings(settings, startedAt, now, undefined, false);
-    throw new ClaudeRunnerError(
+    await cleanupThenThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      lifecycle: { processStarted: false },
+      error: new ClaudeRunnerError(
       "Failed to launch '" + runtime.claudeBin + "'. Ensure Claude Code is on PATH. " +
         (error instanceof Error ? error.message : String(error)),
       {
         code: "claude_spawn_failed",
         cause: error,
-        durationMs: now() - startedAt,
+        durationMs: durationMs(),
         processStarted: false
       }
-    );
+      )
+    });
   }
 
   const processIdentityCandidate = createProcessIdentityCandidate({
@@ -754,16 +1009,32 @@ export async function runClaudeAgent({
     now
   });
   const terminalObserver = observeClaudeChildTerminal(child, processIdentityCandidate, { now });
-  let processObservation;
-  try {
-    processObservation = await inspectProcess(child?.pid);
-  } catch {
-    processObservation = Object.freeze({
-      status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
-      reason: "inspection-threw"
-    });
-  }
-  const processIdentity = finalizeProcessIdentity(processIdentityCandidate, processObservation);
+  // Stdio can also report an asynchronous failure while identity is being
+  // established or while an identity-less child is being stopped. Record it
+  // immediately so an input close/destroy cannot surface as an unhandled
+  // EventEmitter error before normal capture listeners are installed.
+  let preflightStdinError;
+  let preflightStdoutError;
+  let preflightStderrError;
+  child.stdin?.once?.("error", (error) => {
+    preflightStdinError = error;
+  });
+  child.stdout?.once?.("error", (error) => {
+    preflightStdoutError = error;
+  });
+  child.stderr?.once?.("error", (error) => {
+    preflightStderrError = error;
+  });
+  let processIdentity;
+  const terminationTimeoutForCurrentPhase = () => {
+    const remaining = remainingMs(deadlineAt, now);
+    // Before the main deadline, termination consumes only its remaining
+    // profile budget. At or after it, this is the explicit small safety grace
+    // used solely to obtain close proof after a forced stop.
+    return remaining > 0
+      ? Math.max(1, Math.min(terminationTimeoutMs, remaining))
+      : terminationTimeoutMs;
+  };
   const stopAndBuildError = async (originalError) =>
     terminateStartedChild({
       child,
@@ -772,50 +1043,178 @@ export async function runClaudeAgent({
       originalError,
       terminateChild,
       onTerminationStarted,
-      terminationTimeoutMs,
+      terminationTimeoutMs: terminationTimeoutForCurrentPhase(),
       inspectProcess,
-      now
+      now,
+      schedule,
+      cancelSchedule
     });
 
-  if (!processIdentity) {
+  const identityInspection = Promise.resolve()
+    .then(() => inspectProcess(child?.pid))
+    .then(
+      (observation) => ({ kind: "identity", observation }),
+      () => ({
+        kind: "identity",
+        observation: Object.freeze({
+          status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
+          reason: "inspection-threw"
+        })
+      })
+    );
+  const identityLifecycle = Promise.race([
+    identityInspection,
+    terminalObserver.errorPromise.then((observation) => ({ kind: "error", observation })),
+    terminalObserver.exitPromise.then((observation) => ({ kind: "exit", observation })),
+    terminalObserver.terminalPromise.then((observation) => ({ kind: "close", observation }))
+  ]);
+  const identityOutcome = await waitForPromiseUntil(identityLifecycle, {
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+
+  const lifecycle = { processIdentity, terminalObserver, processStarted: true };
+  const identityUnavailable = () => new ClaudeRunnerError(
+    "Claude process did not provide a valid child PID.",
+    {
+      code: "claude_process_identity_unavailable",
+      durationMs: durationMs(),
+      pid: child?.pid,
+      processStarted: true
+    }
+  );
+  const spawnFailure = (error) => new ClaudeRunnerError(
+    "Failed to launch '" + runtime.claudeBin + "'. Ensure Claude Code is on PATH. " +
+      (error instanceof Error ? error.message : String(error)),
+    {
+      code: "claude_spawn_failed",
+      cause: error,
+      durationMs: durationMs(),
+      pid: child?.pid,
+      processStarted: Number.isSafeInteger(child?.pid) && child.pid > 0
+    }
+  );
+
+  if (identityOutcome.timedOut) {
+    const error = await stopAndBuildError(new ClaudeTimeoutError(runtime.timeoutMs));
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (identityOutcome.error) {
     const error = await stopAndBuildError(
-      new ClaudeRunnerError("Claude process did not provide a valid child PID.", {
+      new ClaudeRunnerError("Claude identity establishment failed: " + String(identityOutcome.error), {
         code: "claude_process_identity_unavailable",
-        durationMs: Math.max(0, now() - startedAt),
+        durationMs: durationMs(),
         pid: child?.pid,
         processStarted: true
       })
     );
-    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error });
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (identityOutcome.value?.kind === "error") {
+    const error = spawnFailure(identityOutcome.value.observation.error);
+    if (error.processStarted === false) {
+      await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+    }
+    const stopped = await stopAndBuildError(error);
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error: stopped, lifecycle });
+  }
+  if (identityOutcome.value?.kind === "exit" || identityOutcome.value?.kind === "close") {
+    const error = await stopAndBuildError(
+      identityUnavailable()
+    );
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
   }
 
-  try {
-    await onChildStarted?.(processIdentity);
-  } catch (callbackError) {
+  processIdentity = finalizeProcessIdentity(
+    processIdentityCandidate,
+    identityOutcome.value?.observation,
+    terminalObserver
+  );
+  if (!processIdentity) {
     const error = await stopAndBuildError(
-      new ClaudeRunnerError("Claude child-start lifecycle callback failed: " + callbackError.message, {
+      identityUnavailable()
+    );
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  lifecycle.processIdentity = processIdentity;
+
+  const activation = Promise.resolve()
+    .then(() => onChildStarted?.(processIdentity))
+    .then(
+      () => ({ kind: "activated" }),
+      (error) => ({ kind: "activation-error", error })
+    );
+  const activationOutcome = await waitForPromiseUntil(
+    Promise.race([
+      activation,
+      terminalObserver.errorPromise.then((observation) => ({ kind: "error", observation }))
+    ]),
+    { deadlineAt, now, schedule, cancelSchedule }
+  );
+  if (activationOutcome.timedOut) {
+    const error = await stopAndBuildError(new ClaudeTimeoutError(runtime.timeoutMs));
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (activationOutcome.error) {
+    const error = await stopAndBuildError(
+      new ClaudeRunnerError("Claude child-start lifecycle callback failed: " + String(activationOutcome.error), {
         code: "claude_lifecycle_callback_failed",
-        cause: callbackError,
-        durationMs: Math.max(0, now() - startedAt),
-        pid: child.pid,
+        cause: activationOutcome.error,
+        durationMs: durationMs(),
+        pid: child?.pid,
         processIdentity,
         processStarted: true
       })
     );
-    await cleanupThenThrow({ settings, startedAt, now, pid: child.pid, error });
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (activationOutcome.value?.kind === "error") {
+    const error = spawnFailure(activationOutcome.value.observation.error);
+    const stopped = error.processStarted === false ? error : await stopAndBuildError(error);
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error: stopped, lifecycle });
+  }
+  if (activationOutcome.value?.kind === "activation-error") {
+    const callbackError = activationOutcome.value.error;
+    const error = await stopAndBuildError(
+      new ClaudeRunnerError("Claude child-start lifecycle callback failed: " +
+        (callbackError instanceof Error ? callbackError.message : String(callbackError)), {
+        code: "claude_lifecycle_callback_failed",
+        cause: callbackError,
+        durationMs: durationMs(),
+        pid: child?.pid,
+        processIdentity,
+        processStarted: true
+      })
+    );
+    await cleanupThenThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
   }
 
   if (!child.stdin || !child.stdout || !child.stderr) {
     const error = await stopAndBuildError(
       new ClaudeRunnerError("Claude process did not expose the required stdio streams.", {
         code: "claude_stdio_unavailable",
-        durationMs: Math.max(0, now() - startedAt),
+        durationMs: durationMs(),
         pid: child.pid,
         processIdentity,
         processStarted: true
       })
     );
-    await cleanupThenThrow({ settings, startedAt, now, pid: child.pid, error });
+    await cleanupThenThrow({ settings, startedAt, now, pid: child.pid, error, lifecycle });
+  }
+
+  if (terminalObserver.getExitObservation?.() && !terminalObserver.getTerminalProof?.()) {
+    const error = await stopAndBuildError(
+      new ClaudeRunnerError("Claude exited before accepting its prompt.", {
+        code: "claude_exited_before_ready",
+        durationMs: durationMs(),
+        pid: child.pid,
+        processIdentity,
+        processStarted: true
+      })
+    );
+    await cleanupThenThrow({ settings, startedAt, now, pid: child.pid, error, lifecycle });
   }
 
   return await new Promise((resolve, reject) => {
@@ -824,7 +1223,7 @@ export async function runClaudeAgent({
     let capturedBytes = 0;
     let settled = false;
     let stoppingPromise;
-    let pendingStdinError;
+    let pendingStdinError = preflightStdinError;
     let timer;
 
     const durationMs = () => Math.max(0, now() - startedAt);
@@ -836,7 +1235,7 @@ export async function runClaudeAgent({
     const settle = (error, value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cancelSchedule(timer);
       if (error && error.durationMs === undefined) {
         error.durationMs = durationMs();
       }
@@ -850,14 +1249,9 @@ export async function runClaudeAgent({
           else resolve(value);
         },
         (cleanupError) => {
-          if (error?.code === "claude_termination_unproven") {
-            reject(error);
-            return;
-          }
-          reject(attachLifecycle(cleanupError, {
-            processIdentity: error?.processIdentity || processIdentity,
-            terminalProof: error?.terminalProof,
-            terminationResult: error?.terminationResult,
+          reject(attachCleanupEvidence(cleanupError, error, {
+            processIdentity,
+            terminalObserver,
             processStarted: true
           }));
         }
@@ -914,12 +1308,12 @@ export async function runClaudeAgent({
         pendingStdinError = error;
       }
     });
-    child.on("error", (error) => {
+    terminalObserver.errorPromise.then((observation) => {
       finishAfterForcedTermination(
         new ClaudeRunnerError(
           "Failed to launch '" + runtime.claudeBin + "'. Ensure Claude Code is on PATH. " +
-            error.message,
-          { code: "claude_spawn_failed", cause: error, ...diagnostics() }
+            (observation.error instanceof Error ? observation.error.message : String(observation.error)),
+          { code: "claude_spawn_failed", cause: observation.error, ...diagnostics() }
         )
       );
     });
@@ -975,12 +1369,36 @@ export async function runClaudeAgent({
     };
     child.on("close", handleClose);
 
-    timer = setTimeout(() => {
+    timer = schedule(() => {
       finishAfterForcedTermination(new ClaudeTimeoutError(runtime.timeoutMs, diagnostics()));
-    }, runtime.timeoutMs);
+    }, remainingMs(deadlineAt, now));
+
+    if (preflightStdoutError) {
+      finishAfterForcedTermination(
+        new ClaudeRunnerError("Claude stdout failed: " + preflightStdoutError.message, {
+          code: "claude_stdout_failed",
+          cause: preflightStdoutError,
+          ...diagnostics()
+        })
+      );
+    } else if (preflightStderrError) {
+      finishAfterForcedTermination(
+        new ClaudeRunnerError("Claude stderr failed: " + preflightStderrError.message, {
+          code: "claude_stderr_failed",
+          cause: preflightStderrError,
+          ...diagnostics()
+        })
+      );
+    }
 
     const priorCloseProof = terminalObserver.getCloseProof?.();
     if (priorCloseProof) {
+      // Readable streams can still flush their already-buffered diagnostics on
+      // the next turn after ChildProcess close. Keep close as the proof while
+      // allowing those bounded buffers to reach the diagnostic capture first.
+      // The process is already terminal, so the profile deadline no longer
+      // governs this one event-loop turn of diagnostic delivery.
+      cancelSchedule(timer);
       setImmediate(() => handleClose(priorCloseProof.code, priorCloseProof.signal));
     } else {
       try {

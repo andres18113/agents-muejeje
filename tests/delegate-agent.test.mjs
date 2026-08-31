@@ -1500,6 +1500,183 @@ test("runtime settings failures fail closed before Claude spawn and spawn failur
   assert.equal(malformedSettingsCleanup, 1);
 });
 
+test("Claude arms asynchronous ChildProcess spawn errors before identity inspection", async () => {
+  const child = createFakeChild();
+  child.pid = undefined;
+  const pending = runClaudeAgent({
+    prompt: "async spawn failure",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    createSettings: fakeSettings(),
+    spawnProcess: () => {
+      process.nextTick(() => child.emit("error", new Error("ENOENT")));
+      return child;
+    },
+    inspectProcess: async () => new Promise(() => {})
+  });
+
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_spawn_failed");
+    assert.equal(error.processStarted, false);
+    return true;
+  });
+});
+
+test("identity-unavailable Claude termination uses the exact handle, never PID-only taskkill", async () => {
+  const child = createFakeChild({ pid: 67_891 });
+  let taskkillCalled = false;
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "ambiguous identity",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 1_000 }),
+      createSettings: fakeSettings(),
+      spawnProcess: () => child,
+      inspectProcess: async () => ({ status: "ambiguous", reason: "denied" }),
+      terminateChild: (target, options) => terminateClaudeChild(target, {
+        ...options,
+        platform: "win32",
+        spawnTerminator() {
+          taskkillCalled = true;
+          throw new Error("taskkill must not receive an identity-less PID");
+        }
+      })
+    }),
+    (error) => {
+      assert.equal(error.code, "claude_process_identity_unavailable");
+      assert.equal(error.terminalProof.supervisedByCoordinator, true);
+      return true;
+    }
+  );
+  assert.equal(child.killCalls, 1);
+  assert.equal(taskkillCalled, false);
+});
+
+test("an exit during identity capture cannot become a durable Claude identity", async () => {
+  const child = createFakeChild({ closeOnKill: false, pid: 67_892 });
+  let resolveInspection;
+  const inspection = new Promise((resolve) => {
+    resolveInspection = resolve;
+  });
+  let activated = false;
+  const pending = runClaudeAgent({
+    prompt: "identity race",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    inspectProcess: async () => await inspection,
+    onChildStarted() {
+      activated = true;
+    },
+    terminateChild: terminateFakeChild
+  });
+
+  await afterRunnerStarts();
+  child.emit("exit", 0, null);
+  resolveInspection({
+    status: "alive",
+    identity: { pid: child.pid, startTime: "6789200", source: "test-process-start" }
+  });
+  child.emit("close", 0, null);
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_process_identity_unavailable");
+    assert.equal(error.processIdentity, undefined);
+    assert.equal(error.terminalProof.supervisedByCoordinator, true);
+    return true;
+  });
+  assert.equal(activated, false);
+});
+
+test("profile deadlines include identity and durable activation setup", async () => {
+  const stalledIdentityChild = createFakeChild();
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "identity deadline",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 15 }),
+      createSettings: fakeSettings(),
+      spawnProcess: () => stalledIdentityChild,
+      inspectProcess: async () => await new Promise(() => {}),
+      terminateChild: terminateFakeChild
+    }),
+    ClaudeTimeoutError
+  );
+  assert.equal(stalledIdentityChild.killCalls, 1);
+
+  const stalledActivationChild = createFakeChild();
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "activation deadline",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 15 }),
+      createSettings: fakeSettings(),
+      spawnProcess: () => stalledActivationChild,
+      onChildStarted: async () => await new Promise(() => {}),
+      terminateChild: terminateFakeChild
+    }),
+    ClaudeTimeoutError
+  );
+  assert.equal(stalledActivationChild.killCalls, 1);
+});
+
+test("settings cleanup failure preserves close proof and releases writer custody", async () => {
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ pid: 67_893 });
+  const runtime = writerRuntime(1_000);
+  const outcome = await delegateAgent(
+    { agentType: "task", task: "cleanup evidence", cwd: projectRoot },
+    {
+      writeCustody: custody,
+      createExecutionId: () => "cleanup-evidence",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        createSettings: fakeSettings(async () => {
+          throw new Error("settings cleanup denied");
+        }),
+        spawnProcess: () => child,
+        async onChildStarted(processIdentity) {
+          await argumentsForRunner.onChildStarted(processIdentity);
+          child.stdout.end("completed before cleanup");
+          child.emit("close", 0, null);
+        }
+      })
+    }
+  );
+
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.error.code, "claude_settings_cleanup_failed");
+  assert.equal(outcome.custodyState, "released");
+  assert.equal(custody.getWriteAccess(workspaceForTest(projectRoot).canonicalRepositoryKey), undefined);
+});
+
+test("cleanup failure retains the original forced-termination evidence", async () => {
+  const child = createFakeChild();
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "cleanup after timeout",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 10 }),
+      createSettings: fakeSettings(async () => {
+        throw new Error("cleanup denied");
+      }),
+      spawnProcess: () => child,
+      terminateChild: terminateFakeChild
+    }),
+    (error) => {
+      assert.equal(error.code, "claude_settings_cleanup_failed");
+      assert.equal(error.processOutcome.code, "claude_timeout");
+      assert.equal(error.terminalProof.event, "close");
+      assert.equal(error.terminationResult.status, "terminated");
+      assert.equal(error.cleanupFailure.message, "cleanup denied");
+      return true;
+    }
+  );
+});
+
 test("Windows forced termination targets only the exact Claude child PID and awaits terminal proof", async () => {
   const child = createFakeChild();
   child.pid = 4321;
@@ -1640,11 +1817,13 @@ test("Windows forced termination targets only the exact Claude child PID and awa
   });
   await afterRunnerStarts();
   assert.equal(reusedPidSpawnCalled, false);
-  assert.equal(reusedPidChild.killCalls, 0);
+  // PID reuse forbids taskkill, but the coordinator still owns this exact
+  // ChildProcess handle and makes the bounded direct-handle termination attempt.
+  assert.equal(reusedPidChild.killCalls, 1);
   reusedPidChild.emit("close", 0, null);
   const reusedPidResult = await reusedPidPending;
-  assert.equal(reusedPidResult.status, "already-terminal");
-  assert.equal(reusedPidResult.method, "identity-check");
+  assert.equal(reusedPidResult.status, "terminated");
+  assert.equal(reusedPidResult.method, "child-kill");
   assert.equal(reusedPidResult.identityStatus, "pid-reused");
 });
 

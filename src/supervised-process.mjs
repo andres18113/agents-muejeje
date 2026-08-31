@@ -1,4 +1,11 @@
 import { spawn } from "node:child_process";
+import {
+  PROCESS_IDENTITY_MATCH,
+  PROCESS_IDENTITY_STATUS,
+  compareProcessIdentity,
+  inspectProcessIdentity,
+  validateDurableProcessIdentity
+} from "./process-identity.mjs";
 
 /**
  * One supervised external process.
@@ -7,31 +14,14 @@ import { spawn } from "node:child_process";
  * bounded execution, output limits, termination and proof-of-death are not
  * re-implemented per call site with scattered setTimeout/kill logic.
  *
- * Lifecycle:
- *
- *   spawn exact child
- *       |
- *   bounded execution
- *       |
- *       +-- close -> result
- *       |
- *       +-- timeout / overflow
- *                |
- *                v
- *          termination requested (exact handle / exact PID tree)
- *                |
- *                v
- *          bounded terminal wait
- *                |
- *                +-- close observed -> deterministic failure
- *                `-- no close       -> fail closed, side effects unproven
- *
- * The same conservative rules already used for the Claude child apply here:
- * only `close` is terminal proof, only the exact spawned process (or its PID
- * tree) is terminated, a process is never killed by name, every deadline timer
- * stays referenced, and the returned Promise always settles exactly once.
+ * Only `close` is terminal proof. Windows tree termination has one additional
+ * guard: the PID must still have the durable start-time identity captured for
+ * this exact ChildProcess immediately before taskkill is started. A direct
+ * ChildProcess handle remains safe when that durable identity is unavailable;
+ * a PID-only taskkill never is.
  */
 
+// Explicit close-proof grace after the command's absolute execution deadline.
 const DEFAULT_TERMINATION_TIMEOUT_MS = 5_000;
 
 export class SupervisedProcessError extends Error {
@@ -52,56 +42,251 @@ export class SupervisedProcessError extends Error {
   }
 }
 
+function validPid(pid) {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+function remainingMs(deadlineAt, now) {
+  return Math.max(0, deadlineAt - now());
+}
+
 /**
- * Terminates exactly the supplied child. On Windows a mutating command can
- * spawn helper processes (Git hooks, filters, pagers), so the PID tree of that
- * exact PID is targeted with taskkill. No process is ever matched by name.
+ * Observations themselves are fallible. This bounded race never turns a late
+ * or failed identity query into a positive identity match.
  */
-function requestTermination(child, { platform, spawnTerminator, terminationTimeoutMs, schedule, cancelSchedule }) {
-  const pid = child?.pid;
-  if (platform === "win32" && Number.isSafeInteger(pid) && pid > 0) {
-    let terminator;
-    try {
-      terminator = spawnTerminator("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        shell: false,
-        windowsHide: true,
-        stdio: "ignore"
-      });
-    } catch {
-      // Fall back to the direct handle below.
-      terminator = undefined;
-    }
-    if (terminator && typeof terminator.once === "function") {
-      // The terminator itself is bounded so a wedged taskkill cannot hang us.
-      let done = false;
-      let timer;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        cancelSchedule(timer);
-      };
-      timer = schedule(() => {
-        try {
-          terminator.kill?.();
-        } catch {
-          // Already gone.
-        }
-        finish();
-      }, terminationTimeoutMs);
-      terminator.once("error", finish);
-      terminator.once("close", finish);
-      // Lets the caller drop this deadline once the run itself has settled, so
-      // a finished command never holds the event loop open waiting on taskkill.
-      return finish;
-    }
+function waitForPromiseUntil(promise, { deadlineAt, now, schedule, cancelSchedule }) {
+  const timeoutMs = remainingMs(deadlineAt, now);
+  if (timeoutMs <= 0) return Promise.resolve(Object.freeze({ timedOut: true }));
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cancelSchedule(timer);
+      resolve(Object.freeze(result));
+    };
+    timer = schedule(() => finish({ timedOut: true }), timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => finish({ value }),
+      (error) => finish({ error })
+    );
+  });
+}
+
+/**
+ * Starts the initial identity observation without delaying command execution.
+ * If the exact ChildProcess emits exit or close before the query completes, the
+ * observation is discarded. A later fresh comparison is still required before
+ * Windows taskkill.
+ */
+function captureDurableIdentity(child, { platform, inspectProcess, hasLifecycleEnded }) {
+  let identity;
+  if (platform !== "win32" || !validPid(child?.pid)) {
+    return Object.freeze({ getIdentity: () => identity });
   }
 
+  const pid = child.pid;
+  void Promise.resolve()
+    .then(() => inspectProcess(pid, { platform }))
+    .then(
+      (observation) => {
+        if (hasLifecycleEnded() || observation?.status !== PROCESS_IDENTITY_STATUS.ALIVE) return;
+        let durable;
+        try {
+          durable = validateDurableProcessIdentity(observation.identity);
+        } catch {
+          return;
+        }
+        if (durable.pid === pid) identity = durable;
+      },
+      () => {
+        // Identity absence is fail-closed for taskkill, not a command failure.
+      }
+    );
+
+  return Object.freeze({ getIdentity: () => identity });
+}
+
+function requestExactHandleTermination(child) {
+  let killError;
+  child?.stdin?.once?.("error", () => {});
   try {
-    child?.kill?.();
+    child?.stdin?.end?.();
   } catch {
-    // The child may already have exited.
+    // The input stream may already be closed.
   }
-  return () => {};
+  try {
+    child?.stdin?.destroy?.();
+  } catch {
+    // The input stream may not be destroyable.
+  }
+  try {
+    if (typeof child?.kill !== "function") return Object.freeze({ requested: false });
+    child.kill();
+    return Object.freeze({ requested: true });
+  } catch (error) {
+    killError = error;
+  }
+  return Object.freeze({ requested: false, killError });
+}
+
+/**
+ * Keeps the taskkill helper bounded independently of the supervised child.
+ * Its result is diagnostic only: exact child `close` remains the sole terminal
+ * proof for the command itself.
+ */
+function watchTerminator(terminator, { deadlineAt, now, schedule, cancelSchedule }) {
+  if (!terminator || typeof terminator.once !== "function") {
+    return Object.freeze({ cancel: () => {}, getResult: () => ({ status: "spawn-failed" }) });
+  }
+
+  let settled = false;
+  let result;
+  let timer;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    result = Object.freeze(value);
+    cancelSchedule(timer);
+  };
+  const stop = (status) => {
+    if (settled) return;
+    try {
+      terminator.kill?.();
+    } catch {
+      // The terminator may already have exited.
+    }
+    finish({ status });
+  };
+
+  terminator.once("error", (error) => finish({ status: "error", error }));
+  terminator.once("close", (code, signal) => {
+    finish({ status: code === 0 ? "completed" : "failed", code, signal });
+  });
+  const timeoutMs = remainingMs(deadlineAt, now);
+  if (timeoutMs <= 0) {
+    stop("timeout");
+  } else {
+    timer = schedule(() => stop("timeout"), timeoutMs);
+  }
+
+  return Object.freeze({
+    cancel: () => stop("cancelled"),
+    getResult: () => result
+  });
+}
+
+async function compareBeforeTaskkill(
+  identity,
+  { inspectProcess, platform, deadlineAt, now, schedule, cancelSchedule }
+) {
+  const queryBudgetMs = remainingMs(deadlineAt, now);
+  if (queryBudgetMs <= 0) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-timeout"
+    });
+  }
+
+  const comparison = compareProcessIdentity(identity, {
+    inspectProcess: (pid) => inspectProcess(pid, {
+      platform,
+      timeoutMs: queryBudgetMs,
+      terminationTimeoutMs: queryBudgetMs
+    })
+  });
+  const outcome = await waitForPromiseUntil(comparison, {
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  if (outcome.timedOut) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-timeout"
+    });
+  }
+  if (outcome.error || !outcome.value) {
+    return Object.freeze({
+      status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+      reason: "identity-check-failed"
+    });
+  }
+  return outcome.value;
+}
+
+/**
+ * Chooses a safe termination mechanism. Only a fresh SAME_PROCESS comparison
+ * authorizes taskkill. Every other observation falls back to the exact live
+ * ChildProcess handle and the caller's bounded close wait.
+ */
+async function requestTermination(
+  child,
+  {
+    platform,
+    spawnTerminator,
+    inspectProcess,
+    identityState,
+    hasLifecycleEnded,
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule,
+    isSettled
+  }
+) {
+  if (platform !== "win32" || !validPid(child?.pid)) {
+    requestExactHandleTermination(child);
+    return Object.freeze({ cancel: () => {} });
+  }
+
+  const identity = identityState.getIdentity();
+  if (!identity || hasLifecycleEnded() || isSettled()) {
+    requestExactHandleTermination(child);
+    return Object.freeze({ cancel: () => {} });
+  }
+
+  const comparison = await compareBeforeTaskkill(identity, {
+    inspectProcess,
+    platform,
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  if (
+    isSettled() ||
+    hasLifecycleEnded() ||
+    comparison.status !== PROCESS_IDENTITY_MATCH.SAME_PROCESS
+  ) {
+    if (!isSettled()) requestExactHandleTermination(child);
+    return Object.freeze({ cancel: () => {} });
+  }
+
+  let terminator;
+  try {
+    // The fresh comparison above is deliberately the final asynchronous step
+    // before this PID-based tree kill.
+    terminator = spawnTerminator(
+      "taskkill",
+      ["/PID", String(child.pid), "/T", "/F"],
+      { shell: false, windowsHide: true, stdio: "ignore" }
+    );
+  } catch {
+    requestExactHandleTermination(child);
+    return Object.freeze({ cancel: () => {} });
+  }
+
+  const watcher = watchTerminator(terminator, {
+    deadlineAt,
+    now,
+    schedule,
+    cancelSchedule
+  });
+  return Object.freeze({ cancel: watcher.cancel });
 }
 
 /**
@@ -124,8 +309,10 @@ export function runSupervisedProcess(
     platform = process.platform,
     spawnProcess = spawn,
     spawnTerminator = spawn,
+    inspectProcess = inspectProcessIdentity,
     schedule = setTimeout,
     cancelSchedule = clearTimeout,
+    now = Date.now,
     describeCommand = () => command + " " + args.join(" "),
     onSpawned
   } = {}
@@ -150,6 +337,8 @@ export function runSupervisedProcess(
       return;
     }
 
+    const startedAt = now();
+    const executionDeadlineAt = startedAt + timeoutMs;
     let child;
     try {
       child = spawnProcess(command, args, {
@@ -171,13 +360,15 @@ export function runSupervisedProcess(
     const stderr = [];
     let captured = 0;
     let settled = false;
-    // Set when we asked the process to die; the run can then only fail.
     let interruption;
     let executionTimer;
     let terminalTimer;
     let cancelTermination = () => {};
+    let exitObserved = false;
+    let closeObserved = false;
 
     const text = (chunks) => Buffer.concat(chunks).toString("utf8").trim();
+    const hasLifecycleEnded = () => exitObserved || closeObserved;
 
     // Exactly one settlement. Both deadlines are always cancelled.
     const settle = (error, value) => {
@@ -206,19 +397,42 @@ export function runSupervisedProcess(
     };
 
     // Ask the exact child to die, then wait a bounded time for its `close`.
-    // Only `close` proves the child and its stdio ended.
+    // The main deadline is absolute. An interruption before it may use only
+    // its remaining time; an interruption at the deadline receives the small,
+    // explicit termination safety grace.
     const interrupt = (code, reason, message) => {
       if (settled || interruption) return;
-      interruption = { code, reason, message };
+      const currentTime = now();
+      const terminationDeadlineAt = currentTime < executionDeadlineAt
+        ? Math.min(executionDeadlineAt, currentTime + terminationTimeoutMs)
+        : currentTime + terminationTimeoutMs;
+      interruption = { code, reason, message, terminationDeadlineAt };
       cancelSchedule(executionTimer);
-      cancelTermination = requestTermination(child, {
+
+      terminalTimer = schedule(
+        () => failInterrupted(false),
+        remainingMs(terminationDeadlineAt, now)
+      );
+      void requestTermination(child, {
         platform,
         spawnTerminator,
-        terminationTimeoutMs,
+        inspectProcess,
+        identityState,
+        hasLifecycleEnded,
+        deadlineAt: terminationDeadlineAt,
+        now,
         schedule,
-        cancelSchedule
-      });
-      terminalTimer = schedule(() => failInterrupted(false), terminationTimeoutMs);
+        cancelSchedule,
+        isSettled: () => settled
+      }).then(
+        (termination) => {
+          if (settled) termination.cancel();
+          else cancelTermination = termination.cancel;
+        },
+        () => {
+          if (!settled) requestExactHandleTermination(child);
+        }
+      );
     };
 
     const capture = (chunks, chunk) => {
@@ -236,20 +450,25 @@ export function runSupervisedProcess(
       chunks.push(buffer);
     };
 
-    child.stdout?.on?.("data", (chunk) => capture(stdout, chunk));
-    child.stderr?.on?.("data", (chunk) => capture(stderr, chunk));
-
+    // These lifecycle listeners are armed synchronously after spawn. `exit`
+    // is diagnostic only; `close` is terminal proof.
+    child.once?.("exit", () => {
+      exitObserved = true;
+    });
     child.once?.("error", (error) => {
+      if (interruption) {
+        interruption.childError = error;
+        return;
+      }
       settle(new SupervisedProcessError("Failed to run " + describeCommand() + ".", {
         code: "supervised_process_spawn_failed",
         cause: error,
         stdout: text(stdout),
-        stderr: text(stderr),
-        sideEffectsUnproven: Boolean(interruption)
+        stderr: text(stderr)
       }));
     });
-
     child.once?.("close", (exitCode, signal) => {
+      closeObserved = true;
       if (interruption) {
         // The child closed after we asked it to die: termination is proven,
         // the failure is deterministic, side effects remain unproven.
@@ -273,17 +492,20 @@ export function runSupervisedProcess(
       }
       settle(undefined, Object.freeze({ stdout: text(stdout), stderr: text(stderr), exitCode }));
     });
+    child.stdout?.on?.("data", (chunk) => capture(stdout, chunk));
+    child.stderr?.on?.("data", (chunk) => capture(stderr, chunk));
+    child.stdout?.once?.("error", (error) => {
+      interrupt("supervised_process_failed", "stdout-error", "stdout failed: " + error.message);
+    });
+    child.stderr?.once?.("error", (error) => {
+      interrupt("supervised_process_failed", "stderr-error", "stderr failed: " + error.message);
+    });
 
-    // Handed the exact spawned child so a caller can capture its durable
-    // identity. Invoked after the listeners and before the deadline, and never
-    // awaited here: bounding the command must not wait on the caller.
-    if (typeof onSpawned === "function") {
-      try {
-        onSpawned(child);
-      } catch {
-        // The caller owns reporting its own failure.
-      }
-    }
+    const identityState = captureDurableIdentity(child, {
+      platform,
+      inspectProcess,
+      hasLifecycleEnded
+    });
 
     // Deadline timers stay referenced: an orchestration command that is still
     // deciding a custody outcome must keep the runtime alive.
@@ -293,6 +515,17 @@ export function runSupervisedProcess(
         "timeout",
         "Did not finish within " + Math.round(timeoutMs / 1000) + " seconds"
       );
-    }, timeoutMs);
+    }, remainingMs(executionDeadlineAt, now));
+
+    // Handed the exact spawned child so a caller can capture its durable
+    // identity. Invoked after the listeners and deadline are armed, and never
+    // awaited here: bounding the command must not wait on the caller.
+    if (typeof onSpawned === "function") {
+      try {
+        onSpawned(child);
+      } catch {
+        // The caller owns reporting its own failure.
+      }
+    }
   });
 }
