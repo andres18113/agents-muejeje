@@ -22,11 +22,7 @@ import {
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const agentsDirectory = path.join(projectRoot, "agents");
-const globalAgentsPath = path.join(
-  process.env.USERPROFILE || "C:\\Users\\Andres",
-  ".codex",
-  "AGENTS.md"
-);
+const routingPolicyPath = path.join(projectRoot, "policy", "codex-agent-routing.md");
 const expectedIds = [
   "explore",
   "task",
@@ -331,23 +327,33 @@ test("the consolidated source has one child-process launch owner and no legacy r
   }
 });
 
-test("global routing and documentation name only the consolidated profile surface", async () => {
-  const [globalPolicy, readme, installer] = await Promise.all([
-    readFile(globalAgentsPath, "utf8"),
+test("tracked routing policy and documentation name only the consolidated profile surface", async () => {
+  const [routingPolicy, readme, installer] = await Promise.all([
+    readFile(routingPolicyPath, "utf8"),
     readFile(path.join(projectRoot, "README.md"), "utf8"),
     readFile(path.join(projectRoot, "install-codex.ps1"), "utf8")
   ]);
 
   for (const id of expectedIds) {
-    assert.match(globalPolicy, new RegExp('delegate_agent\\(agent_type="' + id + '"\\)'));
+    assert.match(routingPolicy, new RegExp('`' + id.replace(/[-]/g, "\\-") + '`'));
     assert.match(readme, new RegExp('`' + id.replace(/[-]/g, "\\-") + '`'));
   }
-  assert.match(globalPolicy, /Codex performs narrow factual or evidentiary verification directly/);
-  assert.doesNotMatch(globalPolicy, /delegate_agent\(agent_type="verify"\)/);
+  assert.match(routingPolicy, /`delegate_agent` is the only claude-agents MCP entry point/);
+  assert.match(routingPolicy, /Codex is the Lead/);
+  assert.match(routingPolicy, /owns the final verdict/);
+  assert.match(routingPolicy, /narrow factual and evidentiary verification directly/);
+  assert.match(routingPolicy, /explicit\/manual delegation/);
+  assert.match(routingPolicy, /Phase 4 hard capability enforcement is not implemented/);
+  assert.doesNotMatch(routingPolicy, /delegate_agent\(agent_type="verify"\)/);
   assert.doesNotMatch(readme, /agents\/verify\.md/);
+  assert.match(readme, /npm ci/);
+  assert.match(readme, /npm run ci/);
+  assert.match(readme, /policy\/codex-agent-routing\.md/);
+  assert.match(installer, /Run: npm ci/);
+  assert.doesNotMatch(installer, /AGENTS\.md/);
 
   for (const legacyIdentifier of ["claude_review", "claude_critic", "claude_verify"]) {
-    assert.equal(globalPolicy.includes(legacyIdentifier), false);
+    assert.equal(routingPolicy.includes(legacyIdentifier), false);
     assert.equal(readme.includes(legacyIdentifier), false);
   }
   for (const legacyEnvironmentVariable of [
@@ -355,5 +361,61 @@ test("global routing and documentation name only the consolidated profile surfac
     "CLAUDE_AGENTS_TIMEOUT_MS"
   ]) {
     assert.equal(installer.includes(legacyEnvironmentVariable), false);
+  }
+});
+
+test("package metadata and Windows CI provide clean deterministic validation", async () => {
+  const [packageText, lockText, workflow] = await Promise.all([
+    readFile(path.join(projectRoot, "package.json"), "utf8"),
+    readFile(path.join(projectRoot, "package-lock.json"), "utf8"),
+    readFile(path.join(projectRoot, ".github", "workflows", "ci.yml"), "utf8")
+  ]);
+  const packageJson = JSON.parse(packageText);
+  const packageLock = JSON.parse(lockText);
+
+  assert.equal(packageJson.version, "0.2.0");
+  assert.equal(packageLock.version, "0.2.0");
+  assert.equal(packageLock.packages[""].version, "0.2.0");
+  assert.equal(packageLock.packages[""].name, packageJson.name);
+  assert.deepEqual(packageLock.packages[""].dependencies, packageJson.dependencies);
+  assert.match(packageJson.scripts.test, /node --test/);
+  for (const sourceFile of [
+    "src/index.mjs",
+    "src/agent-registry.mjs",
+    "src/agent-contracts.mjs",
+    "src/delegate-agent.mjs",
+    "src/prompt-composer.mjs",
+    "src/claude-runner.mjs"
+  ]) {
+    assert.match(packageJson.scripts.check, new RegExp(sourceFile.replace(/[./]/g, "\\$&")));
+  }
+  assert.match(packageJson.scripts.ci, /npm run check/);
+  assert.match(packageJson.scripts.ci, /npm test/);
+
+  assert.match(workflow, /runs-on: windows-latest/);
+  assert.match(workflow, /node-version: 20/);
+  assert.match(workflow, /npm ci/);
+  assert.match(workflow, /npm run ci/);
+  assert.doesNotMatch(workflow, /\b(?:claude|codex|secrets)\b/i);
+});
+
+test("repository source and tests do not depend on a personal home path or user profile", async () => {
+  const directories = [path.join(projectRoot, "src"), path.join(projectRoot, "tests")];
+  const files = (
+    await Promise.all(
+      directories.map(async (directory) =>
+        (await readdir(directory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".mjs"))
+          .map((entry) => path.join(directory, entry.name))
+      )
+    )
+  ).flat();
+  const forbiddenPersonalPath = ["C:", "Users", "Andres"].join("\\");
+  const forbiddenEnvKey = ["USER", "PROFILE"].join("");
+
+  for (const file of files) {
+    const content = await readFile(file, "utf8");
+    assert.equal(content.includes(forbiddenPersonalPath), false, file + " contains a personal path");
+    assert.equal(content.toUpperCase().includes(forbiddenEnvKey), false, file + " reads user-profile state");
   }
 });

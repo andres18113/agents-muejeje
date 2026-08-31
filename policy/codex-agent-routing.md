@@ -1,0 +1,37 @@
+# Codex Agent Routing Contract
+
+## Lead authority
+
+Codex is the Lead. It understands the task, plans, implements, debugs, runs deterministic gates, validates Claude findings against repository evidence, and owns the final verdict. Claude specialists return advice, work, or evidence; they never take final responsibility from Codex.
+
+## MCP entry point and valid roles
+
+`delegate_agent` is the only claude-agents MCP entry point. Its valid `agent_type` values are exactly:
+
+- `explore`
+- `task`
+- `general-purpose`
+- `code-review`
+- `research`
+- `rubber-duck`
+- `security-review`
+
+There is no verification profile or compatibility alias. Codex performs narrow factual and evidentiary verification directly with repository evidence and deterministic gates.
+
+## Routing guidance
+
+- Use `explore` for a focused repository question where independent discovery has net value.
+- Use `task` for one exact command or validation operation. Do not ask it to redesign or automatically repair failures.
+- Use `general-purpose` for bounded multi-step secondary work when an independent context materially helps.
+- Use `code-review` for a fresh, high-confidence review of a coherent change set after relevant deterministic gates.
+- Use `research` only through an explicit/manual delegation for deeper evidence-oriented investigation.
+- Use `rubber-duck` for adversarial but constructive critique of plans, architecture, assumptions, tests, implementation reasoning, or causal conclusions.
+- Use `security-review` for security-sensitive changed-code review with high-confidence exploitability criteria.
+
+Current `task` and `general-purpose` mutation posture does not grant Edit or Create capabilities. The Phase 3B runtime remains limited to its declared tool baseline; Phase 4 hard capability enforcement is not implemented. Nested delegation is not implemented.
+
+## Briefs, review, and evidence
+
+Delegate only when independent context can materially improve correctness, confidence, or falsification. When useful, provide a bounded brief with Outcome, Done when, Boundaries, Authoritative context, Non-goals, Known evidence, and Required handoff. Do not require every heading for trivial exploration or a single command.
+
+For code review, provide the coherent change-set scope, intended behavior, important invariants, risk areas, deterministic evidence, and any accepted findings already fixed. A clean specialist result is advisory, not proof. Codex validates each substantive finding, reruns applicable deterministic gates after accepted corrections, and requests a fresh independent code review when a material correction makes the reviewed change set stale.

@@ -3,7 +3,7 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { registerDelegateAgentTool } from "./delegate-agent.mjs";
 
 const SERVER_NAME = "claude-agents";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 
 function createServer() {
   const server = new McpServer({

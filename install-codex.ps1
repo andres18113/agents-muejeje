@@ -12,7 +12,7 @@ $null = Get-Command codex -ErrorAction Stop
 $null = Get-Command claude -ErrorAction Stop
 
 if (-not (Test-Path (Join-Path $Root "node_modules"))) {
-    throw "node_modules not found. Run: npm install @modelcontextprotocol/server zod"
+    throw "node_modules not found. Run: npm ci; then run: npm run ci"
 }
 
 Write-Host "Node:   $Node"
