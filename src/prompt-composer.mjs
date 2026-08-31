@@ -8,14 +8,35 @@ function requireNonEmptyText(name, value) {
  * Combines the stable specialist contract with one dynamic assignment.
  * Registry metadata remains out of the prompt; runtime capabilities are
  * included only as factual execution limits for this invocation.
+ *
+ * The working context names three distinct identities and never conflates
+ * them:
+ *   effectiveCwd   the directory Claude is actually started in
+ *   workspaceRoot  the filesystem root Claude is actually operating in
+ *   repositoryRoot the coordinated repository this work belongs to
+ *
+ * For root-bound roles workspaceRoot and repositoryRoot are the same path.
+ * For general-purpose they differ, and the prompt says so explicitly so the
+ * worker never assumes its edits are visible in the coordinated checkout.
  */
-export function composeAgentPrompt({ contract, task, cwd, canonicalRoot, executionId, runtime }) {
+export function composeAgentPrompt({
+  contract,
+  task,
+  effectiveCwd,
+  workspaceRoot,
+  repositoryRoot,
+  executionId,
+  runtime
+}) {
   requireNonEmptyText("Role contract", contract);
   requireNonEmptyText("Assignment", task);
-  requireNonEmptyText("Working directory", cwd);
-  requireNonEmptyText("Canonical root", canonicalRoot);
+  requireNonEmptyText("Working directory", effectiveCwd);
+  requireNonEmptyText("Workspace root", workspaceRoot);
+  requireNonEmptyText("Repository root", repositoryRoot);
   requireNonEmptyText("Execution ID", executionId);
   requireNonEmptyText("Runtime capability description", runtime.capabilityDescription);
+
+  const isolated = workspaceRoot !== repositoryRoot;
 
   return [
     "ROLE CONTRACT",
@@ -31,9 +52,14 @@ export function composeAgentPrompt({ contract, task, cwd, canonicalRoot, executi
     "WORKING CONTEXT",
     "===============",
     "",
-    "Working directory: " + cwd,
-    "Canonical root: " + canonicalRoot,
+    "Working directory: " + effectiveCwd,
+    "Workspace root: " + workspaceRoot,
+    "Repository root: " + repositoryRoot,
     "Execution ID: " + executionId,
+    "",
+    isolated
+      ? "The workspace root is an isolated Git worktree checked out from the repository root. Work inside the workspace root; changes made there do not appear in the repository root working tree and are not committed, merged, rebased, or pushed for you."
+      : "The workspace root is the coordinated repository root. Work inside it; changes are not committed, merged, rebased, or pushed for you.",
     "",
     "Runtime capabilities:",
     runtime.capabilityDescription,

@@ -9,12 +9,17 @@ export class WorkspaceRootError extends Error {
   }
 }
 
-export function canonicalRootKey(canonicalRoot, { platform = process.platform } = {}) {
-  if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
-    throw new WorkspaceRootError("A non-empty canonical root is required.");
+/**
+ * Derives the coordination key for a repository root. The key exists only to
+ * make two textual spellings of the same root contend for the same durable
+ * writer record; it is never used as a filesystem path.
+ */
+export function canonicalRepositoryKey(repositoryRoot, { platform = process.platform } = {}) {
+  if (typeof repositoryRoot !== "string" || repositoryRoot.length === 0) {
+    throw new WorkspaceRootError("A non-empty repository root is required.");
   }
 
-  const normalized = path.normalize(canonicalRoot);
+  const normalized = path.normalize(repositoryRoot);
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
@@ -35,6 +40,16 @@ async function gitBoundaryExists(directory, { lstatFn }) {
  * nearest Git worktree/repository marker. A .git directory and a worktree's
  * .git pointer file are both valid boundaries. Non-Git workspaces use their
  * real cwd as their independent root.
+ *
+ * Returns the coordinated repository identity:
+ *   effectiveCwd           the canonicalized directory that was requested
+ *   repositoryRoot         the original repository/root used for coordination
+ *                          and durable ownership
+ *   canonicalRepositoryKey the coordination key derived from repositoryRoot
+ *
+ * repositoryRoot is never the isolated worktree a general-purpose worker later
+ * executes in; that root is named workspaceRoot and is produced downstream by
+ * the worktree manager.
  */
 export async function resolveCanonicalWorkspaceRoot(
   cwd,
@@ -60,7 +75,7 @@ export async function resolveCanonicalWorkspaceRoot(
   } catch (error) {
     if (accessMode === "write") {
       throw new WorkspaceRootError(
-        "Cannot establish a canonical workspace root for write access: " + cwd,
+        "Cannot establish a canonical repository root for write access: " + cwd,
         { cause: error }
       );
     }
@@ -68,8 +83,8 @@ export async function resolveCanonicalWorkspaceRoot(
     effectiveCwd = path.resolve(cwd);
     return Object.freeze({
       effectiveCwd,
-      canonicalRoot: effectiveCwd,
-      canonicalRootKey: canonicalRootKey(effectiveCwd, { platform }),
+      repositoryRoot: effectiveCwd,
+      canonicalRepositoryKey: canonicalRepositoryKey(effectiveCwd, { platform }),
       rootSource: "read-cwd-fallback"
     });
   }
@@ -80,8 +95,8 @@ export async function resolveCanonicalWorkspaceRoot(
       if (await gitBoundaryExists(candidate, { lstatFn })) {
         return Object.freeze({
           effectiveCwd,
-          canonicalRoot: candidate,
-          canonicalRootKey: canonicalRootKey(candidate, { platform }),
+          repositoryRoot: candidate,
+          canonicalRepositoryKey: canonicalRepositoryKey(candidate, { platform }),
           rootSource: "git-boundary"
         });
       }
@@ -95,7 +110,7 @@ export async function resolveCanonicalWorkspaceRoot(
   } catch (error) {
     if (accessMode === "write") {
       throw new WorkspaceRootError(
-        "Cannot establish a canonical workspace root for write access: " + effectiveCwd,
+        "Cannot establish a canonical repository root for write access: " + effectiveCwd,
         { cause: error }
       );
     }
@@ -103,8 +118,8 @@ export async function resolveCanonicalWorkspaceRoot(
 
   return Object.freeze({
     effectiveCwd,
-    canonicalRoot: effectiveCwd,
-    canonicalRootKey: canonicalRootKey(effectiveCwd, { platform }),
+    repositoryRoot: effectiveCwd,
+    canonicalRepositoryKey: canonicalRepositoryKey(effectiveCwd, { platform }),
     rootSource: "cwd"
   });
 }

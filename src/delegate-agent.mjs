@@ -245,12 +245,17 @@ function requireExecutionId(createExecutionId) {
   return executionId;
 }
 
+/**
+ * Result fields keep their published Phase 5 names. canonicalRoot is the
+ * repositoryRoot and worktreeRoot is the isolated workspaceRoot, so callers
+ * that already parse this shape keep working.
+ */
 function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now, custodyState }) {
   return {
     executionId,
     agentType: profile.id,
     effectiveCwd: workspace.effectiveCwd,
-    canonicalRoot: workspace.canonicalRoot,
+    canonicalRoot: workspace.repositoryRoot,
     canonicalRootSource: workspace.rootSource,
     accessMode: runtime.accessMode,
     custodyState,
@@ -261,7 +266,7 @@ function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now,
     startedAt,
     durationMs: Math.max(0, now() - startedAt),
     runtimeCapabilities: runtime.capabilityDescription,
-    ...(workspace.worktreeRoot ? { worktreeRoot: workspace.worktreeRoot } : {}),
+    ...(workspace.workspaceRoot ? { worktreeRoot: workspace.workspaceRoot } : {}),
     ...(workspace.baseCommit ? { baseCommit: workspace.baseCommit } : {})
   };
 }
@@ -276,7 +281,23 @@ function failedStatus(error) {
     : "failed";
 }
 
-function custodyRetentionError(existingError, { terminalProofAvailable = false } = {}) {
+function custodyRetentionError(
+  existingError,
+  { terminalProofAvailable = false, workspacePreparationAmbiguous = false } = {}
+) {
+  // A Git deadline never proves that Git did nothing. Say exactly that instead
+  // of borrowing the Claude termination wording, which would be untrue here:
+  // no Claude child was ever started.
+  if (workspacePreparationAmbiguous) {
+    return {
+      code: "worktree_preparation_ambiguous",
+      message:
+        "Write custody retained because isolated worktree preparation timed out after Git started, " +
+        "so its repository side effects are unproven." +
+        (existingError?.message ? " Preparation failure: " + existingError.message : "")
+    };
+  }
+
   if (existingError?.code === "claude_termination_unproven") {
     return {
       code: existingError.code,
@@ -350,6 +371,9 @@ export async function delegateAgent(input, dependencies = {}) {
   let writerProcessIdentity;
   let terminalProof;
   let processProvenNotStarted = false;
+  // Set when a Git process started during worktree preparation and its effect
+  // on the repository could not be observed. Custody must then be retained.
+  let workspacePreparationAmbiguous = false;
   let runnerInvoked = false;
   let outcome;
 
@@ -358,8 +382,8 @@ export async function delegateAgent(input, dependencies = {}) {
       reservation = await writeCustody.reserveWriteAccess({
         executionId,
         agentType: profile.id,
-        canonicalRoot: workspace.canonicalRoot,
-        canonicalRootKey: workspace.canonicalRootKey
+        canonicalRoot: workspace.repositoryRoot,
+        canonicalRootKey: workspace.canonicalRepositoryKey
       });
       custodyState = reservation.state.toLowerCase();
       processProvenNotStarted = true;
@@ -368,28 +392,32 @@ export async function delegateAgent(input, dependencies = {}) {
         const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
         executionWorkspace = await isolatedWorktrees.prepare({
           executionId,
-          canonicalRootKey: workspace.canonicalRootKey,
-          canonicalRoot: workspace.canonicalRoot,
+          canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+          repositoryRoot: workspace.repositoryRoot,
           effectiveCwd: workspace.effectiveCwd
         });
       } else {
         reservation = await writeCustody.markSpawning({
           executionId,
-          canonicalRootKey: workspace.canonicalRootKey
+          canonicalRootKey: workspace.canonicalRepositoryKey
         });
         custodyState = reservation.state.toLowerCase();
       }
     }
 
+    // The root Claude actually operates in: the isolated worktree for
+    // general-purpose, the coordinated repository root for everyone else.
+    const workspaceRoot = executionWorkspace.workspaceRoot || executionWorkspace.repositoryRoot;
     const prompt = composePrompt({
-    profile,
-    contract,
-    task,
-    cwd: executionWorkspace.effectiveCwd,
-    canonicalRoot: executionWorkspace.worktreeRoot || executionWorkspace.canonicalRoot,
-    executionId,
-    runtime
-  });
+      profile,
+      contract,
+      task,
+      effectiveCwd: executionWorkspace.effectiveCwd,
+      workspaceRoot,
+      repositoryRoot: executionWorkspace.repositoryRoot,
+      executionId,
+      runtime
+    });
     if (runtime.accessMode === "write") processProvenNotStarted = false;
 
     runnerInvoked = true;
@@ -398,7 +426,9 @@ export async function delegateAgent(input, dependencies = {}) {
       agentType: profile.id,
       prompt,
       cwd: executionWorkspace.effectiveCwd,
-      canonicalRoot: executionWorkspace.canonicalRoot,
+      // Process identity binds to the repository that granted custody, which
+      // is the same root the prompt reports as the repository root.
+      repositoryRoot: executionWorkspace.repositoryRoot,
       executionId,
       runtime,
       onChildStarted: runtime.accessMode === "write"
@@ -407,7 +437,7 @@ export async function delegateAgent(input, dependencies = {}) {
             writerProcessIdentity = processIdentity;
             reservation = await writeCustody.activateWriteAccess({
               executionId,
-              canonicalRootKey: workspace.canonicalRootKey,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
               processIdentity
             });
             custodyState = reservation.state.toLowerCase();
@@ -419,7 +449,7 @@ export async function delegateAgent(input, dependencies = {}) {
             writerProcessIdentity = processIdentity;
             reservation = await writeCustody.beginTermination({
               executionId,
-              canonicalRootKey: workspace.canonicalRootKey,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
               processIdentity
             });
             custodyState = reservation.state.toLowerCase();
@@ -452,6 +482,7 @@ export async function delegateAgent(input, dependencies = {}) {
     writerProcessIdentity = writerProcessIdentity || error?.processIdentity;
     terminalProof = error?.terminalProof;
     processProvenNotStarted = !runnerInvoked || error?.processStarted === false;
+    workspacePreparationAmbiguous = error?.sideEffectsUnproven === true;
     outcome = {
       ...baseOutcome({
         profile,
@@ -472,25 +503,41 @@ export async function delegateAgent(input, dependencies = {}) {
   } finally {
     if (reservation) {
       try {
-        if (!writerProcessStarted && processProvenNotStarted && outcome?.status !== "completed") {
+        if (
+          !writerProcessStarted &&
+          processProvenNotStarted &&
+          !workspacePreparationAmbiguous &&
+          outcome?.status !== "completed"
+        ) {
           const released = await writeCustody.releaseUnstartedWriteAccess({
             executionId,
-            canonicalRootKey: workspace.canonicalRootKey
+            canonicalRootKey: workspace.canonicalRepositoryKey
           });
           custodyState = released.state.toLowerCase();
         } else if (writerProcessStarted && terminalProof) {
-          const released = await writeCustody.releaseWriteAccessAfterTerminal({
-            executionId,
-            canonicalRootKey: workspace.canonicalRootKey,
-            terminalProof
-          });
+          // A proof without a processIdentity is supervised close evidence:
+          // this coordinator spawned the exact child and saw it close before a
+          // durable identity could be captured. Custody validates that claim.
+          const released = terminalProof.supervisedByCoordinator === true
+            ? await writeCustody.releaseWriteAccessAfterSupervisedClose({
+                executionId,
+                canonicalRootKey: workspace.canonicalRepositoryKey,
+                terminalProof
+              })
+            : await writeCustody.releaseWriteAccessAfterTerminal({
+                executionId,
+                canonicalRootKey: workspace.canonicalRepositoryKey,
+                terminalProof
+              });
           custodyState = released.state.toLowerCase();
         } else {
           const orphaned = await writeCustody.markOrphanedWriteAccess({
             executionId,
-            canonicalRootKey: workspace.canonicalRootKey,
+            canonicalRootKey: workspace.canonicalRepositoryKey,
             processIdentity: writerProcessIdentity,
-            reason: "terminal-proof-unavailable"
+            reason: workspacePreparationAmbiguous
+              ? "worktree-preparation-ambiguous"
+              : "terminal-proof-unavailable"
           });
           custodyState = orphaned.state.toLowerCase();
           outcome = {
@@ -505,7 +552,7 @@ export async function delegateAgent(input, dependencies = {}) {
             }),
             status: outcome?.status === "timeout" ? "timeout" : "failed",
             durationMs: outcome?.durationMs ?? Math.max(0, now() - startedAt),
-            error: custodyRetentionError(outcome?.error),
+            error: custodyRetentionError(outcome?.error, { workspacePreparationAmbiguous }),
             stderrSummary: outcome?.stderrSummary || "",
             ...(Number.isSafeInteger(outcome?.pid) ? { pid: outcome.pid } : {})
           };
@@ -515,7 +562,7 @@ export async function delegateAgent(input, dependencies = {}) {
         try {
           const orphaned = await writeCustody.markOrphanedWriteAccess({
             executionId,
-            canonicalRootKey: workspace.canonicalRootKey,
+            canonicalRootKey: workspace.canonicalRepositoryKey,
             processIdentity: writerProcessIdentity,
             reason: "custody-release-proof-failed"
           });
@@ -535,7 +582,8 @@ export async function delegateAgent(input, dependencies = {}) {
           }),
           status: outcome?.status === "timeout" ? "timeout" : "failed",
           error: custodyRetentionError(releaseError, {
-            terminalProofAvailable: Boolean(terminalProof)
+            terminalProofAvailable: Boolean(terminalProof),
+            workspacePreparationAmbiguous
           }),
           stderrSummary: outcome?.stderrSummary || ""
         };

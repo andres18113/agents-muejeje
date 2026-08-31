@@ -194,12 +194,20 @@ function childIsAlreadyTerminal(child) {
   );
 }
 
-function createProcessIdentityCandidate({ child, executionId, agentType, canonicalRoot, now }) {
+/**
+ * Binds one Claude child to the repository that granted its write custody.
+ *
+ * repositoryRoot is always the coordinated repository root, never the isolated
+ * workspace root a general-purpose worker runs in. Durable ownership is held
+ * per repository, so the identity must name the repository to match its
+ * reservation.
+ */
+function createProcessIdentityCandidate({ child, executionId, agentType, repositoryRoot, now }) {
   if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) return undefined;
   return {
     executionId,
     agentType,
-    canonicalRoot,
+    repositoryRoot,
     pid: child.pid,
     child,
     startedAt: now()
@@ -222,30 +230,45 @@ function finalizeProcessIdentity(candidate, processObservation) {
 }
 
 /**
- * Observes the exact ChildProcess instance created for one invocation. A
- * close or exit event is terminal evidence only for this in-memory identity;
- * it is intentionally not a durable cross-process identity scheme.
+ * Observes the exact ChildProcess instance created for one invocation.
+ *
+ * Only `close` is terminal proof for write custody. Node distinguishes the two
+ * events: `exit` means the direct child ended while its stdio may still be
+ * open, which happens precisely when a descendant still holds the inherited
+ * pipes; `close` means the child ended and its stdio streams closed. Returning
+ * write custody on `exit` alone would hand the repository to a new writer while
+ * a descendant of the old one can still be writing, so `exit` is retained as a
+ * diagnostic observation and never resolves the terminal promise.
+ *
+ * Honest scope: `close` proves the lifecycle of the exact supervised child and
+ * its stdio, not that every detached descendant is dead. A transitive
+ * guarantee needs process-tree containment (Job Objects), which Phase 5.1
+ * deliberately does not add.
  */
 export function observeClaudeChildTerminal(child, processIdentity, { now = Date.now } = {}) {
-  let terminalProof;
   let closeProof;
+  let exitObservation;
   let resolveTerminal;
   const terminalPromise = new Promise((resolve) => {
     resolveTerminal = resolve;
   });
 
   const observe = (event, code, signal) => {
-    const proof = Object.freeze({
+    const observation = Object.freeze({
       processIdentity,
       event,
       code,
       signal,
       observedAt: now()
     });
-    if (event === "close") closeProof = proof;
-    if (terminalProof) return;
-    terminalProof = proof;
-    resolveTerminal(proof);
+    if (event === "exit") {
+      // Diagnostic only. Never custody proof.
+      if (!exitObservation) exitObservation = observation;
+      return;
+    }
+    if (closeProof) return;
+    closeProof = observation;
+    resolveTerminal(observation);
   };
 
   child?.once?.("close", (code, signal) => observe("close", code, signal));
@@ -256,12 +279,40 @@ export function observeClaudeChildTerminal(child, processIdentity, { now = Date.
 
   return Object.freeze({
     processIdentity,
-    getTerminalProof: () => terminalProof,
+    getTerminalProof: () => closeProof,
     getCloseProof: () => closeProof,
+    getExitObservation: () => exitObservation,
     terminalPromise
   });
 }
 
+/**
+ * Terminal evidence for a child this coordinator spawned and watched close,
+ * but whose durable PID+StartTime identity could not be captured because it
+ * died first. It carries no processIdentity, so it can never be mistaken for
+ * durable cross-process proof; only the live coordinator that supervised the
+ * spawn may act on it.
+ */
+function supervisedCloseProof(closeProof) {
+  if (!closeProof || closeProof.event !== "close") return undefined;
+  return Object.freeze({
+    event: "close",
+    code: closeProof.code,
+    signal: closeProof.signal,
+    observedAt: closeProof.observedAt,
+    supervisedByCoordinator: true
+  });
+}
+
+/**
+ * Waits for identity-bound terminal evidence, or for the bounded deadline.
+ *
+ * The deadline timer is deliberately left referenced. This wait decides whether
+ * write custody is released or retained as ORPHANED, so the runtime must stay
+ * alive until the decision resolves. An unref'd timer here lets Node drain the
+ * event loop while the custody decision is still pending, which leaves the
+ * lifecycle Promise permanently unsettled.
+ */
 function waitForTerminalProof(
   terminalObserver,
   {
@@ -283,11 +334,17 @@ function waitForTerminalProof(
       resolve(proof);
     };
     timer = schedule(() => finish(undefined), timeoutMs);
-    if (typeof timer?.unref === "function") timer.unref();
     terminalObserver?.terminalPromise?.then((proof) => finish(proof));
   });
 }
 
+/**
+ * Waits for the terminator (taskkill) to settle within a bounded deadline.
+ *
+ * As with waitForTerminalProof, the deadline timer stays referenced: the
+ * termination outcome feeds the proof-of-death decision, so the runtime must
+ * remain alive until this bounded wait resolves.
+ */
 function waitForTerminator(
   terminator,
   {
@@ -317,7 +374,6 @@ function waitForTerminator(
       }
       finish({ status: "timeout" });
     }, timeoutMs);
-    if (typeof timer?.unref === "function") timer.unref();
     terminator.once("error", (error) => finish({ status: "error", error }));
     terminator.once("close", (code, signal) => {
       finish({ status: code === 0 ? "completed" : "failed", code, signal });
@@ -540,6 +596,21 @@ async function terminateStartedChild({
     });
   }
 
+  // The child died before its durable PID+StartTime identity could be captured,
+  // yet this coordinator spawned the exact ChildProcess and watched it close.
+  // That in-memory evidence is sufficient for this live coordinator to
+  // terminalize its own execution instead of locking the repository forever.
+  // It is deliberately not durable: after a restart the evidence is gone and
+  // the record must stay fail-closed.
+  const supervisedProof = !processIdentity ? supervisedCloseProof(terminalProof) : undefined;
+  if (supervisedProof) {
+    return attachLifecycle(originalError, {
+      terminalProof: supervisedProof,
+      terminationResult,
+      processStarted: true
+    });
+  }
+
   return new ClaudeTerminationUnprovenError(originalError, terminationResult, {
     processIdentity,
     pid: child?.pid,
@@ -558,7 +629,7 @@ async function terminateStartedChild({
 export async function runClaudeAgent({
   prompt,
   cwd,
-  canonicalRoot = cwd,
+  repositoryRoot = cwd,
   executionId = randomUUID(),
   agentType = "unclassified",
   runtime,
@@ -579,10 +650,10 @@ export async function runClaudeAgent({
   if (
     typeof cwd !== "string" ||
     cwd.length === 0 ||
-    typeof canonicalRoot !== "string" ||
-    canonicalRoot.length === 0
+    typeof repositoryRoot !== "string" ||
+    repositoryRoot.length === 0
   ) {
-    throw new ClaudeRunnerError("Claude cwd and canonical root must be non-empty strings.", {
+    throw new ClaudeRunnerError("Claude cwd and repository root must be non-empty strings.", {
       code: "invalid_workspace"
     });
   }
@@ -679,7 +750,7 @@ export async function runClaudeAgent({
     child,
     executionId,
     agentType,
-    canonicalRoot,
+    repositoryRoot,
     now
   });
   const terminalObserver = observeClaudeChildTerminal(child, processIdentityCandidate, { now });

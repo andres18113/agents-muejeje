@@ -55,7 +55,7 @@ function manager(stateRoot, observations, currentPid, options = {}) {
 function childIdentity({
   executionId = "execution-a",
   agentType = "task",
-  canonicalRoot = rootA,
+  repositoryRoot = rootA,
   pid = 200,
   startTime = "20000",
   child = new EventEmitter(),
@@ -65,7 +65,9 @@ function childIdentity({
   return Object.freeze({
     executionId,
     agentType,
-    canonicalRoot,
+    // In-memory process identity names the repository root; the durable record
+    // persists the same value under its canonicalRoot schema field.
+    repositoryRoot,
     pid,
     startTime,
     source,
@@ -483,5 +485,286 @@ test("completed durable records never persist task bodies, contracts, or environ
     for (const forbidden of ["SENSITIVE_ASSIGNMENT_BODY", "ROLE_CONTRACT_TEXT", "SECRET_ENV_VALUE"]) {
       assert.equal(text.includes(forbidden), false);
     }
+  });
+});
+
+test("exit alone never returns write custody and close does", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")], [200, live(200)]]), 100);
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+
+    // 1. `exit` is not proof: the direct child ended but its stdio may still be
+    // held open by a descendant that can keep writing to the repository.
+    await assert.rejects(
+      custody.releaseWriteAccessAfterTerminal({
+        executionId: identity.executionId,
+        canonicalRootKey: rootAKey,
+        terminalProof: {
+          processIdentity: identity,
+          event: "exit",
+          code: 0,
+          signal: null,
+          observedAt: 1_200
+        }
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_terminal_proof_missing");
+        assert.match(error.message, /exit event is not proof/u);
+        return true;
+      }
+    );
+    // 3. Custody is still fully owned while only an exit has been seen.
+    const stillOwned = await custody.getWriteAccess(rootAKey);
+    assert.equal(stillOwned.state, "ACTIVE");
+    assert.equal(stillOwned.accessMode, "write");
+
+    // 2 and 3. The later close for the exact same child does release it.
+    const released = await custody.releaseWriteAccessAfterTerminal({
+      executionId: identity.executionId,
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_300)
+    });
+    assert.equal(released.state, "RELEASED");
+    assert.equal(await custody.getWriteAccess(rootAKey), undefined);
+  });
+});
+
+test("a persisted exit-only terminal proof is rejected as malformed durable state", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(custody);
+    const recordPath = path.join(
+      custody.repositoryStateDirectory(rootAKey),
+      "ownership",
+      "record.json"
+    );
+    const record = JSON.parse(await readFile(recordPath, "utf8"));
+    record.state = "TERMINAL_PROVEN";
+    record.terminalProof = { kind: "child-event", event: "exit", observedAt: 1_100 };
+    record.transitions = [...record.transitions, { state: "TERMINAL_PROVEN", at: 1_100 }];
+    await writeFile(recordPath, JSON.stringify(record, null, 2), "utf8");
+
+    const second = manager(stateRoot, new Map([[100, dead()], [300, live(300)]]), 300);
+    await assert.rejects(reserve(second, { executionId: "execution-b" }), /ambiguous|malformed|invalid/iu);
+  });
+});
+
+test("a supervised close releases custody only inside the coordinator that spawned the child", async () => {
+  await withState(async (stateRoot) => {
+    // 4. The child died before its durable PID+StartTime could be captured, so
+    // no claudeProcess was ever persisted. The same live coordinator did watch
+    // the exact ChildProcess it spawned reach close.
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(custody);
+    await custody.markSpawning({ executionId: "execution-a", canonicalRootKey: rootAKey });
+    const spawning = await custody.getWriteAccess(rootAKey);
+    assert.equal(spawning.state, "SPAWNING");
+    assert.equal(spawning.claudeProcess, undefined);
+
+    const released = await custody.releaseWriteAccessAfterSupervisedClose({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: { event: "close", code: 0, signal: null, observedAt: 1_150, supervisedByCoordinator: true }
+    });
+    assert.equal(released.state, "RELEASED");
+    assert.equal(released.terminalProof.kind, "supervised-child-close");
+    // No fabricated durable identity was persisted for the dead child.
+    assert.equal(released.claudeProcess, undefined);
+    assert.equal(await custody.getWriteAccess(rootAKey), undefined);
+  });
+});
+
+test("supervised close evidence is refused without a real supervised spawn", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(custody);
+    const proof = { event: "close", code: 0, signal: null, observedAt: 1_150, supervisedByCoordinator: true };
+
+    // Not spawning yet: nothing was supervised.
+    await assert.rejects(
+      custody.releaseWriteAccessAfterSupervisedClose({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: proof
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_state_invalid");
+        return true;
+      }
+    );
+
+    await custody.markSpawning({ executionId: "execution-a", canonicalRootKey: rootAKey });
+    // An exit is never supervised close evidence.
+    await assert.rejects(
+      custody.releaseWriteAccessAfterSupervisedClose({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: { ...proof, event: "exit" }
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_terminal_proof_missing");
+        return true;
+      }
+    );
+    // Neither is a proof that does not claim coordinator supervision.
+    await assert.rejects(
+      custody.releaseWriteAccessAfterSupervisedClose({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: { ...proof, supervisedByCoordinator: false }
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_terminal_proof_missing");
+        return true;
+      }
+    );
+  });
+});
+
+test("supervised close evidence does not survive a coordinator restart", async () => {
+  await withState(async (stateRoot) => {
+    // 5. Same durable state, new coordinator process: the in-memory evidence is
+    // gone, so the record must stay fail-closed rather than being released.
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(first);
+    await first.markSpawning({ executionId: "execution-a", canonicalRootKey: rootAKey });
+
+    const restarted = manager(stateRoot, new Map([[100, dead()], [300, live(300)]]), 300);
+    const proof = { event: "close", code: 0, signal: null, observedAt: 1_150, supervisedByCoordinator: true };
+    await assert.rejects(
+      restarted.releaseWriteAccessAfterSupervisedClose({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: proof
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_terminal_proof_required");
+        return true;
+      }
+    );
+
+    // Reconciliation from the restarted coordinator also stays blocked.
+    await assert.rejects(reserve(restarted, { executionId: "execution-b" }), /already retained/);
+    const retained = await restarted.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+    assert.equal(retained.orphanReason, "process-identity-not-persisted");
+  });
+});
+
+async function prepareWithGitOperation(custody, { pid = 500, startTime } = {}) {
+  await reserve(custody);
+  await custody.beginWorktreePreparation({
+    executionId: "execution-a",
+    canonicalRootKey: rootAKey,
+    baseCommit: "a".repeat(40),
+    worktreeRoot: "C:\\state\\worktrees\\execution-a"
+  });
+  await custody.recordWorktreeOperation({
+    executionId: "execution-a",
+    canonicalRootKey: rootAKey,
+    gitOperation: {
+      kind: "worktree-add",
+      pid,
+      startTime: startTime || String(pid * 100),
+      source
+    }
+  });
+}
+
+test("a live persisted Git worktree operation blocks reconciliation", async () => {
+  await withState(async (stateRoot) => {
+    // 10. Coordinator died while `git worktree add` was running and that exact
+    // Git process is still alive: the repository is still being written.
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")], [500, live(500)]]), 100);
+    await prepareWithGitOperation(first);
+
+    const second = manager(
+      stateRoot,
+      new Map([[100, dead()], [500, live(500)], [300, live(300)]]),
+      300
+    );
+    await assert.rejects(reserve(second, { executionId: "execution-b" }), /already retained/);
+    const retained = await second.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+    assert.equal(retained.orphanReason, "coordinator-dead-git-operation-alive");
+    assert.equal(retained.accessMode, "write");
+    // The worktree is preserved, never deleted heuristically.
+    assert.equal(retained.worktreeRoot, "C:\\state\\worktrees\\execution-a");
+  });
+});
+
+test("an ambiguous persisted Git worktree operation remains blocked", async () => {
+  await withState(async (stateRoot) => {
+    // 12. Nothing can be concluded about the Git process, so fail closed.
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")], [500, live(500)]]), 100);
+    await prepareWithGitOperation(first);
+
+    const second = manager(
+      stateRoot,
+      new Map([[100, dead()], [500, ambiguous()], [300, live(300)]]),
+      300
+    );
+    await assert.rejects(reserve(second, { executionId: "execution-b" }), /already retained/);
+    const retained = await second.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+    assert.equal(retained.orphanReason, "git-operation-identity-ambiguous");
+    assert.equal(retained.worktreeRoot, "C:\\state\\worktrees\\execution-a");
+  });
+});
+
+test("a dead or PID-reused Git worktree operation is recognized as no longer running", async () => {
+  await withState(async (stateRoot) => {
+    // 11. Both the proven-dead and the PID-reused cases mean that exact Git
+    // process is gone. Preparation consistency still cannot be proven, so the
+    // execution is orphaned and its worktree preserved rather than guessed at.
+    for (const [label, observation] of [
+      ["dead", dead()],
+      ["pid-reused", live(500, "999999")]
+    ]) {
+      await withState(async (innerRoot) => {
+        const first = manager(innerRoot, new Map([[100, live(100, "10000")], [500, live(500)]]), 100);
+        await prepareWithGitOperation(first);
+
+        const second = manager(
+          innerRoot,
+          new Map([[100, dead()], [500, observation], [300, live(300)]]),
+          300
+        );
+        await assert.rejects(
+          reserve(second, { executionId: "execution-b" }),
+          /already retained/,
+          label + " must still block a new writer"
+        );
+        const retained = await second.getWriteAccess(rootAKey);
+        assert.equal(retained.state, "ORPHANED", label);
+        assert.equal(retained.orphanReason, "git-operation-terminal-preparation-unproven", label);
+        assert.equal(retained.worktreeRoot, "C:\\state\\worktrees\\execution-a", label);
+      });
+    }
+  });
+});
+
+test("a cleared Git worktree operation no longer participates in reconciliation", async () => {
+  await withState(async (stateRoot) => {
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")], [500, live(500)]]), 100);
+    await prepareWithGitOperation(first);
+    const cleared = await first.clearWorktreeOperation({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    assert.equal(cleared.gitOperation, undefined);
+    assert.equal(cleared.state, "PREPARING_WORKTREE");
+
+    const second = manager(
+      stateRoot,
+      new Map([[100, dead()], [500, live(500)], [300, live(300)]]),
+      300
+    );
+    await assert.rejects(reserve(second, { executionId: "execution-b" }), /already retained/);
+    const retained = await second.getWriteAccess(rootAKey);
+    // Falls back to the generic preparing-state rule, not the Git-operation one.
+    assert.equal(retained.orphanReason, "process-identity-not-persisted");
   });
 });

@@ -98,6 +98,21 @@ function hasExactKeys(value, keys) {
   return Object.keys(value).sort().join(",") === [...keys].sort().join(",");
 }
 
+const SUPERVISED_GIT_OPERATIONS = new Set(["worktree-add"]);
+
+/**
+ * A mutating Git operation this coordinator supervised. Persisting its durable
+ * PID+StartTime identity lets a later coordinator tell "Git is still running"
+ * apart from "Git is gone" after a crash during worktree preparation.
+ */
+function validatePersistedGitOperation(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) return false;
+  if (!hasExactKeys(operation, ["kind", "pid", "source", "startTime"])) return false;
+  if (!SUPERVISED_GIT_OPERATIONS.has(operation.kind)) return false;
+  durableProcessIdentity(operation);
+  return true;
+}
+
 function validatePersistedProcessIdentity(identity) {
   if (!identity || typeof identity !== "object" || Array.isArray(identity)) return false;
   if (!hasExactKeys(identity, ["pid", "source", "startTime"])) return false;
@@ -123,6 +138,7 @@ function expectedRecordKeys(record) {
   ];
   for (const optional of [
     "claudeProcess",
+    "gitOperation",
     "worktreeRoot",
     "baseCommit",
     "orphanReason",
@@ -159,7 +175,13 @@ function validateTerminalProof(proof) {
   if (!proof || typeof proof !== "object" || typeof proof.kind !== "string") return false;
   if (!validTimestamp(proof.observedAt)) return false;
   if (proof.kind === "child-event") {
-    return hasExactKeys(proof, ["event", "kind", "observedAt"]) && ["close", "exit"].includes(proof.event);
+    // Only `close` proves the exact child and its stdio ended. `exit` alone
+    // leaves stdio open, which is exactly the case where a descendant still
+    // holds the pipes, so it is never accepted as custody proof.
+    return hasExactKeys(proof, ["event", "kind", "observedAt"]) && proof.event === "close";
+  }
+  if (proof.kind === "supervised-child-close") {
+    return hasExactKeys(proof, ["event", "kind", "observedAt"]) && proof.event === "close";
   }
   if (proof.kind === "not-started") {
     return hasExactKeys(proof, ["kind", "observedAt"]);
@@ -216,6 +238,7 @@ export function validateDurableOwnershipRecord(record) {
     if ((record.worktreeRoot === undefined) !== (record.baseCommit === undefined)) return undefined;
     if (record.orphanReason !== undefined) validIdentityString("orphanReason", record.orphanReason);
     if (record.state === "ORPHANED" && !record.orphanReason) return undefined;
+    if (record.gitOperation !== undefined && !validatePersistedGitOperation(record.gitOperation)) return undefined;
     if (record.terminalProof !== undefined && !validateTerminalProof(record.terminalProof)) return undefined;
     if (["TERMINAL_PROVEN", "HANDOFF_READY", "RELEASED"].includes(record.state) && !record.terminalProof) {
       return undefined;
@@ -325,6 +348,10 @@ export class DurableWriteCustodyManager {
   #now;
   #createNonce;
   #liveIdentities = new Map();
+  // Executions whose Claude child this live coordinator spawned. Purely
+  // in-memory: after a restart it is empty, so a SPAWNING record without a
+  // durable child identity stays fail-closed exactly as before.
+  #supervisedSpawns = new Map();
 
   constructor({
     stateRoot,
@@ -447,8 +474,48 @@ export class DurableWriteCustodyManager {
     });
   }
 
+  /**
+   * Persists the durable identity of the exact Git process performing a
+   * mutating worktree operation. Written only after that process was spawned
+   * and its PID+StartTime were established, so a coordinator crash mid-
+   * preparation can be reconciled by identity instead of by guessing.
+   */
+  async recordWorktreeOperation({ executionId, canonicalRootKey, gitOperation }) {
+    const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+    if (record.state !== "PREPARING_WORKTREE") {
+      throw new WriteCustodyError("A Git worktree operation may only be recorded while preparing.", {
+        code: "write_custody_state_invalid"
+      });
+    }
+    if (!validatePersistedGitOperation(gitOperation)) {
+      throw new WriteCustodyError("A valid supervised Git operation identity is required.", {
+        code: "write_custody_git_operation_invalid"
+      });
+    }
+    return await this.#amendRecord(record, {
+      gitOperation: {
+        kind: gitOperation.kind,
+        pid: gitOperation.pid,
+        startTime: gitOperation.startTime,
+        source: gitOperation.source
+      }
+    });
+  }
+
+  /**
+   * Clears the recorded Git operation. The caller must already hold supervised
+   * terminal proof (the exact Git child closed); a timeout is never enough.
+   */
+  async clearWorktreeOperation({ executionId, canonicalRootKey }) {
+    const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+    if (!record.gitOperation) return recordSnapshot(record);
+    return await this.#amendRecord(record, { gitOperation: undefined });
+  }
+
   async markSpawning({ executionId, canonicalRootKey }) {
-    return await this.#transitionOwned({ executionId, canonicalRootKey }, "SPAWNING");
+    const record = await this.#transitionOwned({ executionId, canonicalRootKey }, "SPAWNING");
+    this.#supervisedSpawns.set(record.repositoryId, record.executionId);
+    return record;
   }
 
   async activateWriteAccess({ executionId, canonicalRootKey, processIdentity }) {
@@ -498,12 +565,13 @@ export class DurableWriteCustodyManager {
     if (
       !terminalProof ||
       typeof terminalProof !== "object" ||
-      !["close", "exit"].includes(terminalProof.event) ||
+      terminalProof.event !== "close" ||
       !validTimestamp(terminalProof.observedAt)
     ) {
-      throw new WriteCustodyError("A valid terminal proof is required before write custody can return.", {
-        code: "write_custody_terminal_proof_missing"
-      });
+      throw new WriteCustodyError(
+        "Write custody returns only on a close event for the exact Claude child; an exit event is not proof.",
+        { code: "write_custody_terminal_proof_missing" }
+      );
     }
     this.#requireLiveIdentity(record, terminalProof.processIdentity, {
       allowUnpersistedIdentity: record.state === "SPAWNING"
@@ -515,6 +583,63 @@ export class DurableWriteCustodyManager {
     }, record.claudeProcess
       ? {}
       : { claudeProcess: durableProcessIdentity(terminalProof.processIdentity) });
+  }
+
+  /**
+   * Releases custody for a Claude child that died before its durable
+   * PID+StartTime identity could be captured.
+   *
+   * This is admissible only because the very same live coordinator both
+   * spawned the exact ChildProcess and observed its `close`. That evidence is
+   * in-memory (#supervisedSpawns) and cannot survive a restart, so a SPAWNING
+   * record whose child was never durably identified still fails closed for any
+   * other or later coordinator. No fake durable identity is ever fabricated or
+   * persisted.
+   */
+  async releaseWriteAccessAfterSupervisedClose({ executionId, canonicalRootKey, terminalProof }) {
+    const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+    if (record.state !== "SPAWNING") {
+      throw new WriteCustodyError(
+        "A supervised close may only terminalize a spawning reservation.",
+        { code: "write_custody_state_invalid" }
+      );
+    }
+    if (record.claudeProcess) {
+      throw new WriteCustodyError(
+        "A durable Claude identity exists; terminal proof must be identity-bound.",
+        { code: "write_custody_terminal_proof_required" }
+      );
+    }
+    if (
+      !terminalProof ||
+      typeof terminalProof !== "object" ||
+      terminalProof.event !== "close" ||
+      terminalProof.supervisedByCoordinator !== true ||
+      !validTimestamp(terminalProof.observedAt)
+    ) {
+      throw new WriteCustodyError(
+        "A supervised close proof for the exact spawned child is required.",
+        { code: "write_custody_terminal_proof_missing" }
+      );
+    }
+    if (this.#supervisedSpawns.get(record.repositoryId) !== record.executionId) {
+      throw new WriteCustodyError(
+        "This coordinator did not supervise the spawn of the owning execution.",
+        { code: "write_custody_terminal_proof_required" }
+      );
+    }
+    if (record.coordinatorProcess?.pid !== this.#currentPid) {
+      throw new WriteCustodyError(
+        "Only the coordinator that reserved the record may use supervised close evidence.",
+        { code: "write_custody_terminal_proof_required" }
+      );
+    }
+
+    return await this.#terminalizeAndRelease(record, {
+      kind: "supervised-child-close",
+      event: "close",
+      observedAt: terminalProof.observedAt
+    });
   }
 
   async markOrphanedWriteAccess({ executionId, canonicalRootKey, processIdentity, reason }) {
@@ -574,6 +699,44 @@ export class DurableWriteCustodyManager {
         reason: "terminal-record",
         coordinator: coordinator.status,
         record: released
+      });
+    }
+
+    // A mutating Git operation was in flight when the coordinator died. Its
+    // durable identity decides whether the repository is still being written.
+    // Whatever the answer, any partially or fully created worktree is
+    // preserved: nothing here deletes a worktree heuristically.
+    if (record.gitOperation) {
+      const gitOperation = await compareProcessIdentity(record.gitOperation, {
+        inspectProcess: this.#inspectProcess
+      });
+      if (gitOperation.status === PROCESS_IDENTITY_MATCH.SAME_PROCESS) {
+        await this.#orphanDuringReconciliation(record, "coordinator-dead-git-operation-alive");
+        return Object.freeze({
+          released: false,
+          reason: "live",
+          coordinator: coordinator.status,
+          gitOperation: gitOperation.status
+        });
+      }
+      if (gitOperation.status === PROCESS_IDENTITY_MATCH.AMBIGUOUS) {
+        await this.#orphanDuringReconciliation(record, "git-operation-identity-ambiguous");
+        return Object.freeze({
+          released: false,
+          reason: "ambiguous",
+          coordinator: coordinator.status,
+          gitOperation: gitOperation.status
+        });
+      }
+      // Dead or PID-reused: that Git process is no longer running. It still
+      // cannot be proven that preparation completed consistently, so the
+      // execution is orphaned and its worktree is kept for inspection.
+      await this.#orphanDuringReconciliation(record, "git-operation-terminal-preparation-unproven");
+      return Object.freeze({
+        released: false,
+        reason: "preparation-unproven",
+        coordinator: coordinator.status,
+        gitOperation: gitOperation.status
       });
     }
 
@@ -649,6 +812,7 @@ export class DurableWriteCustodyManager {
       });
     }
     this.#liveIdentities.delete(current.repositoryId);
+    this.#supervisedSpawns.delete(current.repositoryId);
     return await this.#finishRelease(current);
   }
 
@@ -682,6 +846,27 @@ export class DurableWriteCustodyManager {
 
   async #transitionOwned(owner, nextState, additions = {}) {
     return await this.#transitionRecord(await this.#ownedRecord(owner), nextState, additions);
+  }
+
+  /**
+   * Updates fields on the owned record without a state transition. Used for
+   * supervised-operation bookkeeping that must not advance the lifecycle.
+   */
+  async #amendRecord(record, additions) {
+    // updatedAt is pinned to the last state transition by the durable schema,
+    // and an amendment is not a transition, so it is deliberately unchanged.
+    const next = { ...cloneRecord(record) };
+    for (const [key, value] of Object.entries(additions)) {
+      if (value === undefined) delete next[key];
+      else next[key] = value;
+    }
+    if (!validateDurableOwnershipRecord(next)) {
+      throw new WriteCustodyError("Refusing to persist an invalid durable ownership amendment.", {
+        code: "write_custody_state_invalid"
+      });
+    }
+    await this.#writeRecord(next);
+    return recordSnapshot(next);
   }
 
   async #transitionRecord(record, nextState, additions = {}) {
@@ -749,12 +934,19 @@ export class DurableWriteCustodyManager {
     return record;
   }
 
+  /**
+   * The durable record spells the coordinated repository root as canonicalRoot
+   * because that is the persisted schema field name. In memory the same value
+   * travels as processIdentity.repositoryRoot. This comparison is the single
+   * place the two vocabularies meet; both always name the repository root, and
+   * never the isolated workspace root of a general-purpose worker.
+   */
   #validateClaudeIdentity(record, processIdentity) {
     const durable = durableProcessIdentity(processIdentity);
     if (
       processIdentity?.executionId !== record.executionId ||
       processIdentity?.agentType !== record.agentType ||
-      processIdentity?.canonicalRoot !== record.canonicalRoot ||
+      processIdentity?.repositoryRoot !== record.canonicalRoot ||
       !processIdentity?.child ||
       typeof processIdentity.child !== "object" ||
       !validTimestamp(processIdentity.startedAt) ||

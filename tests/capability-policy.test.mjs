@@ -32,7 +32,7 @@ import {
   ShellPolicyError
 } from "../src/shell-policy.mjs";
 import {
-  canonicalRootKey,
+  canonicalRepositoryKey,
   resolveCanonicalWorkspaceRoot
 } from "../src/workspace-root.mjs";
 
@@ -234,7 +234,7 @@ test("temporary settings are unique, task-free, and hook-enabled only for Bash p
 
 test("canonical roots use real paths, Git boundaries, and a deterministic non-Git fallback", async () => {
   assert.equal(
-    canonicalRootKey("C:\\Workspace\\Root", { platform: "win32" }),
+    canonicalRepositoryKey("C:\\Workspace\\Root", { platform: "win32" }),
     "c:\\workspace\\root"
   );
   await withTemporaryDirectory("claude-agents-root-", async (temporaryDirectory) => {
@@ -246,11 +246,11 @@ test("canonical roots use real paths, Git boundaries, and a deterministic non-Gi
     await mkdir(siblingSubdirectory, { recursive: true });
 
     const resolved = await resolveCanonicalWorkspaceRoot(subdirectory, { accessMode: "write" });
-    assert.equal(resolved.canonicalRoot, await realpath(gitRoot));
+    assert.equal(resolved.repositoryRoot, await realpath(gitRoot));
     assert.equal(resolved.rootSource, "git-boundary");
     const siblingResolved = await resolveCanonicalWorkspaceRoot(siblingSubdirectory, { accessMode: "write" });
-    assert.equal(siblingResolved.canonicalRoot, resolved.canonicalRoot);
-    assert.equal(siblingResolved.canonicalRootKey, resolved.canonicalRootKey);
+    assert.equal(siblingResolved.repositoryRoot, resolved.repositoryRoot);
+    assert.equal(siblingResolved.canonicalRepositoryKey, resolved.canonicalRepositoryKey);
 
     const worktreeRoot = path.join(temporaryDirectory, "worktree-root");
     const worktreeSubdirectory = path.join(worktreeRoot, "lib");
@@ -262,7 +262,7 @@ test("canonical roots use real paths, Git boundaries, and a deterministic non-Gi
     const plainRoot = path.join(temporaryDirectory, "plain-root");
     await mkdir(plainRoot, { recursive: true });
     const plainResolved = await resolveCanonicalWorkspaceRoot(plainRoot, { accessMode: "read" });
-    assert.equal(plainResolved.canonicalRoot, plainResolved.effectiveCwd);
+    assert.equal(plainResolved.repositoryRoot, plainResolved.effectiveCwd);
     assert.equal(plainResolved.rootSource, "cwd");
   });
 
@@ -275,7 +275,7 @@ test("canonical roots use real paths, Git boundaries, and a deterministic non-Gi
         throw error;
       }
     }),
-    /Cannot establish a canonical workspace root for write access/
+    /Cannot establish a canonical repository root for write access/
   );
   const readFallback = await resolveCanonicalWorkspaceRoot("read-fallback", {
     accessMode: "read",

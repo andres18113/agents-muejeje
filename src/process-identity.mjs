@@ -81,6 +81,13 @@ function windowsPowerShellPath(env) {
     : "powershell.exe";
 }
 
+/**
+ * Reads the invariant Windows start time for one PID.
+ *
+ * The deadline timer stays referenced: this observation decides PID reuse and
+ * liveness for custody and proof-of-death, so the runtime must remain alive
+ * until the bounded query resolves.
+ */
 function queryWindowsProcessStartTime(
   pid,
   {
@@ -135,7 +142,6 @@ function queryWindowsProcessStartTime(
       }
       finish({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-timeout" });
     }, timeoutMs);
-    if (typeof timer?.unref === "function") timer.unref();
 
     child.stdout?.on?.("data", (chunk) => {
       if (settled) return;

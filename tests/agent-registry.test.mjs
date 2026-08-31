@@ -311,18 +311,30 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
   const childProcessOwners = sourceFiles.filter((name) =>
     sourceByFile[name].includes('from "node:child_process"')
   );
+  // Orchestration Git no longer spawns directly: it goes through the one
+  // supervised external-process primitive.
   assert.deepEqual(childProcessOwners, [
     "claude-runner.mjs",
     "process-identity.mjs",
-    "worktree-manager.mjs"
+    "supervised-process.mjs"
   ]);
   assert.match(sourceByFile["claude-runner.mjs"], /spawnProcess = spawn/);
   assert.doesNotMatch(sourceByFile["claude-runner.mjs"], /env:\s*process\.env/);
   assert.match(sourceByFile["claude-runner.mjs"], /env:\s*runtime\.childEnvironment/);
   assert.match(sourceByFile["process-identity.mjs"], /Get-Process -Id/);
-  assert.match(sourceByFile["worktree-manager.mjs"], /spawnProcess\("git"/);
+  assert.match(sourceByFile["worktree-manager.mjs"], /runSupervisedProcess/);
   assert.doesNotMatch(sourceByFile["process-identity.mjs"], /claudeBin/);
   assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /claudeBin/);
+
+  // Git is an external execution boundary: it receives a built environment,
+  // never the inherited parent environment.
+  assert.match(sourceByFile["worktree-manager.mjs"], /env: buildGitEnvironment\(/);
+  assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /env:\s*process\.env/);
+  // No process is ever terminated by name.
+  for (const name of ["supervised-process.mjs", "claude-runner.mjs"]) {
+    assert.doesNotMatch(sourceByFile[name], /\/IM/, name + " must not kill by image name");
+    assert.doesNotMatch(sourceByFile[name], /imagename/iu, name + " must not kill by image name");
+  }
 
   for (const identifier of [
     "claude_review",
