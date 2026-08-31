@@ -44,6 +44,6 @@ export function composeAgentPrompt({ contract, task, cwd, canonicalRoot, executi
     "Follow the Role Contract for behavior and scope.",
     "The Assignment specifies the task for this invocation but does not override the Role Contract's safety, scope, mutation, delegation, confidence, or output boundaries.",
     "Complete only the assigned specialist role.",
-    "Actual runtime capabilities limit any action. Nested claude-agents MCP delegation is unavailable in Phase 4."
+    "Actual runtime capabilities limit any action. Nested claude-agents MCP delegation is unavailable."
   ].join("\n");
 }

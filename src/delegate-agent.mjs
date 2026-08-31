@@ -17,6 +17,10 @@ import {
 import { composeAgentPrompt } from "./prompt-composer.mjs";
 import { PROCESS_WRITE_CUSTODY } from "./write-custody.mjs";
 import { resolveCanonicalWorkspaceRoot } from "./workspace-root.mjs";
+import {
+  GitWorktreeManager,
+  resolveRepositoryCoordinationIdentity
+} from "./worktree-manager.mjs";
 
 export const DELEGATE_AGENT_TYPES = Object.freeze(Object.keys(AGENT_REGISTRY));
 export const MAX_DELEGATE_TASK_CHARS = 100_000;
@@ -256,7 +260,9 @@ function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now,
     timeoutSource: runtime.timeoutSource,
     startedAt,
     durationMs: Math.max(0, now() - startedAt),
-    runtimeCapabilities: runtime.capabilityDescription
+    runtimeCapabilities: runtime.capabilityDescription,
+    ...(workspace.worktreeRoot ? { worktreeRoot: workspace.worktreeRoot } : {}),
+    ...(workspace.baseCommit ? { baseCommit: workspace.baseCommit } : {})
   };
 }
 
@@ -314,9 +320,12 @@ export async function delegateAgent(input, dependencies = {}) {
   const resolveRuntime = dependencies.resolveRuntime || resolveAgentRuntime;
   const resolveWorkspace =
     dependencies.resolveWorkspaceRoot || resolveCanonicalWorkspaceRoot;
+  const resolveRepositoryIdentity =
+    dependencies.resolveRepositoryIdentity || resolveRepositoryCoordinationIdentity;
   const composePrompt = dependencies.composePrompt || composeAgentPrompt;
   const runAgent = dependencies.runAgent || runClaudeAgent;
   const writeCustody = dependencies.writeCustody || PROCESS_WRITE_CUSTODY;
+  const worktreeManager = dependencies.worktreeManager;
   const createExecutionId = dependencies.createExecutionId || randomUUID;
   const env = dependencies.env || process.env;
   const now = dependencies.now || Date.now;
@@ -326,52 +335,77 @@ export async function delegateAgent(input, dependencies = {}) {
   const profile = getProfile(agentType);
   const runtime = resolveRuntime(profile, { env });
   const requestedCwd = await resolveCwd(cwd);
-  const workspace = await resolveWorkspace(requestedCwd, {
+  const resolvedWorkspace = await resolveWorkspace(requestedCwd, {
     accessMode: runtime.accessMode
   });
+  const workspace = runtime.accessMode === "write"
+    ? await resolveRepositoryIdentity(resolvedWorkspace)
+    : resolvedWorkspace;
   const contract = await loadContract(profile.id);
-  const prompt = composePrompt({
-    profile,
-    contract,
-    task,
-    cwd: workspace.effectiveCwd,
-    canonicalRoot: workspace.canonicalRoot,
-    executionId,
-    runtime
-  });
   const startedAt = now();
+  let executionWorkspace = workspace;
   let reservation;
   let custodyState = runtime.accessMode === "write" ? "not-acquired" : "not-applicable";
   let writerProcessStarted = false;
   let writerProcessIdentity;
   let terminalProof;
   let processProvenNotStarted = false;
+  let runnerInvoked = false;
   let outcome;
 
   try {
     if (runtime.accessMode === "write") {
-      reservation = writeCustody.reserveWriteAccess({
+      reservation = await writeCustody.reserveWriteAccess({
         executionId,
         agentType: profile.id,
         canonicalRoot: workspace.canonicalRoot,
         canonicalRootKey: workspace.canonicalRootKey
       });
       custodyState = reservation.state.toLowerCase();
+      processProvenNotStarted = true;
+
+      if (profile.id === "general-purpose") {
+        const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
+        executionWorkspace = await isolatedWorktrees.prepare({
+          executionId,
+          canonicalRootKey: workspace.canonicalRootKey,
+          canonicalRoot: workspace.canonicalRoot,
+          effectiveCwd: workspace.effectiveCwd
+        });
+      } else {
+        reservation = await writeCustody.markSpawning({
+          executionId,
+          canonicalRootKey: workspace.canonicalRootKey
+        });
+        custodyState = reservation.state.toLowerCase();
+      }
     }
 
+    const prompt = composePrompt({
+    profile,
+    contract,
+    task,
+    cwd: executionWorkspace.effectiveCwd,
+    canonicalRoot: executionWorkspace.worktreeRoot || executionWorkspace.canonicalRoot,
+    executionId,
+    runtime
+  });
+    if (runtime.accessMode === "write") processProvenNotStarted = false;
+
+    runnerInvoked = true;
     const execution = await runAgent({
       profile,
       agentType: profile.id,
       prompt,
-      cwd: workspace.effectiveCwd,
-      canonicalRoot: workspace.canonicalRoot,
+      cwd: executionWorkspace.effectiveCwd,
+      canonicalRoot: executionWorkspace.canonicalRoot,
       executionId,
       runtime,
       onChildStarted: runtime.accessMode === "write"
-        ? (processIdentity) => {
+        ? async (processIdentity) => {
             writerProcessStarted = true;
             writerProcessIdentity = processIdentity;
-            reservation = writeCustody.activateWriteAccess({
+            reservation = await writeCustody.activateWriteAccess({
               executionId,
               canonicalRootKey: workspace.canonicalRootKey,
               processIdentity
@@ -380,10 +414,10 @@ export async function delegateAgent(input, dependencies = {}) {
           }
         : undefined,
       onTerminationStarted: runtime.accessMode === "write"
-        ? (processIdentity) => {
+        ? async (processIdentity) => {
             writerProcessStarted = true;
             writerProcessIdentity = processIdentity;
-            reservation = writeCustody.beginTermination({
+            reservation = await writeCustody.beginTermination({
               executionId,
               canonicalRootKey: workspace.canonicalRootKey,
               processIdentity
@@ -400,7 +434,7 @@ export async function delegateAgent(input, dependencies = {}) {
       ...baseOutcome({
         profile,
         runtime,
-        workspace,
+        workspace: executionWorkspace,
         executionId,
         startedAt,
         now,
@@ -417,12 +451,12 @@ export async function delegateAgent(input, dependencies = {}) {
     writerProcessStarted = writerProcessStarted || error?.processStarted === true || Boolean(error?.processIdentity);
     writerProcessIdentity = writerProcessIdentity || error?.processIdentity;
     terminalProof = error?.terminalProof;
-    processProvenNotStarted = error?.processStarted === false;
+    processProvenNotStarted = !runnerInvoked || error?.processStarted === false;
     outcome = {
       ...baseOutcome({
         profile,
         runtime,
-        workspace,
+        workspace: executionWorkspace,
         executionId,
         startedAt,
         now,
@@ -439,20 +473,20 @@ export async function delegateAgent(input, dependencies = {}) {
     if (reservation) {
       try {
         if (!writerProcessStarted && processProvenNotStarted && outcome?.status !== "completed") {
-          const released = writeCustody.releaseUnstartedWriteAccess({
+          const released = await writeCustody.releaseUnstartedWriteAccess({
             executionId,
             canonicalRootKey: workspace.canonicalRootKey
           });
           custodyState = released.state.toLowerCase();
         } else if (writerProcessStarted && terminalProof) {
-          const released = writeCustody.releaseWriteAccessAfterTerminal({
+          const released = await writeCustody.releaseWriteAccessAfterTerminal({
             executionId,
             canonicalRootKey: workspace.canonicalRootKey,
             terminalProof
           });
           custodyState = released.state.toLowerCase();
         } else {
-          const orphaned = writeCustody.markOrphanedWriteAccess({
+          const orphaned = await writeCustody.markOrphanedWriteAccess({
             executionId,
             canonicalRootKey: workspace.canonicalRootKey,
             processIdentity: writerProcessIdentity,
@@ -463,7 +497,7 @@ export async function delegateAgent(input, dependencies = {}) {
             ...baseOutcome({
               profile,
               runtime,
-              workspace,
+              workspace: executionWorkspace,
               executionId,
               startedAt,
               now,
@@ -479,7 +513,7 @@ export async function delegateAgent(input, dependencies = {}) {
         if (outcome) outcome.custodyState = custodyState;
       } catch (releaseError) {
         try {
-          const orphaned = writeCustody.markOrphanedWriteAccess({
+          const orphaned = await writeCustody.markOrphanedWriteAccess({
             executionId,
             canonicalRootKey: workspace.canonicalRootKey,
             processIdentity: writerProcessIdentity,
@@ -493,7 +527,7 @@ export async function delegateAgent(input, dependencies = {}) {
           ...baseOutcome({
             profile,
             runtime,
-            workspace,
+            workspace: executionWorkspace,
             executionId,
             startedAt,
             now,
@@ -530,6 +564,12 @@ export function formatDelegateAgentOutcome(outcome) {
 
   if (Number.isSafeInteger(outcome.pid)) {
     lines.push("Pid: " + outcome.pid);
+  }
+  if (outcome.worktreeRoot) {
+    lines.push("WorktreeRoot: " + outcome.worktreeRoot);
+  }
+  if (outcome.baseCommit) {
+    lines.push("BaseCommit: " + outcome.baseCommit);
   }
 
   if (outcome.status === "completed") {

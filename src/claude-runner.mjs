@@ -4,6 +4,13 @@ import {
   ClaudeRuntimeSettingsError,
   createRuntimeSettings
 } from "./claude-runtime-settings.mjs";
+import {
+  PROCESS_IDENTITY_MATCH,
+  PROCESS_IDENTITY_STATUS,
+  compareProcessIdentity,
+  inspectProcessIdentity,
+  validateDurableProcessIdentity
+} from "./process-identity.mjs";
 
 const STDERR_SUMMARY_BYTES = 16 * 1024;
 export const PROCESS_TREE_TERMINATION_TIMEOUT_MS = 5_000;
@@ -187,16 +194,31 @@ function childIsAlreadyTerminal(child) {
   );
 }
 
-function createProcessIdentity({ child, executionId, agentType, canonicalRoot, now }) {
+function createProcessIdentityCandidate({ child, executionId, agentType, canonicalRoot, now }) {
   if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) return undefined;
-  return Object.freeze({
+  return {
     executionId,
     agentType,
     canonicalRoot,
     pid: child.pid,
     child,
     startedAt: now()
-  });
+  };
+}
+
+function finalizeProcessIdentity(candidate, processObservation) {
+  if (!candidate) return undefined;
+  if (processObservation?.status !== PROCESS_IDENTITY_STATUS.ALIVE) return undefined;
+  let durableIdentity;
+  try {
+    durableIdentity = validateDurableProcessIdentity(processObservation.identity);
+  } catch {
+    return undefined;
+  }
+  if (durableIdentity.pid !== candidate.pid) return undefined;
+  candidate.startTime = durableIdentity.startTime;
+  candidate.source = durableIdentity.source;
+  return Object.freeze(candidate);
 }
 
 /**
@@ -206,21 +228,24 @@ function createProcessIdentity({ child, executionId, agentType, canonicalRoot, n
  */
 export function observeClaudeChildTerminal(child, processIdentity, { now = Date.now } = {}) {
   let terminalProof;
+  let closeProof;
   let resolveTerminal;
   const terminalPromise = new Promise((resolve) => {
     resolveTerminal = resolve;
   });
 
   const observe = (event, code, signal) => {
-    if (terminalProof) return;
-    terminalProof = Object.freeze({
+    const proof = Object.freeze({
       processIdentity,
       event,
       code,
       signal,
       observedAt: now()
     });
-    resolveTerminal(terminalProof);
+    if (event === "close") closeProof = proof;
+    if (terminalProof) return;
+    terminalProof = proof;
+    resolveTerminal(proof);
   };
 
   child?.once?.("close", (code, signal) => observe("close", code, signal));
@@ -232,6 +257,7 @@ export function observeClaudeChildTerminal(child, processIdentity, { now = Date.
   return Object.freeze({
     processIdentity,
     getTerminalProof: () => terminalProof,
+    getCloseProof: () => closeProof,
     terminalPromise
   });
 }
@@ -317,7 +343,8 @@ export async function terminateClaudeChild(
     cancelSchedule = clearTimeout,
     terminationTimeoutMs = PROCESS_TREE_TERMINATION_TIMEOUT_MS,
     terminalObserver = observeClaudeChildTerminal(child, undefined),
-    processIdentity
+    processIdentity,
+    inspectProcess = inspectProcessIdentity
   } = {}
 ) {
   if (!runtimeTimeoutIsValid(terminationTimeoutMs)) {
@@ -345,6 +372,28 @@ export async function terminateClaudeChild(
 
   const validPid = Number.isSafeInteger(child?.pid) && child.pid > 0;
   if (platform === "win32" && validPid) {
+    const identityMatch = processIdentity
+      ? await compareProcessIdentity(processIdentity, { inspectProcess })
+      : Object.freeze({
+          status: PROCESS_IDENTITY_MATCH.AMBIGUOUS,
+          reason: "process-identity-unavailable"
+        });
+    if (identityMatch.status !== PROCESS_IDENTITY_MATCH.SAME_PROCESS) {
+      const proof = await waitForTerminalProof(terminalObserver, {
+        timeoutMs: terminationTimeoutMs,
+        schedule,
+        cancelSchedule
+      });
+      return proof
+        ? terminalResult("already-terminal", "identity-check", proof, {
+            identityStatus: identityMatch.status
+          })
+        : terminalResult("termination-unproven", "identity-check", undefined, {
+            identityStatus: identityMatch.status,
+            reason: identityMatch.reason || "process-identity-not-live"
+          });
+    }
+
     let terminator;
     try {
       terminator = spawnTerminator(
@@ -457,12 +506,13 @@ async function terminateStartedChild({
   terminateChild,
   onTerminationStarted,
   terminationTimeoutMs,
+  inspectProcess,
   now
 }) {
   let transitionError;
   if (processIdentity && onTerminationStarted) {
     try {
-      onTerminationStarted(processIdentity);
+      await onTerminationStarted(processIdentity);
     } catch (error) {
       transitionError = error;
     }
@@ -473,7 +523,8 @@ async function terminateStartedChild({
     terminationResult = await terminateChild(child, {
       processIdentity,
       terminalObserver,
-      terminationTimeoutMs
+      terminationTimeoutMs,
+      inspectProcess
     });
   } catch (error) {
     terminationResult = terminalResult("termination-unproven", "none", undefined, { error });
@@ -516,6 +567,7 @@ export async function runClaudeAgent({
   spawnProcess = spawn,
   createSettings = createRuntimeSettings,
   terminateChild = terminateClaudeChild,
+  inspectProcess = inspectProcessIdentity,
   terminationTimeoutMs = PROCESS_TREE_TERMINATION_TIMEOUT_MS,
   now = Date.now
 }) {
@@ -623,14 +675,24 @@ export async function runClaudeAgent({
     );
   }
 
-  const processIdentity = createProcessIdentity({
+  const processIdentityCandidate = createProcessIdentityCandidate({
     child,
     executionId,
     agentType,
     canonicalRoot,
     now
   });
-  const terminalObserver = observeClaudeChildTerminal(child, processIdentity, { now });
+  const terminalObserver = observeClaudeChildTerminal(child, processIdentityCandidate, { now });
+  let processObservation;
+  try {
+    processObservation = await inspectProcess(child?.pid);
+  } catch {
+    processObservation = Object.freeze({
+      status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
+      reason: "inspection-threw"
+    });
+  }
+  const processIdentity = finalizeProcessIdentity(processIdentityCandidate, processObservation);
   const stopAndBuildError = async (originalError) =>
     terminateStartedChild({
       child,
@@ -640,6 +702,7 @@ export async function runClaudeAgent({
       terminateChild,
       onTerminationStarted,
       terminationTimeoutMs,
+      inspectProcess,
       now
     });
 
@@ -656,7 +719,7 @@ export async function runClaudeAgent({
   }
 
   try {
-    onChildStarted?.(processIdentity);
+    await onChildStarted?.(processIdentity);
   } catch (callbackError) {
     const error = await stopAndBuildError(
       new ClaudeRunnerError("Claude child-start lifecycle callback failed: " + callbackError.message, {
@@ -789,7 +852,7 @@ export async function runClaudeAgent({
         )
       );
     });
-    child.on("close", (code, signal) => {
+    const handleClose = (code, signal) => {
       if (settled || stoppingPromise) return;
 
       const outputDiagnostics = diagnostics();
@@ -838,18 +901,24 @@ export async function runClaudeAgent({
         processIdentity,
         terminalProof
       });
-    });
+    };
+    child.on("close", handleClose);
 
     timer = setTimeout(() => {
       finishAfterForcedTermination(new ClaudeTimeoutError(runtime.timeoutMs, diagnostics()));
     }, runtime.timeoutMs);
 
-    try {
-      child.stdin.write(prompt, "utf8");
-      child.stdin.end();
-    } catch (error) {
-      if (!pendingStdinError) {
-        pendingStdinError = error instanceof Error ? error : new Error(String(error));
+    const priorCloseProof = terminalObserver.getCloseProof?.();
+    if (priorCloseProof) {
+      setImmediate(() => handleClose(priorCloseProof.code, priorCloseProof.signal));
+    } else {
+      try {
+        child.stdin.write(prompt, "utf8");
+        child.stdin.end();
+      } catch (error) {
+        if (!pendingStdinError) {
+          pendingStdinError = error instanceof Error ? error : new Error(String(error));
+        }
       }
     }
   });

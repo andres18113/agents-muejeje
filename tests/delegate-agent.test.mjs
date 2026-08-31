@@ -11,7 +11,7 @@ import { loadAgentContract } from "../src/agent-contracts.mjs";
 import {
   DELEGATE_AGENT_TYPES,
   MAX_DELEGATE_TASK_CHARS,
-  delegateAgent,
+  delegateAgent as delegateAgentImplementation,
   delegateAgentInputSchema,
   formatDelegateAgentOutcome,
   registerDelegateAgentTool,
@@ -25,10 +25,10 @@ import {
   ClaudeTimeoutError,
   getClaudeRunnerArgs,
   observeClaudeChildTerminal,
-  runClaudeAgent,
+  runClaudeAgent as runClaudeAgentImplementation,
   terminateClaudeChild
 } from "../src/claude-runner.mjs";
-import { WriteCustodyManager } from "../src/write-custody.mjs";
+import { WriteCustodyError } from "../src/write-custody.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const expectedAgentTypes = [
@@ -40,6 +40,145 @@ const expectedAgentTypes = [
   "rubber-duck",
   "security-review"
 ];
+
+class WriteCustodyManager {
+  #records = new Map();
+
+  worktreeRootFor({ executionId }) {
+    return path.join(os.tmpdir(), "test-worktree-" + executionId);
+  }
+
+  reserveWriteAccess(record) {
+    if (this.#records.has(record.canonicalRootKey)) {
+      throw new WriteCustodyError("Write custody is already reserved.", { code: "write_custody_conflict" });
+    }
+    const reserved = { ...record, state: "RESERVED", accessMode: "none" };
+    this.#records.set(record.canonicalRootKey, reserved);
+    return reserved;
+  }
+
+  beginWorktreePreparation(owner) {
+    return this.#transition(owner, "PREPARING_WORKTREE", "none");
+  }
+
+  markSpawning(owner) {
+    return this.#transition(owner, "SPAWNING", "none");
+  }
+
+  activateWriteAccess({ processIdentity, ...owner }) {
+    const record = this.#owned(owner);
+    record.processIdentity = processIdentity;
+    return this.#transition(owner, "ACTIVE", "write");
+  }
+
+  beginTermination({ processIdentity, ...owner }) {
+    const record = this.#owned(owner);
+    if (record.processIdentity !== processIdentity) {
+      throw new WriteCustodyError("Process identity mismatch.", { code: "write_custody_process_identity_mismatch" });
+    }
+    return this.#transition(owner, "TERMINATING", "write");
+  }
+
+  releaseUnstartedWriteAccess(owner) {
+    const record = this.#owned(owner);
+    if (record.processIdentity) {
+      throw new WriteCustodyError("Terminal proof required.", { code: "write_custody_terminal_proof_required" });
+    }
+    this.#records.delete(owner.canonicalRootKey);
+    return { ...record, state: "RELEASED", accessMode: "none" };
+  }
+
+  releaseWriteAccessAfterTerminal({ terminalProof, ...owner }) {
+    const record = this.#owned(owner);
+    if (!["ACTIVE", "TERMINATING"].includes(record.state)) {
+      throw new WriteCustodyError("Invalid state.", { code: "write_custody_state_invalid" });
+    }
+    if (!terminalProof || terminalProof.processIdentity !== record.processIdentity) {
+      throw new WriteCustodyError("Terminal proof mismatch.", { code: "write_custody_process_identity_mismatch" });
+    }
+    this.#records.delete(owner.canonicalRootKey);
+    return { ...record, state: "RELEASED", accessMode: "none" };
+  }
+
+  markOrphanedWriteAccess({ processIdentity, reason, ...owner }) {
+    const record = this.#owned(owner);
+    if (processIdentity) record.processIdentity = processIdentity;
+    record.orphanReason = reason;
+    return this.#transition(owner, "ORPHANED", "write");
+  }
+
+  getWriteAccess(key) {
+    const record = this.#records.get(key);
+    return record ? { ...record } : undefined;
+  }
+
+  #owned({ executionId, canonicalRootKey }) {
+    const record = this.#records.get(canonicalRootKey);
+    if (!record) throw new WriteCustodyError("Missing custody.", { code: "write_custody_missing" });
+    if (record.executionId !== executionId) {
+      throw new WriteCustodyError("Owner mismatch.", { code: "write_custody_owner_mismatch" });
+    }
+    return record;
+  }
+
+  #transition(owner, state, accessMode) {
+    const record = this.#owned(owner);
+    record.state = state;
+    record.accessMode = accessMode;
+    return { ...record };
+  }
+}
+
+function passthroughWorktreeManager(writeCustody) {
+  return {
+    async prepare({ executionId, canonicalRootKey, canonicalRoot, effectiveCwd }) {
+      const worktreeRoot = writeCustody.worktreeRootFor({ executionId, canonicalRootKey });
+      writeCustody.beginWorktreePreparation({
+        executionId,
+        canonicalRootKey,
+        baseCommit: "a".repeat(40),
+        worktreeRoot
+      });
+      writeCustody.markSpawning({ executionId, canonicalRootKey });
+      return {
+        effectiveCwd,
+        canonicalRoot,
+        canonicalRootKey,
+        rootSource: "test-isolated-worktree",
+        worktreeRoot,
+        baseCommit: "a".repeat(40)
+      };
+    }
+  };
+}
+
+async function delegateAgent(input, dependencies = {}) {
+  const writeCustody = dependencies.writeCustody || new WriteCustodyManager();
+  return await delegateAgentImplementation(input, {
+    ...dependencies,
+    writeCustody,
+    resolveRepositoryIdentity: dependencies.resolveRepositoryIdentity || (async (workspace) => workspace),
+    worktreeManager: dependencies.worktreeManager || passthroughWorktreeManager(writeCustody)
+  });
+}
+
+async function inspectFakeProcess(pid) {
+  return {
+    status: "alive",
+    identity: {
+      pid,
+      startTime: String(pid * 100),
+      source: "test-process-start"
+    }
+  };
+}
+
+function runClaudeAgent(argumentsForRunner) {
+  return runClaudeAgentImplementation({
+    inspectProcess: inspectFakeProcess,
+    ...argumentsForRunner
+  });
+}
 
 function runtimeForTest(overrides = {}) {
   return {
@@ -109,6 +248,8 @@ function completedWriterExecution(argumentsForRunner, result = "specialist respo
     agentType: argumentsForRunner.agentType,
     canonicalRoot: argumentsForRunner.canonicalRoot,
     pid: child.pid,
+    startTime: String(child.pid * 100),
+    source: "test-process-start",
     child,
     startedAt: 1
   });
@@ -213,7 +354,11 @@ test("each remaining profile is looked up from the registry and receives only it
     assert.ok(runnerArguments.prompt.includes(expectedContract.trim()));
     assert.equal(countOccurrences(runnerArguments.prompt, task), 1);
     assert.ok(runnerArguments.prompt.includes("Working directory: " + projectRoot));
-    assert.ok(runnerArguments.prompt.includes("Canonical root: " + projectRoot));
+    assert.ok(
+      runnerArguments.prompt.includes(
+        "Canonical root: " + (agentType === "general-purpose" ? outcome.worktreeRoot : projectRoot)
+      )
+    );
     assert.match(runnerArguments.prompt, /Execution ID: [A-Za-z0-9_-]+/);
     assert.match(runnerArguments.prompt, /Runtime capabilities:/);
     assert.match(
@@ -373,12 +518,12 @@ test("each explicit delegation invokes a fresh runner and keeps nested MCP deleg
   assert.equal(calls.length, 2);
   assert.notEqual(calls[0], calls[1]);
   assert.notEqual(first.executionId, second.executionId);
-  assert.match(calls[0].prompt, /Nested claude-agents MCP delegation is unavailable in Phase 4/);
+  assert.match(calls[0].prompt, /Nested claude-agents MCP delegation is unavailable/);
   assert.equal(calls[0].runtime.disallowedTools.includes("mcp__*"), true);
   assert.equal(calls[0].runtime.toolNames.includes("Task"), false);
 });
 
-test("write admission is process-local, releases on all terminal outcomes, and leaves reads concurrent", async () => {
+test("write admission releases on terminal outcomes and leaves reads concurrent", async () => {
   const custody = new WriteCustodyManager();
   const firstRoot = projectRoot;
   const secondRoot = os.tmpdir();
@@ -527,6 +672,7 @@ test("normal exact child close returns active writer custody", async () => {
     }
   );
   await writerStartedPromise;
+  await afterRunnerStarts();
   const rootKey = workspaceForTest(root).canonicalRootKey;
   assert.equal(custody.getWriteAccess(rootKey).state, "ACTIVE");
   child.stdout.end("normal result");
@@ -954,6 +1100,89 @@ test("Claude runner transports multi-KB prompts through stdin, never argv", asyn
   assert.equal(result.pid, 6789);
 });
 
+test("Claude stdin remains gated until PID plus start-time identity is accepted", async () => {
+  const child = createFakeChild({ pid: 6790 });
+  const received = [];
+  child.stdin.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  let releaseIdentityPersistence;
+  const identityPersisted = new Promise((resolve) => {
+    releaseIdentityPersistence = resolve;
+  });
+  let identityObserved;
+  let notifyIdentityObserved;
+  const identityObservedPromise = new Promise((resolve) => {
+    notifyIdentityObserved = resolve;
+  });
+
+  const pending = runClaudeAgent({
+    prompt: "gated prompt",
+    cwd: projectRoot,
+    canonicalRoot: projectRoot,
+    executionId: "identity-gate",
+    agentType: "task",
+    runtime: runtimeForTest(),
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    async onChildStarted(processIdentity) {
+      identityObserved = processIdentity;
+      notifyIdentityObserved();
+      await identityPersisted;
+    }
+  });
+
+  await identityObservedPromise;
+  assert.equal(identityObserved.pid, 6790);
+  assert.equal(identityObserved.startTime, "679000");
+  assert.equal(received.length, 0);
+  releaseIdentityPersistence();
+  await afterRunnerStarts();
+  assert.equal(Buffer.concat(received).toString("utf8"), "gated prompt");
+  child.stdout.end("done");
+  child.emit("close", 0, null);
+  await pending;
+});
+
+test("a child that closes during durable activation is handled without waiting for the profile timeout", async () => {
+  const child = createFakeChild({ pid: 6791 });
+  const received = [];
+  child.stdin.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  let releaseActivation;
+  const activationMayFinish = new Promise((resolve) => {
+    releaseActivation = resolve;
+  });
+  let notifyActivationStarted;
+  const activationStarted = new Promise((resolve) => {
+    notifyActivationStarted = resolve;
+  });
+
+  const pending = runClaudeAgent({
+    prompt: "must remain gated",
+    cwd: projectRoot,
+    canonicalRoot: projectRoot,
+    executionId: "early-close-during-activation",
+    agentType: "task",
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    async onChildStarted() {
+      notifyActivationStarted();
+      await activationMayFinish;
+    }
+  });
+
+  await activationStarted;
+  child.stderr.end("startup failed before prompt");
+  child.emit("close", 7, null);
+  releaseActivation();
+  await assert.rejects(pending, (error) => {
+    assert.ok(error instanceof ClaudeExitError);
+    assert.equal(error.code, "claude_non_zero_exit");
+    assert.equal(error.stderrSummary, "startup failed before prompt");
+    return true;
+  });
+  assert.equal(received.length, 0);
+});
+
 test("Claude runner removes per-invocation settings on success, failure, and timeout", async () => {
   let successfulCleanup = 0;
   const successfulChild = createFakeChild();
@@ -1075,18 +1304,26 @@ test("runtime settings failures fail closed before Claude spawn and spawn failur
 test("Windows forced termination targets only the exact Claude child PID and awaits terminal proof", async () => {
   const child = createFakeChild();
   child.pid = 4321;
+  const processIdentity = Object.freeze({
+    child,
+    pid: child.pid,
+    startTime: "432100",
+    source: "test-process-start"
+  });
   const terminator = new EventEmitter();
   terminator.killCalls = 0;
   terminator.kill = () => {
     terminator.killCalls += 1;
   };
   let invocation;
-  const terminalObserver = observeClaudeChildTerminal(child, { test: "identity" });
+  const terminalObserver = observeClaudeChildTerminal(child, processIdentity);
   let settled = false;
   const pending = terminateClaudeChild(child, {
     platform: "win32",
+    processIdentity,
     terminalObserver,
     terminationTimeoutMs: 100,
+    inspectProcess: inspectFakeProcess,
     spawnTerminator(command, args, options) {
       invocation = { command, args, options };
       return terminator;
@@ -1109,7 +1346,7 @@ test("Windows forced termination targets only the exact Claude child PID and awa
   const terminated = await pending;
   assert.equal(terminated.status, "terminated");
   assert.equal(terminated.method, "taskkill");
-  assert.equal(terminated.terminalProof.processIdentity.test, "identity");
+  assert.equal(terminated.terminalProof.processIdentity, processIdentity);
   assert.equal(terminator.killCalls, 0);
 
   const noPidChild = createFakeChild({ pid: null });
@@ -1149,6 +1386,42 @@ test("Windows forced termination targets only the exact Claude child PID and awa
   assert.equal(mismatchedResult.status, "termination-failed");
   assert.equal(mismatchedResult.reason, "process-identity-mismatch");
   assert.equal(mismatchedSpawnCalled, false);
+
+  const reusedPidChild = createFakeChild({ closeOnKill: false, pid: 7654 });
+  const reusedPidIdentity = Object.freeze({
+    child: reusedPidChild,
+    pid: reusedPidChild.pid,
+    startTime: "765400",
+    source: "test-process-start"
+  });
+  let reusedPidSpawnCalled = false;
+  const reusedPidObserver = observeClaudeChildTerminal(reusedPidChild, reusedPidIdentity);
+  const reusedPidPending = terminateClaudeChild(reusedPidChild, {
+    platform: "win32",
+    processIdentity: reusedPidIdentity,
+    terminalObserver: reusedPidObserver,
+    terminationTimeoutMs: 100,
+    inspectProcess: async () => ({
+      status: "alive",
+      identity: {
+        pid: reusedPidChild.pid,
+        startTime: "765499",
+        source: "test-process-start"
+      }
+    }),
+    spawnTerminator() {
+      reusedPidSpawnCalled = true;
+      return new EventEmitter();
+    }
+  });
+  await afterRunnerStarts();
+  assert.equal(reusedPidSpawnCalled, false);
+  assert.equal(reusedPidChild.killCalls, 0);
+  reusedPidChild.emit("close", 0, null);
+  const reusedPidResult = await reusedPidPending;
+  assert.equal(reusedPidResult.status, "already-terminal");
+  assert.equal(reusedPidResult.method, "identity-check");
+  assert.equal(reusedPidResult.identityStatus, "pid-reused");
 });
 
 test("Claude runner arms timeout before a stalled stdin can block execution", async () => {

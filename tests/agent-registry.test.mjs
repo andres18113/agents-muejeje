@@ -297,7 +297,7 @@ test("the MCP entrypoint registers only delegate_agent and owns no Claude runtim
   assert.deepEqual(registrations, ["delegate_agent"]);
 });
 
-test("the consolidated source has one child-process launch owner and no legacy runtime identifiers", async () => {
+test("child-process launch responsibilities remain explicit and no legacy runtime identifiers return", async () => {
   const sourceDirectory = path.join(projectRoot, "src");
   const sourceFiles = (await readdir(sourceDirectory))
     .filter((name) => name.endsWith(".mjs"))
@@ -311,10 +311,18 @@ test("the consolidated source has one child-process launch owner and no legacy r
   const childProcessOwners = sourceFiles.filter((name) =>
     sourceByFile[name].includes('from "node:child_process"')
   );
-  assert.deepEqual(childProcessOwners, ["claude-runner.mjs"]);
+  assert.deepEqual(childProcessOwners, [
+    "claude-runner.mjs",
+    "process-identity.mjs",
+    "worktree-manager.mjs"
+  ]);
   assert.match(sourceByFile["claude-runner.mjs"], /spawnProcess = spawn/);
   assert.doesNotMatch(sourceByFile["claude-runner.mjs"], /env:\s*process\.env/);
   assert.match(sourceByFile["claude-runner.mjs"], /env:\s*runtime\.childEnvironment/);
+  assert.match(sourceByFile["process-identity.mjs"], /Get-Process -Id/);
+  assert.match(sourceByFile["worktree-manager.mjs"], /spawnProcess\("git"/);
+  assert.doesNotMatch(sourceByFile["process-identity.mjs"], /claudeBin/);
+  assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /claudeBin/);
 
   for (const identifier of [
     "claude_review",
@@ -351,7 +359,7 @@ test("tracked routing policy and documentation name only the consolidated profil
   assert.match(routingPolicy, /narrow factual and evidentiary verification directly/);
   assert.match(routingPolicy, /explicit\/manual delegation/);
   assert.match(routingPolicy, /Runtime capability selection is profile-specific/);
-  assert.match(routingPolicy, /Codex must not concurrently edit that same root/);
+  assert.match(routingPolicy, /Codex must not concurrently edit that repository/);
   assert.match(routingPolicy, /not an OS sandbox/);
   assert.doesNotMatch(routingPolicy, /delegate_agent\(agent_type="verify"\)/);
   assert.doesNotMatch(readme, /agents\/verify\.md/);
@@ -397,7 +405,9 @@ test("package metadata and Windows CI provide clean deterministic validation", a
     "src/claude-runtime-settings.mjs",
     "src/shell-policy.mjs",
     "src/workspace-root.mjs",
+    "src/process-identity.mjs",
     "src/write-custody.mjs",
+    "src/worktree-manager.mjs",
     "src/delegate-agent.mjs",
     "src/prompt-composer.mjs",
     "src/claude-runner.mjs",
