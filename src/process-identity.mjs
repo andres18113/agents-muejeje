@@ -1,18 +1,44 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-const PROCESS_QUERY_TIMEOUT_MS = 5_000;
+/**
+ * The budget for one Windows identity query.
+ *
+ * The cost here is dominated by Windows PowerShell process startup, not by the
+ * query itself: locally a cold query completes in roughly a quarter of a
+ * second, but on a loaded CI runner several concurrent cold starts were
+ * observed to exceed five seconds, which turned a healthy process into an
+ * ambiguous observation. Ambiguity fails closed, so an over-tight budget does
+ * not corrupt custody, but it does block admission for a live process.
+ *
+ * Twenty seconds gives roughly four times the worst observed startup while
+ * staying finite and far below any profile timeout. It is a liveness budget,
+ * never a correctness one: exceeding it still yields AMBIGUOUS and is never
+ * converted into ALIVE or DEAD.
+ */
+const PROCESS_QUERY_TIMEOUT_MS = 20_000;
+
+/**
+ * Bounded wait for the exact query child to close after we ask it to stop.
+ * The query is read-only, so the observation stays AMBIGUOUS either way; this
+ * exists so a timed-out query is not simply forgotten while still running.
+ */
+const PROCESS_QUERY_TERMINATION_TIMEOUT_MS = 5_000;
+
 const MAX_PROCESS_QUERY_OUTPUT_BYTES = 4_096;
 const WINDOWS_IDENTITY_SOURCE = "windows-get-process-starttime-utc-ticks";
 
-// The script emits only invariant .NET ticks. Exit 3 means Get-Process
-// definitively did not find the PID; every other failure is ambiguous.
+// The script emits only invariant .NET ticks, never a localized console table.
+// It calls System.Diagnostics.Process directly rather than the Get-Process
+// cmdlet: the value is byte-identical (both read Process.StartTime) while
+// avoiding the Management module load on every query. Exit 3 means the PID
+// definitively does not exist; every other failure is ambiguous.
 const WINDOWS_PROCESS_QUERY_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $targetProcessId = [int]__PROCESS_ID__
 try {
-  $targetProcess = Get-Process -Id $targetProcessId -ErrorAction Stop
-} catch [Microsoft.PowerShell.Commands.ProcessCommandException] {
+  $targetProcess = [System.Diagnostics.Process]::GetProcessById($targetProcessId)
+} catch [System.ArgumentException] {
   exit 3
 } catch {
   exit 4
@@ -84,9 +110,16 @@ function windowsPowerShellPath(env) {
 /**
  * Reads the invariant Windows start time for one PID.
  *
- * The deadline timer stays referenced: this observation decides PID reuse and
+ * Both deadline timers stay referenced: this observation decides PID reuse and
  * liveness for custody and proof-of-death, so the runtime must remain alive
  * until the bounded query resolves.
+ *
+ * Abandoned queries are not simply forgotten. When the query is cut short, the
+ * exact spawned child is asked to stop and then awaited, bounded, for its
+ * `close` before the observation completes. Only the handle this function
+ * created is ever terminated; nothing is matched by process name. The query is
+ * read-only, so every one of these paths still reports AMBIGUOUS, which fails
+ * closed.
  */
 function queryWindowsProcessStartTime(
   pid,
@@ -94,6 +127,7 @@ function queryWindowsProcessStartTime(
     spawnProcess = spawn,
     env = process.env,
     timeoutMs = PROCESS_QUERY_TIMEOUT_MS,
+    terminationTimeoutMs = PROCESS_QUERY_TERMINATION_TIMEOUT_MS,
     schedule = setTimeout,
     cancelSchedule = clearTimeout
   } = {}
@@ -126,34 +160,50 @@ function queryWindowsProcessStartTime(
     const stdout = [];
     let stdoutBytes = 0;
     let settled = false;
-    let timedOut = false;
+    // Set once the query has been abandoned. From then on the only remaining
+    // work is the bounded wait for the exact child to close.
+    let abandoned;
+    let queryTimer;
+    let terminationTimer;
+
     const finish = (value) => {
       if (settled) return;
       settled = true;
-      cancelSchedule(timer);
+      cancelSchedule(queryTimer);
+      cancelSchedule(terminationTimer);
       resolve(Object.freeze(value));
     };
-    const timer = schedule(() => {
-      timedOut = true;
+
+    // Ask exactly the child this function spawned to stop, then wait a bounded
+    // time for its close. Whether or not that close arrives, the answer is the
+    // same ambiguous observation; the wait exists so the query process is not
+    // left running unobserved.
+    const abandonQuery = (reason) => {
+      if (settled || abandoned) return;
+      abandoned = { reason };
+      cancelSchedule(queryTimer);
       try {
         child.kill?.();
       } catch {
         // The query may already have exited.
       }
-      finish({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-timeout" });
-    }, timeoutMs);
+      terminationTimer = schedule(() => {
+        finish({
+          status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
+          reason,
+          queryTerminationProven: false
+        });
+      }, terminationTimeoutMs);
+    };
+
+    queryTimer = schedule(() => abandonQuery("query-timeout"), timeoutMs);
 
     child.stdout?.on?.("data", (chunk) => {
-      if (settled) return;
+      if (settled || abandoned) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       stdoutBytes += buffer.length;
       if (stdoutBytes > MAX_PROCESS_QUERY_OUTPUT_BYTES) {
-        finish({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-output-invalid" });
-        try {
-          child.kill?.();
-        } catch {
-          // Best effort only; ambiguity is already recorded.
-        }
+        abandonQuery("query-output-invalid");
         return;
       }
       stdout.push(buffer);
@@ -162,7 +212,16 @@ function queryWindowsProcessStartTime(
       finish({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-process-error" });
     });
     child.once?.("close", (code) => {
-      if (settled || timedOut) return;
+      if (settled) return;
+      if (abandoned) {
+        // The exact query child closed after we asked it to stop.
+        finish({
+          status: PROCESS_IDENTITY_STATUS.AMBIGUOUS,
+          reason: abandoned.reason,
+          queryTerminationProven: true
+        });
+        return;
+      }
       if (code === 3) {
         finish({ status: PROCESS_IDENTITY_STATUS.DEAD });
         return;

@@ -321,7 +321,13 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
   assert.match(sourceByFile["claude-runner.mjs"], /spawnProcess = spawn/);
   assert.doesNotMatch(sourceByFile["claude-runner.mjs"], /env:\s*process\.env/);
   assert.match(sourceByFile["claude-runner.mjs"], /env:\s*runtime\.childEnvironment/);
-  assert.match(sourceByFile["process-identity.mjs"], /Get-Process -Id/);
+  // Windows identity is read by direct PID lookup and emitted as invariant UTC
+  // ticks. The cmdlet used is an implementation detail; never parsing localized
+  // console output is not.
+  assert.match(sourceByFile["process-identity.mjs"], /GetProcessById/);
+  assert.match(sourceByFile["process-identity.mjs"], /StartTime\.ToUniversalTime\(\)\.Ticks/);
+  assert.match(sourceByFile["process-identity.mjs"], /InvariantCulture/);
+  assert.doesNotMatch(sourceByFile["process-identity.mjs"], /Format-Table|ConvertFrom-String|Out-String/);
   assert.match(sourceByFile["worktree-manager.mjs"], /runSupervisedProcess/);
   assert.doesNotMatch(sourceByFile["process-identity.mjs"], /claudeBin/);
   assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /claudeBin/);

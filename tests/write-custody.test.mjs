@@ -113,38 +113,105 @@ async function activate(custody, identity = childIdentity()) {
   });
 }
 
-function runReservationProcess(stateRoot, executionId) {
-  return new Promise((resolve) => {
-    const child = spawn(
-      process.execPath,
-      [path.join(fixtureDirectory, "reserve-writer.mjs"), stateRoot, rootA, executionId],
-      { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
-    );
-    const stdout = [];
-    const stderr = [];
-    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
-    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
-    child.on("close", (code) => resolve({
+/**
+ * Starts one real coordinator process that competes for durable admission.
+ *
+ * The child is launched immediately so both contenders race for the same
+ * atomic rename. A winner then parks until the parent releases it, so the
+ * loser always attempts its reservation while the winner is provably still
+ * alive. That replaces a fixed sleep with an explicit handshake.
+ */
+function startReservationProcess(stateRoot, executionId) {
+  const child = spawn(
+    process.execPath,
+    [path.join(fixtureDirectory, "reserve-writer.mjs"), stateRoot, rootA, executionId, "deterministic"],
+    { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+  );
+  const stdout = [];
+  const stderr = [];
+  let acquired;
+  let exited;
+  const acquiredPromise = new Promise((resolve) => {
+    acquired = resolve;
+  });
+  const exitedPromise = new Promise((resolve) => {
+    exited = resolve;
+  });
+
+  child.stdout.on("data", (chunk) => {
+    stdout.push(Buffer.from(chunk));
+    if (Buffer.concat(stdout).toString("utf8").includes("ACQUIRED")) acquired(true);
+  });
+  child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+  child.once("close", (code) => {
+    acquired(false);
+    exited({
+      executionId,
       code,
       stdout: Buffer.concat(stdout).toString("utf8"),
       stderr: Buffer.concat(stderr).toString("utf8")
-    }));
+    });
   });
+
+  return {
+    executionId,
+    child,
+    // Resolves true once the reservation is held, false if the process ended
+    // first. Either way the contender has reached a decision.
+    settled: acquiredPromise,
+    exited: exitedPromise,
+    release() {
+      try {
+        child.stdin.write("RELEASE\n");
+        child.stdin.end();
+      } catch {
+        // Already gone; its close is awaited regardless.
+      }
+    }
+  };
 }
 
 test("atomic ownership admission excludes a second real coordinator process", {
   skip: process.platform !== "win32"
 }, async () => {
   await withState(async (stateRoot) => {
-    const [first, second] = await Promise.all([
-      runReservationProcess(stateRoot, "process-a"),
-      runReservationProcess(stateRoot, "process-b")
-    ]);
-    const results = [first, second];
-    assert.equal(results.filter((result) => result.code === 0).length, 1, JSON.stringify(results));
-    assert.equal(results.filter((result) => result.code === 2).length, 1, JSON.stringify(results));
-    assert.match(results.find((result) => result.code === 0).stdout, /ACQUIRED/);
-    assert.match(results.find((result) => result.code === 2).stderr, /write_custody_conflict/);
+    // Real Node processes, real durable filesystem admission, real contention.
+    // Identity resolution is injected and deterministic so this test measures
+    // atomic admission and nothing else.
+    const contenders = [
+      startReservationProcess(stateRoot, "process-a"),
+      startReservationProcess(stateRoot, "process-b")
+    ];
+
+    // Both contenders have reached a decision: one holds the reservation, the
+    // other has already failed and exited.
+    const held = await Promise.all(contenders.map((contender) => contender.settled));
+    assert.equal(
+      held.filter(Boolean).length,
+      1,
+      "exactly one real coordinator may hold durable admission"
+    );
+
+    // The winner only lets go once the loser is done contending.
+    for (const contender of contenders) contender.release();
+    const results = await Promise.all(contenders.map((contender) => contender.exited));
+
+    const diagnostics = JSON.stringify(results);
+    const winners = results.filter((result) => result.code === 0);
+    const losers = results.filter((result) => result.code === 2);
+    assert.equal(winners.length, 1, diagnostics);
+    assert.equal(losers.length, 1, diagnostics);
+    assert.match(winners[0].stdout, /ACQUIRED/u, diagnostics);
+    assert.match(losers[0].stderr, /write_custody_conflict/u, diagnostics);
+    // The loser must fail because ownership is held, never because identity
+    // resolution was too slow to decide.
+    assert.doesNotMatch(losers[0].stderr, /ambiguous/u, diagnostics);
+    assert.equal(losers[0].stdout.includes("ACQUIRED"), false, diagnostics);
+
+    // The durable record belongs to the winner and survives the contention.
+    const retained = await manager(stateRoot, new Map(), 100).getWriteAccess(rootAKey);
+    assert.equal(retained.executionId, winners[0].executionId);
+    assert.equal(retained.state, "RESERVED");
   });
 });
 
