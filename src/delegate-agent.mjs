@@ -1,14 +1,22 @@
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import * as z from "zod/v4";
 import { AGENT_REGISTRY, getAgentProfile } from "./agent-registry.mjs";
 import { loadAgentContract } from "./agent-contracts.mjs";
 import {
+  describeRuntimeCapabilities,
+  resolveCapabilityPolicy
+} from "./capability-policy.mjs";
+import { buildClaudeEnvironment } from "./claude-environment.mjs";
+import {
   MAX_CLAUDE_TIMEOUT_MS,
   ClaudeTimeoutError,
   runClaudeAgent
 } from "./claude-runner.mjs";
 import { composeAgentPrompt } from "./prompt-composer.mjs";
+import { PROCESS_WRITE_CUSTODY } from "./write-custody.mjs";
+import { resolveCanonicalWorkspaceRoot } from "./workspace-root.mjs";
 
 export const DELEGATE_AGENT_TYPES = Object.freeze(Object.keys(AGENT_REGISTRY));
 export const MAX_DELEGATE_TASK_CHARS = 100_000;
@@ -23,8 +31,6 @@ const SUPPORTED_REASONING_EFFORTS = new Set([
   "xhigh",
   "max"
 ]);
-const RUNTIME_TOOL_NAMES = Object.freeze(["Read", "Bash", "Glob", "Grep"]);
-const RUNTIME_DISALLOWED_TOOLS = Object.freeze(["mcp__*"]);
 
 export class DelegateAgentConfigurationError extends Error {
   constructor(message) {
@@ -97,16 +103,6 @@ function requirePositiveProfileTimeout(profile) {
   return profile.timeoutMs;
 }
 
-function capabilityDescription() {
-  return [
-    "Requested Claude tools: " + RUNTIME_TOOL_NAMES.join(", ") + ".",
-    "The session uses Claude plan permission mode.",
-    "No Edit or Create tools are exposed by this Phase 3B MCP path.",
-    "This describes available runtime capability, not hard role-level enforcement.",
-    "Nested claude-agents MCP delegation is unavailable: Task is not requested and mcp__* is disallowed."
-  ].join(" ");
-}
-
 /**
  * Resolves the executable backend state for one profile. modelStrategy is
  * intentionally not a historical model lookup: all current strategies use
@@ -135,6 +131,7 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
   }
 
   const profileTimeoutMs = requirePositiveProfileTimeout(profile);
+  const capabilityPolicy = resolveCapabilityPolicy(profile);
   const timeoutOverride = env?.CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS;
   const timeoutMs = positiveIntegerFromEnvironment(
     env,
@@ -167,10 +164,18 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
         ? "profile"
         : "operator-override",
     maxCaptureBytes,
-    permissionMode: "plan",
-    toolNames: RUNTIME_TOOL_NAMES,
-    disallowedTools: RUNTIME_DISALLOWED_TOOLS,
-    capabilityDescription: capabilityDescription()
+    accessMode: capabilityPolicy.accessMode,
+    permissionMode: capabilityPolicy.permissionMode,
+    toolNames: capabilityPolicy.toolNames,
+    disallowedTools: capabilityPolicy.disallowedTools,
+    shellPolicy: capabilityPolicy.shellPolicy,
+    nestedDelegation: capabilityPolicy.nestedDelegation,
+    environmentPolicy: capabilityPolicy.environmentPolicy,
+    settingsIsolation: capabilityPolicy.settingsIsolation,
+    mcpIsolation: capabilityPolicy.mcpIsolation,
+    enforcementBoundary: capabilityPolicy.enforcementBoundary,
+    childEnvironment: buildClaudeEnvironment(env),
+    capabilityDescription: describeRuntimeCapabilities(capabilityPolicy)
   });
 }
 
@@ -225,6 +230,42 @@ function outcomeError(error) {
   };
 }
 
+function requireExecutionId(createExecutionId) {
+  const executionId = createExecutionId();
+  if (
+    typeof executionId !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(executionId)
+  ) {
+    throw new DelegateAgentConfigurationError("Execution ID generation returned an invalid value.");
+  }
+  return executionId;
+}
+
+function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now, custodyState }) {
+  return {
+    executionId,
+    agentType: profile.id,
+    effectiveCwd: workspace.effectiveCwd,
+    canonicalRoot: workspace.canonicalRoot,
+    canonicalRootSource: workspace.rootSource,
+    accessMode: runtime.accessMode,
+    custodyState,
+    model: runtime.model,
+    reasoningEffort: runtime.reasoningEffort,
+    timeoutMs: runtime.timeoutMs,
+    timeoutSource: runtime.timeoutSource,
+    startedAt,
+    durationMs: Math.max(0, now() - startedAt),
+    runtimeCapabilities: runtime.capabilityDescription
+  };
+}
+
+function failedStatus(error) {
+  return error instanceof ClaudeTimeoutError || error?.code === "claude_timeout"
+    ? "timeout"
+    : "failed";
+}
+
 /**
  * Executes exactly one explicit profile delegation. Dependencies are injectable
  * so unit tests can verify composition and lifecycle behavior without a real
@@ -239,70 +280,138 @@ export async function delegateAgent(input, dependencies = {}) {
   const resolveCwd =
     dependencies.resolveWorkingDirectory || resolveDelegationWorkingDirectory;
   const resolveRuntime = dependencies.resolveRuntime || resolveAgentRuntime;
+  const resolveWorkspace =
+    dependencies.resolveWorkspaceRoot || resolveCanonicalWorkspaceRoot;
   const composePrompt = dependencies.composePrompt || composeAgentPrompt;
   const runAgent = dependencies.runAgent || runClaudeAgent;
+  const writeCustody = dependencies.writeCustody || PROCESS_WRITE_CUSTODY;
+  const createExecutionId = dependencies.createExecutionId || randomUUID;
   const env = dependencies.env || process.env;
   const now = dependencies.now || Date.now;
 
   validateDelegationTask(task);
+  const executionId = requireExecutionId(createExecutionId);
   const profile = getProfile(agentType);
-  const effectiveCwd = await resolveCwd(cwd);
-  const contract = await loadContract(profile.id);
   const runtime = resolveRuntime(profile, { env });
+  const requestedCwd = await resolveCwd(cwd);
+  const workspace = await resolveWorkspace(requestedCwd, {
+    accessMode: runtime.accessMode
+  });
+  const contract = await loadContract(profile.id);
   const prompt = composePrompt({
     profile,
     contract,
     task,
-    cwd: effectiveCwd,
+    cwd: workspace.effectiveCwd,
+    canonicalRoot: workspace.canonicalRoot,
+    executionId,
     runtime
   });
   const startedAt = now();
+  let reservation;
+  let custodyState = runtime.accessMode === "write" ? "not-acquired" : "not-applicable";
+  let outcome;
 
   try {
+    if (runtime.accessMode === "write") {
+      reservation = writeCustody.reserveWriteAccess({
+        executionId,
+        agentType: profile.id,
+        canonicalRoot: workspace.canonicalRoot,
+        canonicalRootKey: workspace.canonicalRootKey
+      });
+      custodyState = reservation.state.toLowerCase();
+      reservation = writeCustody.activateWriteAccess({
+        executionId,
+        canonicalRootKey: workspace.canonicalRootKey
+      });
+      custodyState = reservation.state.toLowerCase();
+    }
+
     const execution = await runAgent({
       profile,
       prompt,
-      cwd: effectiveCwd,
+      cwd: workspace.effectiveCwd,
+      canonicalRoot: workspace.canonicalRoot,
+      executionId,
       runtime
     });
 
-    return {
-      agentType: profile.id,
+    outcome = {
+      ...baseOutcome({
+        profile,
+        runtime,
+        workspace,
+        executionId,
+        startedAt,
+        now,
+        custodyState
+      }),
       status: "completed",
-      model: runtime.model,
-      reasoningEffort: runtime.reasoningEffort,
-      timeoutMs: runtime.timeoutMs,
-      timeoutSource: runtime.timeoutSource,
       durationMs:
         Number.isFinite(execution.durationMs) ? execution.durationMs : Math.max(0, now() - startedAt),
-      runtimeCapabilities: runtime.capabilityDescription,
       result: execution.result,
-      stderrSummary: execution.stderrSummary || ""
+      stderrSummary: execution.stderrSummary || "",
+      ...(Number.isSafeInteger(execution.pid) ? { pid: execution.pid } : {})
     };
   } catch (error) {
-    return {
-      agentType: profile.id,
-      status:
-        error instanceof ClaudeTimeoutError || error?.code === "claude_timeout"
-          ? "timeout"
-          : "failed",
-      model: runtime.model,
-      reasoningEffort: runtime.reasoningEffort,
-      timeoutMs: runtime.timeoutMs,
-      timeoutSource: runtime.timeoutSource,
+    outcome = {
+      ...baseOutcome({
+        profile,
+        runtime,
+        workspace,
+        executionId,
+        startedAt,
+        now,
+        custodyState
+      }),
+      status: failedStatus(error),
       durationMs:
         Number.isFinite(error?.durationMs) ? error.durationMs : Math.max(0, now() - startedAt),
-      runtimeCapabilities: runtime.capabilityDescription,
       error: outcomeError(error),
-      stderrSummary: error?.stderrSummary || ""
+      stderrSummary: error?.stderrSummary || "",
+      ...(Number.isSafeInteger(error?.pid) ? { pid: error.pid } : {})
     };
+  } finally {
+    if (reservation) {
+      try {
+        const released = writeCustody.releaseWriteAccess({
+          executionId,
+          canonicalRootKey: workspace.canonicalRootKey
+        });
+        custodyState = released.state.toLowerCase();
+        if (outcome) outcome.custodyState = custodyState;
+      } catch (releaseError) {
+        custodyState = "release-failed";
+        outcome = {
+          ...baseOutcome({
+            profile,
+            runtime,
+            workspace,
+            executionId,
+            startedAt,
+            now,
+            custodyState
+          }),
+          status: "failed",
+          error: outcomeError(releaseError),
+          stderrSummary: outcome?.stderrSummary || ""
+        };
+      }
+    }
   }
+
+  return outcome;
 }
 
 export function formatDelegateAgentOutcome(outcome) {
   const lines = [
     "Agent: " + outcome.agentType,
+    "ExecutionId: " + outcome.executionId,
     "Status: " + outcome.status,
+    "AccessMode: " + outcome.accessMode,
+    "CanonicalRoot: " + outcome.canonicalRoot,
+    "CustodyState: " + outcome.custodyState,
     "Model: " + outcome.model,
     "ReasoningEffort: " + outcome.reasoningEffort,
     "TimeoutMs: " + outcome.timeoutMs,
@@ -310,6 +419,10 @@ export function formatDelegateAgentOutcome(outcome) {
     "DurationMs: " + outcome.durationMs,
     "RuntimeCapabilities: " + outcome.runtimeCapabilities
   ];
+
+  if (Number.isSafeInteger(outcome.pid)) {
+    lines.push("Pid: " + outcome.pid);
+  }
 
   if (outcome.status === "completed") {
     lines.push("", outcome.result);

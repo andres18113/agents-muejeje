@@ -46,6 +46,8 @@ const requiredProfileFields = [
   "manualOnly",
   "mutationPosture",
   "enforcementStatus",
+  "enforcementBoundary",
+  "contextStrategy",
   "runtimeIntegrationStatus",
   "declaredCapabilities",
   "allowedSubagents",
@@ -118,6 +120,8 @@ test("every remaining profile has complete active-runtime metadata", () => {
       "reasoningEffort",
       "mutationPosture",
       "enforcementStatus",
+      "enforcementBoundary",
+      "contextStrategy",
       "runtimeIntegrationStatus",
       "delegationStatus",
       "outputContract"
@@ -243,15 +247,16 @@ test("specified Phase 3B policy metadata is retained", () => {
   }
 });
 
-test("posture metadata remains declarative rather than falsely hard-enforced", () => {
-  for (const id of ["explore", "code-review", "rubber-duck", "security-review"]) {
+test("posture metadata records truthful Claude-runtime enforcement boundaries", () => {
+  for (const id of ["explore", "code-review", "research", "rubber-duck", "security-review"]) {
     assert.equal(AGENT_REGISTRY[id].mutationPosture, "read-only");
   }
   assert.equal(AGENT_REGISTRY.task.mutationPosture, "mutation-capable");
   assert.equal(AGENT_REGISTRY["general-purpose"].mutationPosture, "mutation-capable");
-  assert.equal(AGENT_REGISTRY.research.mutationPosture, "runtime-dependent");
   for (const profile of Object.values(AGENT_REGISTRY)) {
-    assert.equal(profile.enforcementStatus, "not-yet-enforced");
+    assert.equal(profile.enforcementStatus, "runtime-enforced");
+    assert.equal(profile.enforcementBoundary, "claude-runtime-cooperative");
+    assert.equal(profile.contextStrategy, "fresh");
   }
 });
 
@@ -308,6 +313,8 @@ test("the consolidated source has one child-process launch owner and no legacy r
   );
   assert.deepEqual(childProcessOwners, ["claude-runner.mjs"]);
   assert.match(sourceByFile["claude-runner.mjs"], /spawnProcess = spawn/);
+  assert.doesNotMatch(sourceByFile["claude-runner.mjs"], /env:\s*process\.env/);
+  assert.match(sourceByFile["claude-runner.mjs"], /env:\s*runtime\.childEnvironment/);
 
   for (const identifier of [
     "claude_review",
@@ -343,7 +350,9 @@ test("tracked routing policy and documentation name only the consolidated profil
   assert.match(routingPolicy, /owns the final verdict/);
   assert.match(routingPolicy, /narrow factual and evidentiary verification directly/);
   assert.match(routingPolicy, /explicit\/manual delegation/);
-  assert.match(routingPolicy, /Phase 4 hard capability enforcement is not implemented/);
+  assert.match(routingPolicy, /Runtime capability selection is profile-specific/);
+  assert.match(routingPolicy, /Codex must not concurrently edit that same root/);
+  assert.match(routingPolicy, /not an OS sandbox/);
   assert.doesNotMatch(routingPolicy, /delegate_agent\(agent_type="verify"\)/);
   assert.doesNotMatch(readme, /agents\/verify\.md/);
   assert.match(readme, /npm ci/);
@@ -383,9 +392,16 @@ test("package metadata and Windows CI provide clean deterministic validation", a
     "src/index.mjs",
     "src/agent-registry.mjs",
     "src/agent-contracts.mjs",
+    "src/capability-policy.mjs",
+    "src/claude-environment.mjs",
+    "src/claude-runtime-settings.mjs",
+    "src/shell-policy.mjs",
+    "src/workspace-root.mjs",
+    "src/write-custody.mjs",
     "src/delegate-agent.mjs",
     "src/prompt-composer.mjs",
-    "src/claude-runner.mjs"
+    "src/claude-runner.mjs",
+    "hooks/claude-pretool-policy.mjs"
   ]) {
     assert.match(packageJson.scripts.check, new RegExp(sourceFile.replace(/[./]/g, "\\$&")));
   }
@@ -399,7 +415,7 @@ test("package metadata and Windows CI provide clean deterministic validation", a
   assert.doesNotMatch(workflow, /\b(?:claude|codex|secrets)\b/i);
 });
 
-test("repository source and tests do not depend on a personal home path or user profile", async () => {
+test("repository source and tests contain no hard-coded personal path or global policy dependency", async () => {
   const directories = [path.join(projectRoot, "src"), path.join(projectRoot, "tests")];
   const files = (
     await Promise.all(
@@ -411,11 +427,15 @@ test("repository source and tests do not depend on a personal home path or user 
     )
   ).flat();
   const forbiddenPersonalPath = ["C:", "Users", "Andres"].join("\\");
-  const forbiddenEnvKey = ["USER", "PROFILE"].join("");
 
   for (const file of files) {
     const content = await readFile(file, "utf8");
     assert.equal(content.includes(forbiddenPersonalPath), false, file + " contains a personal path");
-    assert.equal(content.toUpperCase().includes(forbiddenEnvKey), false, file + " reads user-profile state");
   }
+
+  const registryTest = await readFile(path.join(projectRoot, "tests", "agent-registry.test.mjs"), "utf8");
+  const userProfileKey = ["USER", "PROFILE"].join("");
+  const globalPolicySuffix = [".codex", "AGENTS.md"].join("/");
+  assert.equal(registryTest.includes(userProfileKey), false, "tests must not locate state through " + userProfileKey);
+  assert.equal(registryTest.includes(globalPolicySuffix), false, "tests must not read a global AGENTS policy");
 });

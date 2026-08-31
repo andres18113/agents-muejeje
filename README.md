@@ -83,9 +83,25 @@ For larger or riskier work, a brief may include Outcome, Done when, Boundaries, 
 
 Role contracts in `agents/` define specialist behavior. The dynamic task defines one assignment and cannot override contract boundaries.
 
-The composed prompt is sent through child stdin, never as a command-line prompt argument. The runner uses a fresh process with `--no-session-persistence`, `--no-chrome`, plan mode, requested `Read`, `Bash`, `Glob`, and `Grep` tools, and `mcp__*` denied. No Edit or Create tools are exposed, including for profiles whose declared posture is mutation-capable. This is a capability baseline, not hard role-level enforcement; Phase 4 will address hard capability enforcement.
+Every invocation uses a fresh Claude process. The full role contract and assignment travel only over child stdin, never in command-line arguments. Nested Agent/Task delegation and external MCP tools are disabled.
 
-Nested delegation is not enabled. `research` is manual-only in registry policy but is allowed when Codex explicitly calls `delegate_agent`.
+| Profile | Access | Exposed Claude tools | Shell policy |
+|---|---|---|---|
+| `explore` | read | Read, Grep, Glob | none |
+| `task` | write | Bash | guarded command execution; no Edit/Write |
+| `general-purpose` | write | Read, Grep, Glob, Edit, Write, Bash | guarded bounded-repository work |
+| `code-review` | read | Read, Grep, Glob | none; Lead supplies VCS/change-set evidence when needed |
+| `research` | read | Read, Grep, Glob | none |
+| `rubber-duck` | read | Read, Grep, Glob | none |
+| `security-review` | read | Read, Grep, Glob | none; Lead supplies VCS/change-set evidence when needed |
+
+`task` and `general-purpose` acquire process-local write custody before Claude starts. At most one active write-capable Claude delegation may own one canonical root inside this MCP server process. Codex must not concurrently edit that root while custody is active. This does not prevent Codex, another MCP process, or another same-user process from writing; it is not system-wide locking or an OS sandbox.
+
+The runner uses `--restricted`, `--setting-sources ""`, `--strict-mcp-config`, and a private per-invocation settings file. The settings file contains only runtime policy and an optional Bash PreToolUse guard; it never contains the task body and is deleted at terminal cleanup. The child environment is built from a compatibility allowlist instead of inheriting `process.env`, so ordinary secret-bearing variables are not passed by default.
+
+On Windows, forced timeout/overflow termination targets the exact spawned Claude PID with `taskkill /PID <pid> /T /F` when available, with a bounded fallback to the direct child kill. Fresh context and `--no-session-persistence` remain mandatory; there is no persistent parent, resume, durable lease, worktree isolation, or cross-process custody yet. Those stronger lifecycle and ownership controls are Phase 5 work.
+
+`research` remains manual-only in registry policy but is allowed when Codex explicitly calls `delegate_agent`.
 
 ## Environment overrides
 

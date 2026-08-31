@@ -6,8 +6,8 @@
   "description": "Local MCP server that exposes profile-driven fresh Claude Code specialists to Codex CLI.",
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test tests/agent-registry.test.mjs tests/delegate-agent.test.mjs",
-    "check": "node --check src/index.mjs && node --check src/agent-registry.mjs && node --check src/agent-contracts.mjs && node --check src/delegate-agent.mjs && node --check src/prompt-composer.mjs && node --check src/claude-runner.mjs",
+    "test": "node --test tests/agent-registry.test.mjs tests/delegate-agent.test.mjs tests/capability-policy.test.mjs tests/write-custody.test.mjs",
+    "check": "node --check src/index.mjs && node --check src/agent-registry.mjs && node --check src/agent-contracts.mjs && node --check src/capability-policy.mjs && node --check src/claude-environment.mjs && node --check src/claude-runtime-settings.mjs && node --check src/shell-policy.mjs && node --check src/workspace-root.mjs && node --check src/write-custody.mjs && node --check src/delegate-agent.mjs && node --check src/prompt-composer.mjs && node --check src/claude-runner.mjs && node --check hooks/claude-pretool-policy.mjs",
     "ci": "npm run check && npm test"
   },
   "dependencies": {

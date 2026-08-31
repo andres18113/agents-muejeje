@@ -24,8 +24,10 @@ import {
   ClaudeRunnerError,
   ClaudeTimeoutError,
   getClaudeRunnerArgs,
-  runClaudeAgent
+  runClaudeAgent,
+  terminateClaudeChild
 } from "../src/claude-runner.mjs";
+import { WriteCustodyManager } from "../src/write-custody.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const expectedAgentTypes = [
@@ -47,12 +49,26 @@ function runtimeForTest(overrides = {}) {
     timeoutSource: "profile",
     maxCaptureBytes: 1024 * 1024,
     permissionMode: "plan",
-    toolNames: ["Read", "Bash", "Glob", "Grep"],
-    disallowedTools: ["mcp__*"],
+    accessMode: "read",
+    toolNames: ["Read", "Grep", "Glob"],
+    disallowedTools: ["Agent", "Task", "mcp__*"],
+    shellPolicy: "none",
+    childEnvironment: { PATH: "test-path", SystemRoot: "C:\\Windows" },
     capabilityDescription:
-      "Requested Claude tools: Read, Bash, Glob, Grep. No Edit or Create tools are exposed.",
+      "Available Claude tools: Read, Grep, Glob. Bash is not exposed.",
     ...overrides
   };
+}
+
+function fakeSettings(cleanup = async () => {}) {
+  return async () => ({
+    settingsPath: "C:\\temp\\claude-runtime-settings.json",
+    cleanup
+  });
+}
+
+function afterRunnerStarts() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function createFakeChild({ stdin, stdout, stderr } = {}) {
@@ -78,6 +94,15 @@ function completedRunner(result = "specialist response") {
     stderrSummary: "",
     durationMs: 7
   });
+}
+
+function workspaceForTest(cwd) {
+  return {
+    effectiveCwd: cwd,
+    canonicalRoot: cwd,
+    canonicalRootKey: cwd.toLowerCase(),
+    rootSource: "test"
+  };
 }
 
 test("delegate_agent schema accepts exactly seven profiles and rejects removed or unknown types", () => {
@@ -145,6 +170,8 @@ test("each remaining profile is looked up from the registry and receives only it
     assert.ok(runnerArguments.prompt.includes(expectedContract.trim()));
     assert.equal(countOccurrences(runnerArguments.prompt, task), 1);
     assert.ok(runnerArguments.prompt.includes("Working directory: " + projectRoot));
+    assert.ok(runnerArguments.prompt.includes("Canonical root: " + projectRoot));
+    assert.match(runnerArguments.prompt, /Execution ID: [A-Za-z0-9_-]+/);
     assert.match(runnerArguments.prompt, /Runtime capabilities:/);
     assert.match(
       runnerArguments.prompt,
@@ -239,10 +266,12 @@ test("runtime resolution uses the configured backend with profile effort and tim
   assert.equal(overridden.reasoningEffort, AGENT_REGISTRY.explore.reasoningEffort);
   assert.equal(overridden.timeoutMs, 1234);
   assert.equal(overridden.timeoutSource, "operator-override");
-  assert.deepEqual(overridden.toolNames, ["Read", "Bash", "Glob", "Grep"]);
-  assert.deepEqual(overridden.disallowedTools, ["mcp__*"]);
+  assert.equal(overridden.accessMode, "read");
+  assert.deepEqual(overridden.toolNames, ["Read", "Grep", "Glob"]);
+  assert.deepEqual(overridden.disallowedTools, ["Agent", "Task", "mcp__*"]);
+  assert.equal(overridden.shellPolicy, "none");
   assert.equal(overridden.toolNames.includes("Task"), false);
-  assert.match(overridden.capabilityDescription, /not hard role-level enforcement/);
+  assert.match(overridden.capabilityDescription, /not an OS sandbox/);
 
   assert.throws(
     () => resolveAgentRuntime(AGENT_REGISTRY.explore, { env: { CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS: "0" } }),
@@ -289,14 +318,106 @@ test("each explicit delegation invokes a fresh runner and keeps nested MCP deleg
     return { result: "ok", stderrSummary: "", durationMs: 1 };
   };
 
-  await delegateAgent({ agentType: "explore", task: "first", cwd: projectRoot }, { runAgent: runner });
-  await delegateAgent({ agentType: "explore", task: "second", cwd: projectRoot }, { runAgent: runner });
+  const first = await delegateAgent(
+    { agentType: "explore", task: "first", cwd: projectRoot },
+    { runAgent: runner }
+  );
+  const second = await delegateAgent(
+    { agentType: "explore", task: "second", cwd: projectRoot },
+    { runAgent: runner }
+  );
 
   assert.equal(calls.length, 2);
   assert.notEqual(calls[0], calls[1]);
-  assert.match(calls[0].prompt, /Nested claude-agents MCP delegation is unavailable in Phase 3B/);
+  assert.notEqual(first.executionId, second.executionId);
+  assert.match(calls[0].prompt, /Nested claude-agents MCP delegation is unavailable in Phase 4/);
   assert.equal(calls[0].runtime.disallowedTools.includes("mcp__*"), true);
   assert.equal(calls[0].runtime.toolNames.includes("Task"), false);
+});
+
+test("write admission is process-local, releases on all terminal outcomes, and leaves reads concurrent", async () => {
+  const custody = new WriteCustodyManager();
+  const firstRoot = projectRoot;
+  const secondRoot = os.tmpdir();
+  const executionIds = ["writer-one", "writer-two", "reader-one", "writer-three", "writer-four"];
+  let nextExecution = 0;
+  const commonDependencies = {
+    writeCustody: custody,
+    createExecutionId: () => executionIds[nextExecution++],
+    resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd)
+  };
+
+  let completeFirst;
+  const firstStarted = new Promise((resolve) => {
+    completeFirst = resolve;
+  });
+  let firstRunnerStarted;
+  const firstRunnerStartedPromise = new Promise((resolve) => {
+    firstRunnerStarted = resolve;
+  });
+  const first = delegateAgent(
+    { agentType: "task", task: "npm test", cwd: firstRoot },
+    {
+      ...commonDependencies,
+      runAgent: async () => {
+        firstRunnerStarted();
+        await firstStarted;
+        return { result: "first complete", stderrSummary: "", durationMs: 10 };
+      }
+    }
+  );
+  await firstRunnerStartedPromise;
+
+  let secondRunnerCalled = false;
+  const second = await delegateAgent(
+    { agentType: "general-purpose", task: "implement bounded fix", cwd: firstRoot },
+    {
+      ...commonDependencies,
+      runAgent: async () => {
+        secondRunnerCalled = true;
+        return { result: "unexpected", stderrSummary: "", durationMs: 1 };
+      }
+    }
+  );
+  assert.equal(second.status, "failed");
+  assert.equal(second.error.code, "write_custody_conflict");
+  assert.equal(secondRunnerCalled, false);
+
+  const readWhileWriting = await delegateAgent(
+    { agentType: "explore", task: "find one file", cwd: firstRoot },
+    { ...commonDependencies, runAgent: completedRunner("read complete") }
+  );
+  assert.equal(readWhileWriting.status, "completed");
+  assert.equal(readWhileWriting.accessMode, "read");
+  assert.equal(readWhileWriting.custodyState, "not-applicable");
+
+  completeFirst();
+  const firstOutcome = await first;
+  assert.equal(firstOutcome.status, "completed");
+  assert.equal(firstOutcome.custodyState, "released");
+  assert.equal(custody.getWriteAccess(workspaceForTest(firstRoot).canonicalRootKey), undefined);
+
+  const differentRoot = await delegateAgent(
+    { agentType: "general-purpose", task: "bounded work", cwd: secondRoot },
+    { ...commonDependencies, runAgent: completedRunner("different root complete") }
+  );
+  assert.equal(differentRoot.status, "completed");
+  assert.equal(differentRoot.custodyState, "released");
+
+  const timeout = await delegateAgent(
+    { agentType: "task", task: "npm test", cwd: firstRoot },
+    {
+      ...commonDependencies,
+      runAgent: async () => {
+        throw new ClaudeTimeoutError(10, { durationMs: 10 });
+      }
+    }
+  );
+  assert.equal(timeout.status, "timeout");
+  assert.equal(timeout.custodyState, "released");
+  assert.equal(custody.getWriteAccess(workspaceForTest(firstRoot).canonicalRootKey), undefined);
+  assert.notEqual(firstOutcome.executionId, second.executionId);
+  assert.notEqual(second.executionId, readWhileWriting.executionId);
 });
 
 test("runner lifecycle failures never become completed outcomes", async () => {
@@ -375,8 +496,13 @@ test("MCP handler exposes completed metadata and treats failed execution as an e
 
   registerDelegateAgentTool(server, {
     delegate: async ({ agentType }) => ({
+      executionId: "execution-success",
       agentType,
       status: "completed",
+      accessMode: "read",
+      effectiveCwd: projectRoot,
+      canonicalRoot: projectRoot,
+      custodyState: "not-applicable",
       model: "test-claude",
       reasoningEffort: "low",
       timeoutMs: 100,
@@ -392,13 +518,22 @@ test("MCP handler exposes completed metadata and treats failed execution as an e
   const success = await registration.handler({ agent_type: "explore", task: "inspect", cwd: projectRoot });
   assert.equal(success.isError, undefined);
   assert.match(success.content[0].text, /Agent: explore/);
+  assert.match(success.content[0].text, /ExecutionId: execution-success/);
   assert.match(success.content[0].text, /Status: completed/);
+  assert.match(success.content[0].text, /AccessMode: read/);
+  assert.match(success.content[0].text, /CanonicalRoot: /);
+  assert.match(success.content[0].text, /CustodyState: not-applicable/);
   assert.match(success.content[0].text, /agent response/);
 
   registerDelegateAgentTool(server, {
     delegate: async ({ agentType }) => ({
+      executionId: "execution-timeout",
       agentType,
       status: "timeout",
+      accessMode: "write",
+      effectiveCwd: projectRoot,
+      canonicalRoot: projectRoot,
+      custodyState: "released",
       model: "test-claude",
       reasoningEffort: "medium",
       timeoutMs: 100,
@@ -419,6 +554,7 @@ test("Claude runner transports multi-KB prompts through stdin, never argv", asyn
   const prompt = "large role contract and assignment\n".repeat(2500);
   const runtime = runtimeForTest();
   const child = createFakeChild();
+  child.pid = 6789;
   const received = [];
   let spawnedArgs;
   let spawnedOptions;
@@ -428,25 +564,196 @@ test("Claude runner transports multi-KB prompts through stdin, never argv", asyn
     prompt,
     cwd: projectRoot,
     runtime,
+    createSettings: fakeSettings(),
     spawnProcess(_bin, args, options) {
       spawnedArgs = args;
       spawnedOptions = options;
       return child;
     }
   });
+  await afterRunnerStarts();
   child.stdout.end("specialist output");
   child.stderr.end();
   child.emit("close", 0, null);
 
   const result = await pending;
   assert.equal(Buffer.concat(received).toString("utf8"), prompt);
-  assert.deepEqual(spawnedArgs, getClaudeRunnerArgs(runtime));
+  assert.deepEqual(
+    spawnedArgs,
+    getClaudeRunnerArgs(runtime, "C:\\temp\\claude-runtime-settings.json")
+  );
   assert.equal(spawnedArgs.includes(prompt), false);
   assert.equal(spawnedArgs.includes("--input-format"), true);
+  assert.equal(spawnedArgs.includes("--setting-sources"), true);
+  assert.equal(spawnedArgs.includes("--strict-mcp-config"), true);
+  assert.equal(spawnedArgs.includes("--restricted"), true);
+  assert.equal(spawnedArgs.includes("--no-session-persistence"), true);
   assert.equal(spawnedOptions.shell, false);
   assert.equal(spawnedOptions.windowsHide, true);
   assert.deepEqual(spawnedOptions.stdio, ["pipe", "pipe", "pipe"]);
+  assert.deepEqual(spawnedOptions.env, runtime.childEnvironment);
   assert.equal(result.result, "specialist output");
+  assert.equal(result.pid, 6789);
+});
+
+test("Claude runner removes per-invocation settings on success, failure, and timeout", async () => {
+  let successfulCleanup = 0;
+  const successfulChild = createFakeChild();
+  const successful = runClaudeAgent({
+    prompt: "success",
+    cwd: projectRoot,
+    runtime: runtimeForTest(),
+    createSettings: fakeSettings(async () => {
+      successfulCleanup += 1;
+    }),
+    spawnProcess: () => successfulChild
+  });
+  await afterRunnerStarts();
+  successfulChild.stdout.end("done");
+  successfulChild.emit("close", 0, null);
+  await successful;
+  assert.equal(successfulCleanup, 1);
+
+  let failureCleanup = 0;
+  const failedChild = createFakeChild();
+  const failed = runClaudeAgent({
+    prompt: "failure",
+    cwd: projectRoot,
+    runtime: runtimeForTest(),
+    createSettings: fakeSettings(async () => {
+      failureCleanup += 1;
+    }),
+    spawnProcess: () => failedChild
+  });
+  await afterRunnerStarts();
+  failedChild.stderr.end("failure diagnostic");
+  failedChild.emit("close", 1, null);
+  await assert.rejects(failed, ClaudeExitError);
+  assert.equal(failureCleanup, 1);
+
+  let timeoutCleanup = 0;
+  class StalledStdin extends EventEmitter {
+    write() { return false; }
+    end() {}
+  }
+  const timedOutChild = createFakeChild({
+    stdin: new StalledStdin(),
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter()
+  });
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "timeout",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 10 }),
+      createSettings: fakeSettings(async () => {
+        timeoutCleanup += 1;
+      }),
+      spawnProcess: () => timedOutChild
+    }),
+    ClaudeTimeoutError
+  );
+  assert.equal(timeoutCleanup, 1);
+});
+
+test("runtime settings failures fail closed before Claude spawn and spawn failures still clean up", async () => {
+  let spawnedAfterSettingsFailure = false;
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "settings failure",
+      cwd: projectRoot,
+      runtime: runtimeForTest(),
+      createSettings: async () => {
+        throw new Error("cannot create settings");
+      },
+      spawnProcess: () => {
+        spawnedAfterSettingsFailure = true;
+        return createFakeChild();
+      }
+    }),
+    (error) => error instanceof ClaudeRunnerError && error.code === "claude_runtime_settings_failed"
+  );
+  assert.equal(spawnedAfterSettingsFailure, false);
+
+  let spawnFailureCleanup = 0;
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "spawn failure",
+      cwd: projectRoot,
+      runtime: runtimeForTest(),
+      createSettings: fakeSettings(async () => {
+        spawnFailureCleanup += 1;
+      }),
+      spawnProcess: () => {
+        throw new Error("spawn unavailable");
+      }
+    }),
+    (error) => error instanceof ClaudeRunnerError && error.code === "claude_spawn_failed"
+  );
+  assert.equal(spawnFailureCleanup, 1);
+
+  let malformedSettingsCleanup = 0;
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "malformed settings",
+      cwd: projectRoot,
+      runtime: runtimeForTest(),
+      createSettings: async () => ({
+        settingsPath: "",
+        cleanup: async () => {
+          malformedSettingsCleanup += 1;
+        }
+      }),
+      spawnProcess: () => {
+        throw new Error("runner must not spawn with malformed settings");
+      }
+    }),
+    (error) => error instanceof ClaudeRunnerError && error.code === "invalid_runtime_policy"
+  );
+  assert.equal(malformedSettingsCleanup, 1);
+});
+
+test("Windows forced termination targets only the exact Claude child PID", () => {
+  const child = createFakeChild();
+  child.pid = 4321;
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+  };
+  let invocation;
+  let scheduled;
+  const method = terminateClaudeChild(child, {
+    platform: "win32",
+    spawnTerminator(command, args, options) {
+      invocation = { command, args, options };
+      return terminator;
+    },
+    schedule(callback, delay) {
+      scheduled = { callback, delay, unref() {} };
+      return scheduled;
+    },
+    cancelSchedule() {}
+  });
+  assert.equal(method, "taskkill");
+  assert.deepEqual(invocation, {
+    command: "taskkill",
+    args: ["/PID", "4321", "/T", "/F"],
+    options: { shell: false, windowsHide: true, stdio: "ignore" }
+  });
+  assert.equal(child.killCalls, 0);
+  scheduled.callback();
+  assert.equal(terminator.killCalls, 1);
+
+  const noPidChild = createFakeChild();
+  assert.equal(terminateClaudeChild(noPidChild, { platform: "win32" }), "child-kill");
+  assert.equal(noPidChild.killCalls, 1);
+
+  const exitedChild = createFakeChild();
+  exitedChild.pid = 6789;
+  exitedChild.exitCode = 0;
+  assert.equal(terminateClaudeChild(exitedChild, { platform: "win32" }), "already-exited");
+  assert.equal(exitedChild.killCalls, 0);
 });
 
 test("Claude runner arms timeout before a stalled stdin can block execution", async () => {
@@ -467,8 +774,10 @@ test("Claude runner arms timeout before a stalled stdin can block execution", as
     prompt: "stalled stdin test",
     cwd: projectRoot,
     runtime: runtimeForTest({ timeoutMs: 20 }),
+    createSettings: fakeSettings(),
     spawnProcess: () => child
   });
+  await afterRunnerStarts();
   child.stdin.emit("error", new Error("write EOF"));
 
   await assert.rejects(pending, (error) => {
@@ -485,8 +794,10 @@ test("Claude runner preserves early-exit diagnostics and fails closed", async ()
     prompt: "stdin error",
     cwd: projectRoot,
     runtime: runtimeForTest(),
+    createSettings: fakeSettings(),
     spawnProcess: () => stdinErrorChild
   });
+  await afterRunnerStarts();
   stdinErrorChild.stdin.emit("error", new Error("EPIPE"));
   stdinErrorChild.stderr.end("real early-exit diagnostic");
   stdinErrorChild.stdout.end("real early-exit stdout");
@@ -505,8 +816,10 @@ test("Claude runner preserves early-exit diagnostics and fails closed", async ()
     prompt: "stdin error with zero exit",
     cwd: projectRoot,
     runtime: runtimeForTest(),
+    createSettings: fakeSettings(),
     spawnProcess: () => zeroExitAfterStdinErrorChild
   });
+  await afterRunnerStarts();
   zeroExitAfterStdinErrorChild.stdin.emit("error", new Error("EPIPE"));
   zeroExitAfterStdinErrorChild.stdout.end("incomplete response");
   zeroExitAfterStdinErrorChild.emit("close", 0, null);
@@ -521,8 +834,10 @@ test("Claude runner preserves early-exit diagnostics and fails closed", async ()
     prompt: "exit error",
     cwd: projectRoot,
     runtime: runtimeForTest(),
+    createSettings: fakeSettings(),
     spawnProcess: () => exitChild
   });
+  await afterRunnerStarts();
   exitChild.stderr.end("invalid invocation");
   exitChild.emit("close", 1, null);
   await assert.rejects(exitFailure, (error) => {
@@ -537,8 +852,10 @@ test("Claude runner preserves early-exit diagnostics and fails closed", async ()
     prompt: "overflow",
     cwd: projectRoot,
     runtime: runtimeForTest({ maxCaptureBytes: 5 }),
+    createSettings: fakeSettings(),
     spawnProcess: () => overflowChild
   });
+  await afterRunnerStarts();
   overflowChild.stdout.emit("data", Buffer.from("123456"));
   await assert.rejects(overflowFailure, (error) => {
     assert.ok(error instanceof ClaudeOutputCaptureOverflowError);
@@ -552,6 +869,7 @@ test("Claude runner preserves early-exit diagnostics and fails closed", async ()
       prompt: "invalid timeout",
       cwd: projectRoot,
       runtime: runtimeForTest({ timeoutMs: 2147483648 }),
+      createSettings: fakeSettings(),
       spawnProcess: () => {
         throw new Error("runner must not spawn with an invalid timeout");
       }

@@ -9,10 +9,12 @@ function requireNonEmptyText(name, value) {
  * Registry metadata remains out of the prompt; runtime capabilities are
  * included only as factual execution limits for this invocation.
  */
-export function composeAgentPrompt({ contract, task, cwd, runtime }) {
+export function composeAgentPrompt({ contract, task, cwd, canonicalRoot, executionId, runtime }) {
   requireNonEmptyText("Role contract", contract);
   requireNonEmptyText("Assignment", task);
   requireNonEmptyText("Working directory", cwd);
+  requireNonEmptyText("Canonical root", canonicalRoot);
+  requireNonEmptyText("Execution ID", executionId);
   requireNonEmptyText("Runtime capability description", runtime.capabilityDescription);
 
   return [
@@ -30,6 +32,8 @@ export function composeAgentPrompt({ contract, task, cwd, runtime }) {
     "===============",
     "",
     "Working directory: " + cwd,
+    "Canonical root: " + canonicalRoot,
+    "Execution ID: " + executionId,
     "",
     "Runtime capabilities:",
     runtime.capabilityDescription,
@@ -40,6 +44,6 @@ export function composeAgentPrompt({ contract, task, cwd, runtime }) {
     "Follow the Role Contract for behavior and scope.",
     "The Assignment specifies the task for this invocation but does not override the Role Contract's safety, scope, mutation, delegation, confidence, or output boundaries.",
     "Complete only the assigned specialist role.",
-    "Actual runtime capabilities limit any action. Nested claude-agents MCP delegation is unavailable in Phase 3B."
+    "Actual runtime capabilities limit any action. Nested claude-agents MCP delegation is unavailable in Phase 4."
   ].join("\n");
 }

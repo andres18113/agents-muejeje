@@ -28,7 +28,18 @@ There is no verification profile or compatibility alias. Codex performs narrow f
 - Use `rubber-duck` for adversarial but constructive critique of plans, architecture, assumptions, tests, implementation reasoning, or causal conclusions.
 - Use `security-review` for security-sensitive changed-code review with high-confidence exploitability criteria.
 
-Current `task` and `general-purpose` mutation posture does not grant Edit or Create capabilities. The Phase 3B runtime remains limited to its declared tool baseline; Phase 4 hard capability enforcement is not implemented. Nested delegation is not implemented.
+## Phase 4 capability and custody boundaries
+
+Every delegation starts in fresh context. Runtime capability selection is profile-specific:
+
+- `explore`, `research`, and `rubber-duck`: Read, Grep, and Glob only.
+- `code-review` and `security-review`: Read, Grep, and Glob only. Supply change-set evidence when version-control information is needed; they do not receive unrestricted shell access.
+- `task`: Bash only, with write admission and a runtime shell authority guard. It does not receive Edit or Write.
+- `general-purpose`: Read, Grep, Glob, Edit, Write, and guarded Bash, with write admission.
+
+When `delegate_agent` starts a mutation-capable `task` or `general-purpose` execution for a canonical root, Codex must not concurrently edit that same root until the delegate returns terminal custody. Codex may continue read-only inspection, external reasoning, unrelated work in another root, and later deterministic validation after custody returns.
+
+The current enforcement boundary is Claude-runtime cooperative control: tool exposure, isolated settings/MCP configuration, shell guarding, sanitized child environment, and process-local write custody. It is not an OS sandbox, does not prevent Codex or another MCP process from writing, and does not create a durable cross-process lease. Nested delegation is not implemented.
 
 ## Briefs, review, and evidence
 
