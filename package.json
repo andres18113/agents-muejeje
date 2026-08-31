@@ -1,0 +1,15 @@
+{
+  "name": "claude-agents-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP server that exposes profile-driven fresh Claude Code specialists to Codex CLI.",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.5.4"
+  }
+}
