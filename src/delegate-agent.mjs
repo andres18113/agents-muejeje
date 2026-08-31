@@ -261,9 +261,41 @@ function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now,
 }
 
 function failedStatus(error) {
-  return error instanceof ClaudeTimeoutError || error?.code === "claude_timeout"
+  return (
+    error instanceof ClaudeTimeoutError ||
+    error?.code === "claude_timeout" ||
+    error?.timeoutOccurred === true
+  )
     ? "timeout"
     : "failed";
+}
+
+function custodyRetentionError(existingError, { terminalProofAvailable = false } = {}) {
+  if (existingError?.code === "claude_termination_unproven") {
+    return {
+      code: existingError.code,
+      message:
+        typeof existingError.message === "string" && existingError.message.length > 0
+          ? existingError.message
+          : "Write custody retained because Claude child termination could not be proven."
+    };
+  }
+
+  if (terminalProofAvailable) {
+    return {
+      code: "write_custody_release_failed",
+      message:
+        "Write custody retained because the terminal proof could not be applied to its owning reservation." +
+        (existingError?.message ? " Release failure: " + existingError.message : "")
+    };
+  }
+
+  return {
+    code: "claude_termination_unproven",
+    message:
+      "Write custody retained because Claude child termination could not be proven." +
+      (existingError?.message ? " Original failure: " + existingError.message : "")
+  };
 }
 
 /**
@@ -310,6 +342,10 @@ export async function delegateAgent(input, dependencies = {}) {
   const startedAt = now();
   let reservation;
   let custodyState = runtime.accessMode === "write" ? "not-acquired" : "not-applicable";
+  let writerProcessStarted = false;
+  let writerProcessIdentity;
+  let terminalProof;
+  let processProvenNotStarted = false;
   let outcome;
 
   try {
@@ -321,21 +357,44 @@ export async function delegateAgent(input, dependencies = {}) {
         canonicalRootKey: workspace.canonicalRootKey
       });
       custodyState = reservation.state.toLowerCase();
-      reservation = writeCustody.activateWriteAccess({
-        executionId,
-        canonicalRootKey: workspace.canonicalRootKey
-      });
-      custodyState = reservation.state.toLowerCase();
     }
 
     const execution = await runAgent({
       profile,
+      agentType: profile.id,
       prompt,
       cwd: workspace.effectiveCwd,
       canonicalRoot: workspace.canonicalRoot,
       executionId,
-      runtime
+      runtime,
+      onChildStarted: runtime.accessMode === "write"
+        ? (processIdentity) => {
+            writerProcessStarted = true;
+            writerProcessIdentity = processIdentity;
+            reservation = writeCustody.activateWriteAccess({
+              executionId,
+              canonicalRootKey: workspace.canonicalRootKey,
+              processIdentity
+            });
+            custodyState = reservation.state.toLowerCase();
+          }
+        : undefined,
+      onTerminationStarted: runtime.accessMode === "write"
+        ? (processIdentity) => {
+            writerProcessStarted = true;
+            writerProcessIdentity = processIdentity;
+            reservation = writeCustody.beginTermination({
+              executionId,
+              canonicalRootKey: workspace.canonicalRootKey,
+              processIdentity
+            });
+            custodyState = reservation.state.toLowerCase();
+          }
+        : undefined
     });
+    writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
+    writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
+    terminalProof = execution?.terminalProof;
 
     outcome = {
       ...baseOutcome({
@@ -355,6 +414,10 @@ export async function delegateAgent(input, dependencies = {}) {
       ...(Number.isSafeInteger(execution.pid) ? { pid: execution.pid } : {})
     };
   } catch (error) {
+    writerProcessStarted = writerProcessStarted || error?.processStarted === true || Boolean(error?.processIdentity);
+    writerProcessIdentity = writerProcessIdentity || error?.processIdentity;
+    terminalProof = error?.terminalProof;
+    processProvenNotStarted = error?.processStarted === false;
     outcome = {
       ...baseOutcome({
         profile,
@@ -375,14 +438,57 @@ export async function delegateAgent(input, dependencies = {}) {
   } finally {
     if (reservation) {
       try {
-        const released = writeCustody.releaseWriteAccess({
-          executionId,
-          canonicalRootKey: workspace.canonicalRootKey
-        });
-        custodyState = released.state.toLowerCase();
+        if (!writerProcessStarted && processProvenNotStarted && outcome?.status !== "completed") {
+          const released = writeCustody.releaseUnstartedWriteAccess({
+            executionId,
+            canonicalRootKey: workspace.canonicalRootKey
+          });
+          custodyState = released.state.toLowerCase();
+        } else if (writerProcessStarted && terminalProof) {
+          const released = writeCustody.releaseWriteAccessAfterTerminal({
+            executionId,
+            canonicalRootKey: workspace.canonicalRootKey,
+            terminalProof
+          });
+          custodyState = released.state.toLowerCase();
+        } else {
+          const orphaned = writeCustody.markOrphanedWriteAccess({
+            executionId,
+            canonicalRootKey: workspace.canonicalRootKey,
+            processIdentity: writerProcessIdentity,
+            reason: "terminal-proof-unavailable"
+          });
+          custodyState = orphaned.state.toLowerCase();
+          outcome = {
+            ...baseOutcome({
+              profile,
+              runtime,
+              workspace,
+              executionId,
+              startedAt,
+              now,
+              custodyState
+            }),
+            status: outcome?.status === "timeout" ? "timeout" : "failed",
+            durationMs: outcome?.durationMs ?? Math.max(0, now() - startedAt),
+            error: custodyRetentionError(outcome?.error),
+            stderrSummary: outcome?.stderrSummary || "",
+            ...(Number.isSafeInteger(outcome?.pid) ? { pid: outcome.pid } : {})
+          };
+        }
         if (outcome) outcome.custodyState = custodyState;
       } catch (releaseError) {
-        custodyState = "release-failed";
+        try {
+          const orphaned = writeCustody.markOrphanedWriteAccess({
+            executionId,
+            canonicalRootKey: workspace.canonicalRootKey,
+            processIdentity: writerProcessIdentity,
+            reason: "custody-release-proof-failed"
+          });
+          custodyState = orphaned.state.toLowerCase();
+        } catch {
+          custodyState = "retention-failed";
+        }
         outcome = {
           ...baseOutcome({
             profile,
@@ -393,8 +499,10 @@ export async function delegateAgent(input, dependencies = {}) {
             now,
             custodyState
           }),
-          status: "failed",
-          error: outcomeError(releaseError),
+          status: outcome?.status === "timeout" ? "timeout" : "failed",
+          error: custodyRetentionError(releaseError, {
+            terminalProofAvailable: Boolean(terminalProof)
+          }),
           stderrSummary: outcome?.stderrSummary || ""
         };
       }

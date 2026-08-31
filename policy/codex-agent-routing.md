@@ -37,9 +37,9 @@ Every delegation starts in fresh context. Runtime capability selection is profil
 - `task`: Bash only, with write admission and a runtime shell authority guard. It does not receive Edit or Write.
 - `general-purpose`: Read, Grep, Glob, Edit, Write, and guarded Bash, with write admission.
 
-When `delegate_agent` starts a mutation-capable `task` or `general-purpose` execution for a canonical root, Codex must not concurrently edit that same root until the delegate returns terminal custody. Codex may continue read-only inspection, external reasoning, unrelated work in another root, and later deterministic validation after custody returns.
+When `delegate_agent` starts a mutation-capable `task` or `general-purpose` execution for a canonical root, Codex must not concurrently edit that same root until the delegate returns terminal custody. Custody returns only after the exact spawned Claude child has a demonstrated terminal `close` or `exit` event. If the delegate reports `claude_termination_unproven`, its process-local root remains blocked as `ORPHANED`; do not start another writer for that root in this MCP process. A server restart only loses the in-memory block; it is not proof that the orphan exited. Codex may continue read-only inspection, external reasoning, unrelated work in another root, and later deterministic validation after custody returns.
 
-The current enforcement boundary is Claude-runtime cooperative control: tool exposure, isolated settings/MCP configuration, shell guarding, sanitized child environment, and process-local write custody. It is not an OS sandbox, does not prevent Codex or another MCP process from writing, and does not create a durable cross-process lease. Nested delegation is not implemented.
+The current enforcement boundary is Claude-runtime cooperative control: tool exposure, isolated settings/MCP configuration, shell guarding, sanitized child environment, and process-local write custody with fail-closed termination proof. It is not an OS sandbox, does not prevent Codex or another MCP process from writing, and does not create a durable cross-process lease or orphan reconciliation. Nested delegation is not implemented.
 
 ## Briefs, review, and evidence
 
