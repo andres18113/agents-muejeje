@@ -48,7 +48,9 @@ function manager(stateRoot, observations, currentPid, options = {}) {
     inspectProcess: inspector(observations),
     currentPid,
     now: options.now || (() => 1_000),
-    createNonce: options.createNonce
+    createNonce: options.createNonce,
+    beforePublish: options.beforePublish,
+    afterPublicationIssued: options.afterPublicationIssued
   });
 }
 
@@ -91,8 +93,18 @@ async function withState(callback) {
   try {
     await callback(stateRoot);
   } finally {
-    await rm(stateRoot, { recursive: true, force: true });
+    await rm(stateRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 async function reserve(custody, {
@@ -246,7 +258,7 @@ test("durable state is rejected when configured inside the working tree", async 
       (error) => error instanceof WriteCustodyError && error.code === "write_custody_state_root_invalid"
     );
   } finally {
-    await rm(repositoryRoot, { recursive: true, force: true });
+    await rm(repositoryRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
 });
 
@@ -503,6 +515,152 @@ test("coordinator and Claude both proven dead are reconciled", async () => {
       300
     );
     const acquired = await reserve(second, { executionId: "execution-b" });
+    assert.equal(acquired.executionId, "execution-b");
+  });
+});
+
+test("a crashed coordinator's TERMINATING record never releases even when Claude is proven dead", async () => {
+  await withState(async (stateRoot) => {
+    // Real durable state, not a fixture: reserve, spawn, activate and begin
+    // termination through the ordinary API so the record on disk is exactly
+    // what a coordinator writes just before it starts killing its child.
+    const identity = childIdentity();
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")], [200, live(200, "20000")]]), 100);
+    await reserve(first);
+    await activate(first, identity);
+    const terminating = await first.beginTermination({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity
+    });
+    assert.equal(terminating.state, "TERMINATING");
+
+    // Read the record straight off the filesystem to prove the durable state
+    // under test really is TERMINATING with a persisted Claude identity.
+    const recordPath = path.join(
+      first.repositoryStateDirectory(rootAKey),
+      "ownership",
+      "record.json"
+    );
+    const persisted = JSON.parse(await readFile(recordPath, "utf8"));
+    assert.equal(persisted.state, "TERMINATING");
+    assert.deepEqual(persisted.claudeProcess, durableIdentity(200, "20000"));
+
+    // The coordinator crashed. Its Claude child is gone too - but the taskkill
+    // helper it may have launched had no durable identity, so nothing can prove
+    // the repository is quiet. Releasing here would hand the tree to a new
+    // writer while a destructive tree-kill could still be running.
+    const restarted = manager(
+      stateRoot,
+      new Map([
+        [100, dead()],
+        [200, dead()],
+        [300, live(300, "30000")]
+      ]),
+      300
+    );
+    const reconciliation = await restarted.reconcileExistingOwnership(rootAKey);
+    assert.equal(reconciliation.released, false, "TERMINATING must never auto-release");
+    assert.equal(reconciliation.reason, "forced-termination-unproven");
+    assert.equal(reconciliation.coordinator, "dead");
+    assert.equal(reconciliation.claude, "dead");
+
+    await assert.rejects(
+      reserve(restarted, { executionId: "execution-b" }),
+      (error) => {
+        assert.ok(error instanceof WriteCustodyError);
+        assert.equal(error.code, "write_custody_conflict");
+        return true;
+      },
+      "a new writer must remain blocked"
+    );
+
+    const retained = await restarted.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+    assert.equal(retained.orphanReason, "forced-termination-helper-quiescence-unproven");
+    assert.equal(retained.accessMode, "write");
+    assert.equal(retained.executionId, "execution-a");
+    assert.equal(retained.terminalProof, undefined, "no terminal proof may be fabricated");
+
+    // Repeated reconciliation must stay fail-closed rather than eventually
+    // releasing once the record has settled into ORPHANED.
+    const second = await restarted.reconcileExistingOwnership(rootAKey);
+    assert.equal(second.released, false);
+    assert.equal(second.reason, "forced-termination-unproven");
+    await assert.rejects(reserve(restarted, { executionId: "execution-c" }), /already retained/);
+    assert.equal((await restarted.getWriteAccess(rootAKey)).state, "ORPHANED");
+  });
+});
+
+test("an already ORPHANED record with a dead Claude also stays fail-closed after a crash", async () => {
+  await withState(async (stateRoot) => {
+    // Reaching ORPHANED is the coordinator admitting it could not prove
+    // termination, which is precisely when an unproven taskkill helper may
+    // still exist. A later coordinator must not read "Claude is dead" as
+    // permission to take the repository.
+    const identity = childIdentity();
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")], [200, live(200, "20000")]]), 100);
+    await reserve(first);
+    await activate(first, identity);
+    const orphaned = await first.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "termination-grace-expired"
+    });
+    assert.equal(orphaned.state, "ORPHANED");
+
+    const restarted = manager(
+      stateRoot,
+      new Map([[100, dead()], [200, dead()], [300, live(300, "30000")]]),
+      300
+    );
+    const reconciliation = await restarted.reconcileExistingOwnership(rootAKey);
+    assert.equal(reconciliation.released, false);
+    assert.equal(reconciliation.reason, "forced-termination-unproven");
+    await assert.rejects(reserve(restarted, { executionId: "execution-b" }), /already retained/);
+    const retained = await restarted.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+    // The original orphan reason is preserved: the record was already ORPHANED,
+    // so reconciliation records no new transition.
+    assert.equal(retained.orphanReason, "termination-grace-expired");
+  });
+});
+
+test("durable terminal states still complete their release after the coordinator dies", async () => {
+  await withState(async (stateRoot) => {
+    // The counterpart to the rule above: TERMINAL_PROVEN and HANDOFF_READY rest
+    // on proof that was written to disk before the crash, so a later
+    // coordinator can finish the handoff it can still verify.
+    const first = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(first);
+    const recordPath = path.join(
+      first.repositoryStateDirectory(rootAKey),
+      "ownership",
+      "record.json"
+    );
+    const reserved = JSON.parse(await readFile(recordPath, "utf8"));
+    const at = reserved.updatedAt;
+    await writeFile(
+      recordPath,
+      JSON.stringify({
+        ...reserved,
+        revision: reserved.revision + 1,
+        state: "TERMINAL_PROVEN",
+        accessMode: "none",
+        updatedAt: at,
+        transitions: [...reserved.transitions, { state: "TERMINAL_PROVEN", at }],
+        terminalProof: { kind: "not-started", observedAt: at }
+      }, null, 2) + "\n",
+      "utf8"
+    );
+
+    const restarted = manager(stateRoot, new Map([[100, dead()], [300, live(300, "30000")]]), 300);
+    const reconciliation = await restarted.reconcileExistingOwnership(rootAKey);
+    assert.equal(reconciliation.released, true);
+    assert.equal(reconciliation.reason, "terminal-record");
+    assert.equal(reconciliation.record.state, "RELEASED");
+    const acquired = await reserve(restarted, { executionId: "execution-b" });
     assert.equal(acquired.executionId, "execution-b");
   });
 });
@@ -833,5 +991,365 @@ test("a cleared Git worktree operation no longer participates in reconciliation"
     const retained = await second.getWriteAccess(rootAKey);
     // Falls back to the generic preparing-state rule, not the Git-operation one.
     assert.equal(retained.orphanReason, "process-identity-not-persisted");
+  });
+});
+
+test("a stale beginTermination publication cannot overwrite a released execution or a new owner", async () => {
+  await withState(async (stateRoot) => {
+    const publicationReached = deferred();
+    const resumePublication = deferred();
+    const observations = new Map([
+      [100, live(100, "10000")],
+      [200, live(200, "20000")],
+      [300, live(300, "30000")],
+      [400, live(400, "40000")]
+    ]);
+    const first = manager(stateRoot, observations, 100, {
+      beforePublish: async ({ nextRecord }) => {
+        if (nextRecord.executionId === "execution-a" && nextRecord.state === "TERMINATING") {
+          publicationReached.resolve();
+          await resumePublication.promise;
+        }
+      }
+    });
+    const identityA = childIdentity();
+    await reserve(first);
+    await activate(first, identityA);
+
+    const staleTermination = first.beginTermination({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identityA
+    });
+    await publicationReached.promise;
+
+    // This separate manager represents a later coordinator after A died. It
+    // terminalizes A through reconciliation, archives it, then admits B.
+    observations.set(100, dead());
+    observations.set(200, dead());
+    const second = manager(stateRoot, observations, 300);
+    await reserve(second, { executionId: "execution-b" });
+    const identityB = childIdentity({ executionId: "execution-b", pid: 400, startTime: "40000" });
+    await activate(second, identityB);
+
+    resumePublication.resolve();
+    await assert.rejects(
+      staleTermination,
+      (error) => error instanceof WriteCustodyError &&
+        ["write_custody_owner_mismatch", "write_custody_stale_mutation"].includes(error.code)
+    );
+    const authoritative = await second.getWriteAccess(rootAKey);
+    assert.equal(authoritative.executionId, "execution-b");
+    assert.equal(authoritative.state, "ACTIVE");
+  });
+});
+
+test("cancelled delayed activation stops blocking terminal recovery and never later publishes ACTIVE", async () => {
+  await withState(async (stateRoot) => {
+    const publicationReached = deferred();
+    const resumePublication = deferred();
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100, {
+      beforePublish: async ({ nextRecord }) => {
+        if (nextRecord.state === "ACTIVE") {
+          publicationReached.resolve();
+          await resumePublication.promise;
+        }
+      }
+    });
+    const identity = childIdentity();
+    await reserve(custody);
+    await custody.markSpawning({ executionId: "execution-a", canonicalRootKey: rootAKey });
+    const controller = new AbortController();
+    const activation = custody.activateWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      mutationSignal: controller.signal
+    });
+    await publicationReached.promise;
+    controller.abort();
+
+    // The aborted write is still paused before its final rename, but it no
+    // longer has publication authority. Terminal recovery can therefore make
+    // conservative durable progress instead of waiting behind it forever.
+    const orphaned = await custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "activation-deadline-expired"
+    });
+    assert.equal(orphaned.state, "ORPHANED");
+    await custody.releaseOrphanedWriteAccessAfterTerminal({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_250)
+    });
+    const admitted = await reserve(custody, { executionId: "execution-b" });
+    assert.equal(admitted.executionId, "execution-b");
+    resumePublication.resolve();
+    await assert.rejects(
+      activation,
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_mutation_cancelled"
+    );
+    const record = await custody.getWriteAccess(rootAKey);
+    assert.equal(record.executionId, "execution-b");
+    assert.equal(record.state, "RESERVED");
+  });
+});
+
+test("cancelled beginTermination cannot race exact terminal release or a later admission", async () => {
+  await withState(async (stateRoot) => {
+    const publicationReached = deferred();
+    const resumePublication = deferred();
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100, {
+      beforePublish: async ({ nextRecord }) => {
+        if (nextRecord.state === "TERMINATING") {
+          publicationReached.resolve();
+          await resumePublication.promise;
+        }
+      }
+    });
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+
+    const controller = new AbortController();
+    const terminating = custody.beginTermination({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      mutationSignal: controller.signal
+    });
+    await publicationReached.promise;
+    controller.abort();
+
+    const released = await custody.releaseWriteAccessAfterTerminal({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_250)
+    });
+    assert.equal(released.state, "RELEASED");
+    const admitted = await reserve(custody, { executionId: "execution-b" });
+    assert.equal(admitted.executionId, "execution-b");
+
+    resumePublication.resolve();
+    await assert.rejects(
+      terminating,
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_mutation_cancelled"
+    );
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.executionId, "execution-b");
+    assert.equal(authoritative.state, "RESERVED");
+  });
+});
+
+test("post-publication cancellation lets an issued transition quiesce before release and admission", async () => {
+  await withState(async (stateRoot) => {
+    const publicationIssued = deferred();
+    const resumePublication = deferred();
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100, {
+      afterPublicationIssued: async ({ nextRecord }) => {
+        if (nextRecord.executionId === "execution-a" && nextRecord.state === "TERMINATING") {
+          publicationIssued.resolve();
+          await resumePublication.promise;
+        }
+      }
+    });
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+
+    const controller = new AbortController();
+    let terminationSettled = false;
+    const terminating = custody.beginTermination({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      mutationSignal: controller.signal
+    }).then((record) => {
+      terminationSettled = true;
+      return record;
+    });
+    await publicationIssued.promise;
+
+    // Cancellation arrives after the rename call. It must not be represented
+    // as pre-publication invalidation or let later ownership work overtake the
+    // still-issued transition.
+    controller.abort();
+    let releaseSettled = false;
+    let admissionSettled = false;
+    const released = custody.releaseWriteAccessAfterTerminal({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_250)
+    }).then((record) => {
+      releaseSettled = true;
+      return record;
+    });
+    const admitted = reserve(custody, { executionId: "execution-b" }).then((record) => {
+      admissionSettled = true;
+      return record;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(terminationSettled, false);
+    assert.equal(releaseSettled, false);
+    assert.equal(admissionSettled, false);
+
+    resumePublication.resolve();
+    const [transitioned, releasedRecord, admittedRecord] = await Promise.all([
+      terminating,
+      released,
+      admitted
+    ]);
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(transitioned.state, "TERMINATING");
+    assert.equal(releasedRecord.state, "RELEASED");
+    assert.equal(admittedRecord.executionId, "execution-b");
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.executionId, "execution-b");
+    assert.equal(authoritative.state, "RESERVED");
+  });
+});
+
+test("concurrent mutations of one real ownership record serialize in invocation order", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")], [200, live(200, "20000")]]), 100);
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+
+    const terminating = custody.beginTermination({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity
+    });
+    const orphaning = custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "test-concurrent-order"
+    });
+    await Promise.all([terminating, orphaning]);
+    const record = await custody.getWriteAccess(rootAKey);
+    assert.equal(record.state, "ORPHANED");
+    assert.deepEqual(record.transitions.map((entry) => entry.state), [
+      "RESERVED",
+      "SPAWNING",
+      "ACTIVE",
+      "TERMINATING",
+      "ORPHANED"
+    ]);
+    assert.equal(record.revision, 4);
+  });
+});
+
+test("archive and admission cannot interleave an old released record over a new owner", async () => {
+  await withState(async (stateRoot) => {
+    const observations = new Map([[100, live(100, "10000")]]);
+    const custody = manager(stateRoot, observations, 100);
+    await reserve(custody);
+    const release = custody.releaseUnstartedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    const admission = reserve(custody, { executionId: "execution-b" });
+    const [released, admitted] = await Promise.all([release, admission]);
+    assert.equal(released.state, "RELEASED");
+    assert.equal(admitted.executionId, "execution-b");
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.executionId, "execution-b");
+    assert.equal(authoritative.state, "RESERVED");
+  });
+});
+
+test("a valid Phase 5.2 record migrates to revisioned publication on its next mutation", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    await reserve(custody);
+    const recordPath = path.join(custody.repositoryStateDirectory(rootAKey), "ownership", "record.json");
+    const legacy = JSON.parse(await readFile(recordPath, "utf8"));
+    legacy.schemaVersion = 1;
+    delete legacy.revision;
+    await writeFile(recordPath, JSON.stringify(legacy, null, 2), "utf8");
+
+    const spawning = await custody.markSpawning({ executionId: "execution-a", canonicalRootKey: rootAKey });
+    assert.equal(spawning.schemaVersion, 2);
+    assert.equal(spawning.revision, 1);
+    const durable = JSON.parse(await readFile(recordPath, "utf8"));
+    assert.equal(durable.schemaVersion, 2);
+    assert.equal(durable.revision, 1);
+  });
+});
+
+test("the same live coordinator can release ORPHANED custody on a later exact close", async () => {
+  await withState(async (stateRoot) => {
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100);
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+    await custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "termination-grace-expired"
+    });
+
+    const released = await custody.releaseOrphanedWriteAccessAfterTerminal({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_300)
+    });
+    assert.equal(released.state, "RELEASED");
+    assert.deepEqual(released.transitions.map((entry) => entry.state), [
+      "RESERVED",
+      "SPAWNING",
+      "ACTIVE",
+      "ORPHANED",
+      "TERMINAL_PROVEN",
+      "HANDOFF_READY",
+      "RELEASED"
+    ]);
+  });
+});
+
+test("foreign or ambiguous late proof cannot release ORPHANED custody", async () => {
+  await withState(async (stateRoot) => {
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const first = manager(stateRoot, observations, 100);
+    const identity = childIdentity();
+    await reserve(first);
+    await activate(first, identity);
+    await first.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "termination-grace-expired"
+    });
+
+    const foreign = manager(stateRoot, new Map([[300, live(300, "30000")]]), 300);
+    await assert.rejects(
+      foreign.releaseOrphanedWriteAccessAfterTerminal({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: terminalProof(identity, 1_300)
+      }),
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_terminal_proof_required"
+    );
+    const retained = await first.getWriteAccess(rootAKey);
+    assert.equal(retained.state, "ORPHANED");
+
+    await assert.rejects(
+      first.releaseOrphanedWriteAccessAfterTerminal({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: terminalProof(childIdentity({ child: new EventEmitter() }), 1_400)
+      }),
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_process_identity_mismatch"
+    );
+    assert.equal((await first.getWriteAccess(rootAKey)).state, "ORPHANED");
   });
 });

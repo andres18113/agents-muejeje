@@ -57,7 +57,7 @@ test("dead and ambiguous process observations remain distinct", async () => {
   assert.equal(ambiguous.status, PROCESS_IDENTITY_MATCH.AMBIGUOUS);
 });
 
-test("Windows Get-Process returns invariant start identity for the current process", {
+test("Windows Process.GetProcessById returns invariant start identity for the current process", {
   skip: process.platform !== "win32"
 }, async () => {
   const observation = await inspectProcessIdentity(process.pid);
@@ -132,6 +132,23 @@ function stubQueryChild() {
   };
   return child;
 }
+
+test("a cancelled identity observation does not launch a new PowerShell query", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let spawned = false;
+  const observation = await inspectProcessIdentity(4321, {
+    platform: "win32",
+    abortSignal: controller.signal,
+    spawnProcess: () => {
+      spawned = true;
+      return stubQueryChild();
+    }
+  });
+  assert.equal(observation.status, PROCESS_IDENTITY_STATUS.AMBIGUOUS);
+  assert.equal(observation.reason, "query-cancelled");
+  assert.equal(spawned, false);
+});
 
 test("an abandoned identity query terminates the exact child and awaits its close", async () => {
   // Timeout: the query child is asked to stop and then awaited. When it does

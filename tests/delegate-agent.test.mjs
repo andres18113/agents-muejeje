@@ -132,6 +132,23 @@ class WriteCustodyManager {
     return { ...record, state: "RELEASED", accessMode: "none" };
   }
 
+  releaseOrphanedWriteAccessAfterTerminal({ terminalProof, ...owner }) {
+    const record = this.#owned(owner);
+    if (record.state !== "ORPHANED") {
+      throw new WriteCustodyError("Invalid state.", { code: "write_custody_state_invalid" });
+    }
+    if (!terminalProof || terminalProof.event !== "close") {
+      throw new WriteCustodyError("Terminal proof missing.", {
+        code: "write_custody_terminal_proof_missing"
+      });
+    }
+    if (terminalProof.supervisedByCoordinator !== true && terminalProof.processIdentity !== record.processIdentity) {
+      throw new WriteCustodyError("Terminal proof mismatch.", { code: "write_custody_process_identity_mismatch" });
+    }
+    this.#records.delete(owner.canonicalRootKey);
+    return { ...record, state: "RELEASED", accessMode: "none" };
+  }
+
   markOrphanedWriteAccess({ processIdentity, reason, ...owner }) {
     const record = this.#owned(owner);
     if (processIdentity) record.processIdentity = processIdentity;
@@ -906,6 +923,11 @@ test("taskkill failure or timeout retains ORPHANED custody and only readers rema
     assert.equal(outcome.error.code, "claude_termination_unproven");
     assert.equal(outcome.custodyState, "orphaned");
     assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+    assert.equal(
+      child.killCalls,
+      1,
+      terminatorMode + " taskkill failure falls back to the exact in-memory child handle"
+    );
     assert.match(formatDelegateAgentOutcome(outcome), /CustodyState: orphaned/);
     assert.match(formatDelegateAgentOutcome(outcome), /ErrorCode: claude_termination_unproven/);
     assert.match(formatDelegateAgentOutcome(outcome), /write custody must remain retained/i);
@@ -939,6 +961,56 @@ test("taskkill failure or timeout retains ORPHANED custody and only readers rema
     assert.equal(nextWriter.error.code, "write_custody_conflict");
     assert.equal(nextWriterCalled, false);
   }
+});
+
+test("target close cannot release writer custody while a launched taskkill helper is unproven", async () => {
+  const custody = new WriteCustodyManager();
+  const child = stalledChildForTermination();
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+    return true;
+  };
+  let taskkillStarted;
+  const taskkillStartedPromise = new Promise((resolve) => {
+    taskkillStarted = resolve;
+  });
+  const runtime = writerRuntime(10);
+  const pending = delegateAgent(
+    { agentType: "task", task: "target closes before helper", cwd: projectRoot },
+    {
+      writeCustody: custody,
+      createExecutionId: () => "helper-unproven-writer",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        createSettings: fakeSettings(),
+        spawnProcess: () => child,
+        terminationTimeoutMs: 20,
+        terminateChild: (target, options) => terminateClaudeChild(target, {
+          ...options,
+          platform: "win32",
+          spawnTerminator() {
+            taskkillStarted();
+            return terminator;
+          }
+        })
+      })
+    }
+  );
+
+  await taskkillStartedPromise;
+  child.emit("close", null, "SIGTERM");
+  const outcome = await pending;
+  const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "claude_termination_unproven");
+  assert.equal(outcome.custodyState, "orphaned");
+  assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+  assert.equal(terminator.killCalls, 1, "the hanging helper receives an exact-handle stop request");
 });
 
 test("synchronous spawn and pre-spawn failures return an unstarted reservation safely", async () => {
@@ -1044,7 +1116,7 @@ test("terminal-proof and terminator deadlines resolve deterministically on refer
     schedule: terminatorScheduler.schedule,
     cancelSchedule: terminatorScheduler.cancelSchedule
   });
-  assert.equal(terminatorResult.status, "termination-failed");
+  assert.equal(terminatorResult.status, "termination-unproven");
   assert.equal(terminatorResult.method, "taskkill");
   assert.equal(terminatorResult.taskkillStatus, "timeout");
   assert.equal(terminatorResult.terminalProof, undefined);
@@ -1056,6 +1128,55 @@ test("terminal-proof and terminator deadlines resolve deterministically on refer
   for (const timer of [...proofScheduler.timers, ...terminatorScheduler.timers]) {
     assert.equal(timer.unrefCalls, 0, "lifecycle deadline timers must stay referenced");
   }
+});
+
+test("a taskkill helper that errors again while being stopped stays bounded and fails closed", async () => {
+  // The Claude path through the shared helper watcher. The helper reports a
+  // failure, which makes us ask that exact helper to stop; asking a real
+  // ChildProcess to die can make it emit `error` again on a later turn. That
+  // second event must be absorbed rather than crash the coordinator, and the
+  // termination must still report unproven quiescence.
+  const child = stalledChildForTermination();
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+    // The stop request fails asynchronously, after the first error was handled.
+    setImmediate(() => terminator.emit("error", new Error("kill request failed")));
+    return true;
+  };
+  const processIdentity = {
+    executionId: "helper-error-writer",
+    agentType: "task",
+    repositoryRoot: projectRoot,
+    pid: child.pid,
+    startTime: String(child.pid * 100),
+    source: "test-process-start",
+    child,
+    startedAt: 1
+  };
+
+  const result = await terminateClaudeChild(child, {
+    platform: "win32",
+    terminationTimeoutMs: 40,
+    processIdentity,
+    inspectProcess: async (pid) => inspectFakeProcess(pid),
+    spawnTerminator: () => {
+      setImmediate(() => terminator.emit("error", new Error("taskkill failed")));
+      return terminator;
+    }
+  });
+
+  assert.equal(result.status, "termination-unproven");
+  assert.equal(result.method, "taskkill");
+  assert.equal(result.terminalProof, undefined, "no proof may be produced without both closes");
+  assert.equal(result.taskkillHelperQuiescenceProven, false);
+  assert.equal(result.helperQuiescenceUnproven, true);
+  assert.equal(terminator.killCalls, 1, "a repeated helper error must not request another kill");
+  assert.equal(child.killCalls, 1, "helper failure falls back to the exact target handle once");
+
+  // A late error arriving after the watcher settled is still absorbed.
+  assert.doesNotThrow(() => terminator.emit("error", new Error("late error")));
 });
 
 test("lifecycle waits keep the runtime alive until the bounded decision resolves", () => {
@@ -1382,6 +1503,82 @@ test("a child that closes during durable activation is handled without waiting f
   assert.equal(received.length, 0);
 });
 
+test("startup stdout and a clean close before assignment cannot complete a writer", async () => {
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ pid: 6792 });
+  const received = [];
+  child.stdin.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  let notifyActivationStarted;
+  const activationStarted = new Promise((resolve) => {
+    notifyActivationStarted = resolve;
+  });
+  let notifyCancellationObserved;
+  const cancellationObserved = new Promise((resolve) => {
+    notifyCancellationObserved = resolve;
+  });
+  let notifyActivationFinished;
+  const activationFinished = new Promise((resolve) => {
+    notifyActivationFinished = resolve;
+  });
+  let activationSignal;
+  let terminalRelease;
+  const releaseAfterTerminal = custody.releaseWriteAccessAfterTerminal.bind(custody);
+  custody.releaseWriteAccessAfterTerminal = (details) => {
+    terminalRelease = details.terminalProof;
+    return releaseAfterTerminal(details);
+  };
+  const runtime = writerRuntime(1_000);
+
+  const pending = delegateAgent(
+    { agentType: "task", task: "must not treat startup text as an answer", cwd: projectRoot },
+    {
+      writeCustody: custody,
+      createExecutionId: () => "clean-close-before-assignment",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        createSettings: fakeSettings(),
+        spawnProcess: () => child,
+        async onChildStarted(processIdentity, context) {
+          activationSignal = context.mutationSignal;
+          notifyActivationStarted();
+          await new Promise((resolve) => {
+            const continueAfterCancellation = () => {
+              notifyCancellationObserved();
+              resolve();
+            };
+            context.mutationSignal.addEventListener("abort", continueAfterCancellation, { once: true });
+            if (context.mutationSignal.aborted) continueAfterCancellation();
+          });
+          // This deliberately completes after runner cancellation was
+          // requested, modeling a lifecycle callback that was already in
+          // flight. The terminal release still serializes against it.
+          await argumentsForRunner.onChildStarted(processIdentity, context);
+          notifyActivationFinished();
+        }
+      })
+    }
+  );
+
+  await activationStarted;
+  child.stdout.end("startup text is not a specialist result");
+  child.emit("close", 0, null);
+  await cancellationObserved;
+  await activationFinished;
+
+  const outcome = await pending;
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.error.code, "claude_exited_before_ready");
+  assert.equal("result" in outcome, false);
+  assert.equal(activationSignal.aborted, true);
+  assert.equal(Buffer.concat(received).length, 0);
+  assert.equal(terminalRelease.event, "close");
+  assert.equal(terminalRelease.code, 0);
+  assert.equal(custody.getWriteAccess(workspaceForTest(projectRoot).canonicalRepositoryKey), undefined);
+});
+
 test("Claude runner removes per-invocation settings on success, failure, and timeout", async () => {
   let successfulCleanup = 0;
   const successfulChild = createFakeChild();
@@ -1580,7 +1777,7 @@ test("an exit during identity capture cannot become a durable Claude identity", 
   });
   child.emit("close", 0, null);
   await assert.rejects(pending, (error) => {
-    assert.equal(error.code, "claude_process_identity_unavailable");
+    assert.equal(error.code, "claude_exited_before_ready");
     assert.equal(error.processIdentity, undefined);
     assert.equal(error.terminalProof.supervisedByCoordinator, true);
     return true;
@@ -1620,6 +1817,90 @@ test("profile deadlines include identity and durable activation setup", async ()
   assert.equal(stalledActivationChild.killCalls, 1);
 });
 
+test("a timed-out durable termination transition reports cancellation without claiming pre-publication invalidation", async () => {
+  const child = createFakeChild();
+  let mutationSignal;
+  let callbackTerminationDeadlineAt;
+  let childTerminationDeadlineAt;
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "termination callback timeout",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 10 }),
+      createSettings: fakeSettings(),
+      spawnProcess: () => child,
+      terminationTimeoutMs: 20,
+      onTerminationStarted(_processIdentity, context) {
+        mutationSignal = context.mutationSignal;
+        callbackTerminationDeadlineAt = context.terminationDeadlineAt;
+        return new Promise(() => {});
+      },
+      terminateChild: async (target, options) => {
+        childTerminationDeadlineAt = options.terminationDeadlineAt;
+        target.emit("close", null, "SIGTERM");
+        return {
+          status: "terminated",
+          method: "test",
+          terminalProof: options.terminalObserver.getTerminalProof()
+        };
+      }
+    }),
+    (error) => {
+      assert.equal(error.code, "claude_timeout");
+      assert.equal(error.terminationResult.durableTransition.status, "timed-out");
+      assert.equal(error.terminationResult.durableTransition.cancellationRequested, true);
+      assert.equal(
+        Object.hasOwn(error.terminationResult.durableTransition, "authorityInvalidated"),
+        false
+      );
+      assert.equal(error.terminalProof.event, "close");
+      return true;
+    }
+  );
+  assert.equal(mutationSignal.aborted, true);
+  assert.equal(callbackTerminationDeadlineAt, childTerminationDeadlineAt);
+});
+
+test("a close that wins after durable termination starts records truthful transition evidence", async () => {
+  const child = createFakeChild({ closeOnKill: false });
+  let transitionStarted;
+  const transitionStartedPromise = new Promise((resolve) => {
+    transitionStarted = resolve;
+  });
+  let mutationSignal;
+  const pending = runClaudeAgent({
+    prompt: "close races durable termination",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 100, maxCaptureBytes: 1 }),
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    onTerminationStarted(_processIdentity, context) {
+      mutationSignal = context.mutationSignal;
+      transitionStarted();
+      return new Promise(() => {});
+    },
+    terminateChild: terminateFakeChild
+  });
+
+  await afterRunnerStarts();
+  child.stdout.emit("data", Buffer.from("overflow"));
+  await transitionStartedPromise;
+  child.emit("close", null, "SIGTERM");
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_output_capture_overflow");
+    assert.equal(error.terminalProof.event, "close");
+    assert.equal(error.terminationResult.durableTransition.status, "terminal-close-won");
+    assert.equal(error.terminationResult.durableTransition.transitionStarted, true);
+    assert.equal(error.terminationResult.durableTransition.cancellationRequested, true);
+    assert.equal(
+      Object.hasOwn(error.terminationResult.durableTransition, "authorityInvalidated"),
+      false
+    );
+    return true;
+  });
+  assert.equal(mutationSignal.aborted, true);
+});
+
 test("settings cleanup failure preserves close proof and releases writer custody", async () => {
   const custody = new WriteCustodyManager();
   const child = createFakeChild({ pid: 67_893 });
@@ -1649,6 +1930,38 @@ test("settings cleanup failure preserves close proof and releases writer custody
 
   assert.equal(outcome.status, "failed");
   assert.equal(outcome.error.code, "claude_settings_cleanup_failed");
+  assert.equal(outcome.custodyState, "released");
+  assert.equal(custody.getWriteAccess(workspaceForTest(projectRoot).canonicalRepositoryKey), undefined);
+});
+
+test("settings cleanup timeout preserves close proof and releases writer custody", async () => {
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ pid: 67_894 });
+  const runtime = writerRuntime(1_000);
+  const outcome = await delegateAgent(
+    { agentType: "task", task: "cleanup timeout evidence", cwd: projectRoot },
+    {
+      writeCustody: custody,
+      createExecutionId: () => "cleanup-timeout-evidence",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        housekeepingTimeoutMs: 10,
+        createSettings: fakeSettings(async () => await new Promise(() => {})),
+        spawnProcess: () => child,
+        async onChildStarted(processIdentity) {
+          await argumentsForRunner.onChildStarted(processIdentity);
+          child.stdout.end("completed before cleanup timeout");
+          child.emit("close", 0, null);
+        }
+      })
+    }
+  );
+
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.error.code, "claude_settings_cleanup_timeout");
   assert.equal(outcome.custodyState, "released");
   assert.equal(custody.getWriteAccess(workspaceForTest(projectRoot).canonicalRepositoryKey), undefined);
 });
@@ -1825,6 +2138,95 @@ test("Windows forced termination targets only the exact Claude child PID and awa
   assert.equal(reusedPidResult.status, "terminated");
   assert.equal(reusedPidResult.method, "child-kill");
   assert.equal(reusedPidResult.identityStatus, "pid-reused");
+});
+
+test("Windows taskkill helper close is separately required before Claude termination is safe", async () => {
+  const child = createFakeChild({ closeOnKill: false, pid: 67_900 });
+  const processIdentity = Object.freeze({
+    child,
+    pid: child.pid,
+    startTime: String(child.pid * 100),
+    source: "test-process-start"
+  });
+  const terminalObserver = observeClaudeChildTerminal(child, processIdentity);
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+    return true;
+  };
+  let taskkillStarted;
+  const taskkillStartedPromise = new Promise((resolve) => {
+    taskkillStarted = resolve;
+  });
+  const hanging = terminateClaudeChild(child, {
+    platform: "win32",
+    processIdentity,
+    terminalObserver,
+    terminationTimeoutMs: 20,
+    inspectProcess: inspectFakeProcess,
+    spawnTerminator() {
+      taskkillStarted();
+      return terminator;
+    }
+  });
+  await taskkillStartedPromise;
+  child.emit("close", null, "SIGTERM");
+  const unproven = await hanging;
+  assert.equal(unproven.status, "termination-unproven");
+  assert.equal(unproven.terminalProof, undefined);
+  assert.equal(unproven.targetTerminalProofObserved, true);
+  assert.equal(unproven.taskkillHelperQuiescenceProven, false);
+  assert.equal(terminator.killCalls, 1, "the hung helper receives an exact-handle stop request");
+
+  const recoveringChild = createFakeChild({ closeOnKill: false, pid: 67_901 });
+  const recoveringIdentity = Object.freeze({
+    child: recoveringChild,
+    pid: recoveringChild.pid,
+    startTime: String(recoveringChild.pid * 100),
+    source: "test-process-start"
+  });
+  const recoveringObserver = observeClaudeChildTerminal(recoveringChild, recoveringIdentity);
+  const failingTerminator = new EventEmitter();
+  failingTerminator.killCalls = 0;
+  failingTerminator.kill = () => {
+    failingTerminator.killCalls += 1;
+    return true;
+  };
+  let recoveredTaskkillStarted;
+  const recoveredTaskkillStartedPromise = new Promise((resolve) => {
+    recoveredTaskkillStarted = resolve;
+  });
+  let recoveredSettled = false;
+  const recovering = terminateClaudeChild(recoveringChild, {
+    platform: "win32",
+    processIdentity: recoveringIdentity,
+    terminalObserver: recoveringObserver,
+    terminationTimeoutMs: 100,
+    inspectProcess: inspectFakeProcess,
+    spawnTerminator() {
+      recoveredTaskkillStarted();
+      return failingTerminator;
+    }
+  });
+  recovering.then(() => {
+    recoveredSettled = true;
+  });
+  await recoveredTaskkillStartedPromise;
+  failingTerminator.emit("exit", 1, null);
+  await afterRunnerStarts();
+  assert.equal(recoveringChild.killCalls, 1, "nonzero taskkill exit falls back to the exact Claude handle");
+  assert.equal(failingTerminator.killCalls, 1, "nonzero taskkill exit requests helper termination");
+
+  recoveringChild.emit("close", null, "SIGTERM");
+  await afterRunnerStarts();
+  assert.equal(recoveredSettled, false, "target close cannot be confused with helper close");
+
+  failingTerminator.emit("close", 1, null);
+  const recovered = await recovering;
+  assert.equal(recovered.terminalProof, recoveringObserver.getTerminalProof());
+  assert.equal(recovered.taskkillHelperQuiescenceProven, true);
+  assert.equal(recovered.taskkillHelper.closeProven, true);
 });
 
 test("Claude runner arms timeout before a stalled stdin can block execution", async () => {
@@ -2076,7 +2478,7 @@ test("a child that dies before durable identity capture releases custody via sup
   );
 
   assert.equal(outcome.status, "failed");
-  assert.equal(outcome.error.code, "claude_process_identity_unavailable");
+  assert.equal(outcome.error.code, "claude_exited_before_ready");
   // Released rather than orphaned: the coordinator saw the exact child close.
   assert.equal(outcome.custodyState, "released");
   assert.equal(supervisedRelease.event, "close");
@@ -2198,4 +2600,178 @@ test("a rejected or slow durable activation callback fails closed without hangin
   assert.equal(outcome.status, "failed");
   assert.match(outcome.error.message, /durable activation failed|termination/iu);
   assert.notEqual(outcome.custodyState, "active");
+});
+
+test("Claude never writes assignment bytes after the absolute execution deadline", async () => {
+  let clock = 0;
+  const child = createFakeChild();
+  const received = [];
+  child.stdin.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  await assert.rejects(
+    runClaudeAgent({
+      prompt: "must not reach stdin",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 10 }),
+      now: () => clock,
+      createSettings: fakeSettings(),
+      spawnProcess: () => child,
+      async onChildStarted() {
+        // Simulate durable setup consuming exactly the profile budget.
+        clock = 10;
+      },
+      terminateChild: terminateFakeChild
+    }),
+    (error) => error instanceof ClaudeTimeoutError && error.code === "claude_timeout"
+  );
+  assert.equal(Buffer.concat(received).length, 0);
+  assert.equal(child.killCalls, 1);
+});
+
+test("forced interruption gets the same fixed proof-of-death grace before or at the execution deadline", async () => {
+  async function observeGrace(interruptionAt) {
+    let clock = 0;
+    const child = createFakeChild({ closeOnKill: false });
+    let terminationDeadlineAt;
+    const pending = runClaudeAgent({
+      prompt: "grace test",
+      cwd: projectRoot,
+      runtime: runtimeForTest({ timeoutMs: 100, maxCaptureBytes: 1 }),
+      now: () => clock,
+      createSettings: fakeSettings(),
+      spawnProcess: () => child,
+      terminationTimeoutMs: 25,
+      terminateChild: async (target, options) => {
+        terminationDeadlineAt = options.terminationDeadlineAt;
+        target.emit("close", null, "SIGTERM");
+        return {
+          status: "terminated",
+          method: "test",
+          terminalProof: options.terminalObserver.getTerminalProof()
+        };
+      }
+    });
+    await afterRunnerStarts();
+    clock = interruptionAt;
+    child.stdout.emit("data", Buffer.from("overflow"));
+    await assert.rejects(pending, ClaudeOutputCaptureOverflowError);
+    return terminationDeadlineAt - interruptionAt;
+  }
+
+  assert.equal(await observeGrace(99), 25);
+  assert.equal(await observeGrace(100), 25);
+});
+
+test("hanging settings cleanup is bounded and preserves exact terminal evidence", async () => {
+  const child = createFakeChild();
+  await assert.rejects(
+    (async () => {
+      const pending = runClaudeAgent({
+        prompt: "cleanup timeout",
+        cwd: projectRoot,
+        runtime: runtimeForTest(),
+        housekeepingTimeoutMs: 10,
+        createSettings: fakeSettings(async () => await new Promise(() => {})),
+        spawnProcess: () => child
+      });
+      await afterRunnerStarts();
+      child.stdout.end("completed before housekeeping timeout");
+      child.emit("close", 0, null);
+      return await pending;
+    })(),
+    (error) => {
+      assert.equal(error.code, "claude_settings_cleanup_timeout");
+      assert.equal(error.terminalProof.event, "close");
+      assert.equal(error.processOutcome.status, "completed");
+      assert.ok(error.cleanupFailure);
+      return true;
+    }
+  );
+});
+
+test("a later exact close releases same-coordinator ORPHANED custody", async () => {
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ closeOnKill: false });
+  const runtime = writerRuntime(10);
+  const outcome = await delegateAgent(
+    { agentType: "task", task: "late exact close", cwd: projectRoot },
+    {
+      writeCustody: custody,
+      createExecutionId: () => "late-close-recovery",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        createSettings: fakeSettings(),
+        spawnProcess: () => child,
+        terminationTimeoutMs: 10,
+        terminateChild: terminateFakeChild
+      })
+    }
+  );
+  const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
+  assert.equal(outcome.custodyState, "orphaned");
+  assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+
+  child.emit("close", null, "SIGTERM");
+  await afterRunnerStarts();
+  await afterRunnerStarts();
+  assert.equal(custody.getWriteAccess(rootKey), undefined);
+  // The returned outcome is a synchronous snapshot. Late exact-close recovery
+  // advances durable custody rather than mutating an already returned result.
+  assert.equal(outcome.custodyState, "orphaned");
+});
+
+test("a failed late ORPHANED recovery stays fail-closed and reports its persistence error", async () => {
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ closeOnKill: false });
+  const runtime = writerRuntime(10);
+  const diagnostics = [];
+  const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
+  const recoveryFailure = new Error("late custody persistence failed");
+  custody.releaseOrphanedWriteAccessAfterTerminal = () => {
+    throw recoveryFailure;
+  };
+  let unhandledRejection;
+  const recordUnhandledRejection = (reason) => {
+    unhandledRejection = reason;
+  };
+  process.on("unhandledRejection", recordUnhandledRejection);
+  try {
+    const outcome = await delegateAgent(
+      { agentType: "task", task: "late recovery persistence failure", cwd: projectRoot },
+      {
+        writeCustody: custody,
+        createExecutionId: () => "late-close-recovery-failure",
+        resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+        resolveRuntime: () => runtime,
+        runAgent: (argumentsForRunner) => runClaudeAgent({
+          ...argumentsForRunner,
+          runtime,
+          createSettings: fakeSettings(),
+          spawnProcess: () => child,
+          terminationTimeoutMs: 10,
+          terminateChild: terminateFakeChild,
+          async onLateRecoveryFailure(error, context) {
+            diagnostics.push({ error, context });
+            throw new Error("diagnostic sink unavailable");
+          }
+        })
+      }
+    );
+    assert.equal(outcome.custodyState, "orphaned");
+    assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+
+    child.emit("close", null, "SIGTERM");
+    await afterRunnerStarts();
+    await afterRunnerStarts();
+    assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+    assert.equal(outcome.custodyState, "orphaned", "late recovery never mutates returned outcomes");
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0].error, recoveryFailure);
+    assert.equal(diagnostics[0].context.terminalProof.event, "close");
+    assert.equal(unhandledRejection, undefined);
+  } finally {
+    process.removeListener("unhandledRejection", recordUnhandledRejection);
+  }
 });

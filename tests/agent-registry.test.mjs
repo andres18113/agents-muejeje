@@ -87,7 +87,7 @@ async function withExploreContractFixture({ createFile, content }, callback) {
     const fixtureLoader = await import(fixtureModuleUrl);
     await callback(fixtureLoader);
   } finally {
-    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
 }
 
@@ -299,12 +299,18 @@ test("the MCP entrypoint registers only delegate_agent and owns no Claude runtim
 
 test("child-process launch responsibilities remain explicit and no legacy runtime identifiers return", async () => {
   const sourceDirectory = path.join(projectRoot, "src");
-  const sourceFiles = (await readdir(sourceDirectory))
+  // Recursive: the process/ and custody/ internals are held to the same
+  // spawn-ownership and never-kill-by-name rules as the top-level modules.
+  const sourceFiles = (await readdir(sourceDirectory, { recursive: true }))
     .filter((name) => name.endsWith(".mjs"))
+    .map((name) => name.split(path.sep).join("/"))
     .sort();
   const sourceByFile = Object.fromEntries(
     await Promise.all(
-      sourceFiles.map(async (name) => [name, await readFile(path.join(sourceDirectory, name), "utf8")])
+      sourceFiles.map(async (name) => [
+        name,
+        await readFile(path.join(sourceDirectory, name), "utf8")
+      ])
     )
   );
 
@@ -312,12 +318,42 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
     sourceByFile[name].includes('from "node:child_process"')
   );
   // Orchestration Git no longer spawns directly: it goes through the one
-  // supervised external-process primitive.
+  // supervised external-process primitive. claude-termination owns the Claude
+  // taskkill spawn adapter; the shared Windows primitives deliberately do not
+  // spawn at all, so the decision to launch a destructive helper stays with a
+  // named supervisor rather than with a shared utility.
   assert.deepEqual(childProcessOwners, [
     "claude-runner.mjs",
+    "claude-termination.mjs",
     "process-identity.mjs",
     "supervised-process.mjs"
   ]);
+  assert.equal(
+    sourceByFile["process/windows-termination.mjs"].includes('from "node:child_process"'),
+    false,
+    "shared Windows termination must receive an injected spawn adapter"
+  );
+
+  // Claude and Git must terminate through the same implementation. Neither
+  // supervisor may carry its own copy of the helper watcher or identity gate.
+  for (const supervisor of ["claude-termination.mjs", "supervised-process.mjs"]) {
+    assert.match(
+      sourceByFile[supervisor],
+      /from "\.\/process\/windows-termination\.mjs"/,
+      supervisor + " must use the shared Windows termination primitives"
+    );
+    for (const duplicated of ["superviseTaskkillHelper", "requestExactHandleTermination"]) {
+      assert.equal(
+        sourceByFile[supervisor].includes("function " + duplicated),
+        false,
+        supervisor + " must not redefine " + duplicated
+      );
+    }
+  }
+  // Exactly one module builds a taskkill argv. shell-policy names taskkill as a
+  // denied agent command, which is a policy list rather than an invocation.
+  const taskkillOwners = sourceFiles.filter((name) => sourceByFile[name].includes('"/PID"'));
+  assert.deepEqual(taskkillOwners, ["process/windows-termination.mjs"]);
   assert.match(sourceByFile["claude-runner.mjs"], /spawnProcess = spawn/);
   assert.doesNotMatch(sourceByFile["claude-runner.mjs"], /env:\s*process\.env/);
   assert.match(sourceByFile["claude-runner.mjs"], /env:\s*runtime\.childEnvironment/);
@@ -336,8 +372,8 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
   // never the inherited parent environment.
   assert.match(sourceByFile["worktree-manager.mjs"], /env: buildGitEnvironment\(/);
   assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /env:\s*process\.env/);
-  // No process is ever terminated by name.
-  for (const name of ["supervised-process.mjs", "claude-runner.mjs"]) {
+  // No process is ever terminated by name, anywhere in the tree.
+  for (const name of sourceFiles) {
     assert.doesNotMatch(sourceByFile[name], /\/IM/, name + " must not kill by image name");
     assert.doesNotMatch(sourceByFile[name], /imagename/iu, name + " must not kill by image name");
   }

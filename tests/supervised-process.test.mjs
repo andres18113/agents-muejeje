@@ -138,7 +138,7 @@ test("supervised process bounds output overflow and direct-handle failures", asy
   });
 });
 
-test("Windows taskkill is bounded and its own error cannot replace close proof", async () => {
+test("Windows taskkill helper error cannot replace either helper or target close proof", async () => {
   const child = fakeChild();
   const terminator = new EventEmitter();
   terminator.killCalls = 0;
@@ -162,11 +162,14 @@ test("Windows taskkill is bounded and its own error cannot replace close proof",
   });
   await assert.rejects(pending, (error) => {
     assert.equal(error.code, "supervised_process_timeout");
-    assert.equal(error.terminationProven, true);
+    assert.equal(error.terminationProven, false);
+    assert.equal(error.targetTerminationProven, true);
+    assert.equal(error.taskkillHelperQuiescenceProven, false);
     return true;
   });
   assert.deepEqual(invocation, { command: "taskkill", args: ["/PID", String(child.pid), "/T", "/F"] });
-  assert.equal(child.killCalls, 0);
+  assert.equal(child.killCalls, 1, "taskkill error falls back to the exact spawned child handle");
+  assert.equal(terminator.killCalls, 1, "a failed helper receives an exact-handle stop request");
 
   const hangingChild = fakeChild();
   const hangingTerminator = new EventEmitter();
@@ -187,7 +190,55 @@ test("Windows taskkill is bounded and its own error cannot replace close proof",
     return true;
   });
   assert.equal(hangingTerminator.killCalls, 1, "a hung taskkill is itself bounded");
-  assert.equal(hangingChild.killCalls, 0);
+  assert.equal(hangingChild.killCalls, 1, "a hung taskkill reserves grace for exact-handle fallback");
+});
+
+test("Windows taskkill helper close is independent from target close", async () => {
+  const child = fakeChild({ onKill: () => true });
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+    return true;
+  };
+  let spawned;
+  const spawnedPromise = new Promise((resolve) => {
+    spawned = resolve;
+  });
+  let settled = false;
+  const pending = run(child, {
+    platform: "win32",
+    timeoutMs: 100,
+    terminationTimeoutMs: 100,
+    inspectProcess: async (pid) => liveIdentity(pid),
+    spawnTerminator: () => {
+      spawned();
+      return terminator;
+    }
+  });
+  pending.finally(() => {
+    settled = true;
+  }).catch(() => {});
+
+  await spawnedPromise;
+  terminator.emit("error", new Error("taskkill failed"));
+  await nextTurn();
+  assert.equal(child.killCalls, 1, "helper failure falls back to the exact target handle");
+  assert.equal(terminator.killCalls, 1, "helper error requests termination of the exact helper handle");
+
+  child.emit("close", null, "SIGTERM");
+  await nextTurn();
+  assert.equal(settled, false, "target close alone cannot prove taskkill quiescence");
+
+  terminator.emit("close", null, "SIGTERM");
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "supervised_process_timeout");
+    assert.equal(error.terminationProven, true);
+    assert.equal(error.targetTerminationProven, true);
+    assert.equal(error.taskkillHelperQuiescenceProven, true);
+    assert.equal(error.taskkillHelper.closeProven, true);
+    return true;
+  });
 });
 
 test("Windows taskkill refuses reused, ambiguous, and dead identities", async () => {
@@ -225,6 +276,87 @@ test("Windows taskkill refuses reused, ambiguous, and dead identities", async ()
     assert.equal(taskkillCalls, 0, label + " never authorizes taskkill");
     assert.equal(child.killCalls, 1, label + " falls back to the exact handle");
   }
+});
+
+test("an unsuccessfully completed taskkill falls back to the exact handle and still requires close", async () => {
+  const child = fakeChild({
+    onKill(target) {
+      setImmediate(() => target.emit("close", null, "SIGTERM"));
+      return true;
+    }
+  });
+  const terminator = new EventEmitter();
+  terminator.kill = () => true;
+  const pending = run(child, {
+    platform: "win32",
+    timeoutMs: 20,
+    terminationTimeoutMs: 20,
+    inspectProcess: async (pid) => liveIdentity(pid),
+    spawnTerminator: () => {
+      setImmediate(() => terminator.emit("close", 1, null));
+      return terminator;
+    }
+  });
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "supervised_process_timeout");
+    assert.equal(error.terminationProven, true);
+    return true;
+  });
+  assert.equal(child.killCalls, 1);
+
+  const noClose = fakeChild({ onKill: () => true });
+  const failedTerminator = new EventEmitter();
+  failedTerminator.kill = () => true;
+  await assert.rejects(run(noClose, {
+    platform: "win32",
+    timeoutMs: 10,
+    terminationTimeoutMs: 10,
+    inspectProcess: async (pid) => liveIdentity(pid),
+    spawnTerminator: () => {
+      setImmediate(() => failedTerminator.emit("close", 1, null));
+      return failedTerminator;
+    }
+  }), (error) => {
+    assert.equal(error.terminationProven, false, "kill request alone is never terminal proof");
+    return true;
+  });
+  assert.equal(noClose.killCalls, 1);
+});
+
+test("a taskkill helper that errors again while being stopped keeps Git bounded and fails closed", async () => {
+  // The Git path through the same shared helper watcher as Claude termination.
+  // The helper fails, we ask that exact helper to stop, and the stop request
+  // makes it emit `error` a second time on a later turn.
+  const child = fakeChild({ onKill: () => true });
+  const terminator = new EventEmitter();
+  terminator.killCalls = 0;
+  terminator.kill = () => {
+    terminator.killCalls += 1;
+    setImmediate(() => terminator.emit("error", new Error("kill request failed")));
+    return true;
+  };
+
+  const pending = run(child, {
+    platform: "win32",
+    timeoutMs: 10,
+    terminationTimeoutMs: 40,
+    inspectProcess: async (pid) => liveIdentity(pid),
+    spawnTerminator: () => {
+      setImmediate(() => terminator.emit("error", new Error("taskkill failed")));
+      return terminator;
+    }
+  });
+
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "supervised_process_timeout");
+    assert.equal(error.terminationProven, false);
+    assert.equal(error.taskkillHelperQuiescenceProven, false);
+    assert.equal(error.sideEffectsUnproven, true);
+    return true;
+  });
+  assert.equal(terminator.killCalls, 1, "a repeated helper error must not request another kill");
+  assert.equal(child.killCalls, 1, "helper failure falls back to the exact target handle once");
+  assert.doesNotThrow(() => terminator.emit("error", new Error("late error")));
 });
 
 test("late lifecycle events cannot settle a supervised process twice", async () => {

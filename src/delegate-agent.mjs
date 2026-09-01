@@ -248,7 +248,10 @@ function requireExecutionId(createExecutionId) {
 /**
  * Result fields keep their published Phase 5 names. canonicalRoot is the
  * repositoryRoot and worktreeRoot is the isolated workspaceRoot, so callers
- * that already parse this shape keep working.
+ * that already parse this shape keep working. custodyState is the durable
+ * state observed during synchronous finalization; it is intentionally not a
+ * live object and an authorized late exact-close recovery may advance the
+ * durable record after this outcome has returned.
  */
 function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now, custodyState }) {
   return {
@@ -376,6 +379,10 @@ export async function delegateAgent(input, dependencies = {}) {
   let workspacePreparationAmbiguous = false;
   let runnerInvoked = false;
   let outcome;
+  let resolveCustodyFinalization;
+  const custodyFinalization = new Promise((resolve) => {
+    resolveCustodyFinalization = resolve;
+  });
 
   try {
     if (runtime.accessMode === "write") {
@@ -432,27 +439,46 @@ export async function delegateAgent(input, dependencies = {}) {
       executionId,
       runtime,
       onChildStarted: runtime.accessMode === "write"
-        ? async (processIdentity) => {
+        ? async (processIdentity, { mutationSignal } = {}) => {
             writerProcessStarted = true;
             writerProcessIdentity = processIdentity;
             reservation = await writeCustody.activateWriteAccess({
               executionId,
               canonicalRootKey: workspace.canonicalRepositoryKey,
-              processIdentity
+              processIdentity,
+              mutationSignal
             });
             custodyState = reservation.state.toLowerCase();
           }
         : undefined,
       onTerminationStarted: runtime.accessMode === "write"
-        ? async (processIdentity) => {
+        ? async (processIdentity, { mutationSignal } = {}) => {
             writerProcessStarted = true;
             writerProcessIdentity = processIdentity;
             reservation = await writeCustody.beginTermination({
               executionId,
               canonicalRootKey: workspace.canonicalRepositoryKey,
-              processIdentity
+              processIdentity,
+              mutationSignal
             });
             custodyState = reservation.state.toLowerCase();
+          }
+        : undefined,
+      onLateTerminalProof: runtime.accessMode === "write"
+        ? async (lateTerminalProof) => {
+            // runClaudeAgent invokes this only after a termination-unproven
+            // outcome. Wait until this invocation has durably retained the
+            // orphan first, then let the same coordinator's exact close proof
+            // take the explicit ORPHANED -> RELEASED recovery path. The
+            // already-constructed delegation outcome remains its synchronous
+            // custodyState snapshot; the durable record is authoritative.
+            await custodyFinalization;
+            if (typeof writeCustody.releaseOrphanedWriteAccessAfterTerminal !== "function") return;
+            await writeCustody.releaseOrphanedWriteAccessAfterTerminal({
+              executionId,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              terminalProof: lateTerminalProof
+            });
           }
         : undefined
     });
@@ -501,45 +527,76 @@ export async function delegateAgent(input, dependencies = {}) {
       ...(Number.isSafeInteger(error?.pid) ? { pid: error.pid } : {})
     };
   } finally {
-    if (reservation) {
-      try {
-        if (
-          !writerProcessStarted &&
-          processProvenNotStarted &&
-          !workspacePreparationAmbiguous &&
-          outcome?.status !== "completed"
-        ) {
-          const released = await writeCustody.releaseUnstartedWriteAccess({
-            executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey
-          });
-          custodyState = released.state.toLowerCase();
-        } else if (writerProcessStarted && terminalProof) {
-          // A proof without a processIdentity is supervised close evidence:
-          // this coordinator spawned the exact child and saw it close before a
-          // durable identity could be captured. Custody validates that claim.
-          const released = terminalProof.supervisedByCoordinator === true
-            ? await writeCustody.releaseWriteAccessAfterSupervisedClose({
+    try {
+      if (reservation) {
+        try {
+          if (
+            !writerProcessStarted &&
+            processProvenNotStarted &&
+            !workspacePreparationAmbiguous &&
+            outcome?.status !== "completed"
+          ) {
+            const released = await writeCustody.releaseUnstartedWriteAccess({
+              executionId,
+              canonicalRootKey: workspace.canonicalRepositoryKey
+            });
+            custodyState = released.state.toLowerCase();
+          } else if (writerProcessStarted && terminalProof) {
+            // A proof without a processIdentity is supervised close evidence:
+            // this coordinator spawned the exact child and saw it close before a
+            // durable identity could be captured. Custody validates that claim.
+            const released = terminalProof.supervisedByCoordinator === true
+              ? await writeCustody.releaseWriteAccessAfterSupervisedClose({
+                  executionId,
+                  canonicalRootKey: workspace.canonicalRepositoryKey,
+                  terminalProof
+                })
+              : await writeCustody.releaseWriteAccessAfterTerminal({
+                  executionId,
+                  canonicalRootKey: workspace.canonicalRepositoryKey,
+                  terminalProof
+                });
+            custodyState = released.state.toLowerCase();
+          } else {
+            const orphaned = await writeCustody.markOrphanedWriteAccess({
+              executionId,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              processIdentity: writerProcessIdentity,
+              reason: workspacePreparationAmbiguous
+                ? "worktree-preparation-ambiguous"
+                : "terminal-proof-unavailable"
+            });
+            custodyState = orphaned.state.toLowerCase();
+            outcome = {
+              ...baseOutcome({
+                profile,
+                runtime,
+                workspace: executionWorkspace,
                 executionId,
-                canonicalRootKey: workspace.canonicalRepositoryKey,
-                terminalProof
-              })
-            : await writeCustody.releaseWriteAccessAfterTerminal({
-                executionId,
-                canonicalRootKey: workspace.canonicalRepositoryKey,
-                terminalProof
-              });
-          custodyState = released.state.toLowerCase();
-        } else {
-          const orphaned = await writeCustody.markOrphanedWriteAccess({
-            executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey,
-            processIdentity: writerProcessIdentity,
-            reason: workspacePreparationAmbiguous
-              ? "worktree-preparation-ambiguous"
-              : "terminal-proof-unavailable"
-          });
-          custodyState = orphaned.state.toLowerCase();
+                startedAt,
+                now,
+                custodyState
+              }),
+              status: outcome?.status === "timeout" ? "timeout" : "failed",
+              durationMs: outcome?.durationMs ?? Math.max(0, now() - startedAt),
+              error: custodyRetentionError(outcome?.error, { workspacePreparationAmbiguous }),
+              stderrSummary: outcome?.stderrSummary || "",
+              ...(Number.isSafeInteger(outcome?.pid) ? { pid: outcome.pid } : {})
+            };
+          }
+          if (outcome) outcome.custodyState = custodyState;
+        } catch (releaseError) {
+          try {
+            const orphaned = await writeCustody.markOrphanedWriteAccess({
+              executionId,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              processIdentity: writerProcessIdentity,
+              reason: "custody-release-proof-failed"
+            });
+            custodyState = orphaned.state.toLowerCase();
+          } catch {
+            custodyState = "retention-failed";
+          }
           outcome = {
             ...baseOutcome({
               profile,
@@ -551,43 +608,16 @@ export async function delegateAgent(input, dependencies = {}) {
               custodyState
             }),
             status: outcome?.status === "timeout" ? "timeout" : "failed",
-            durationMs: outcome?.durationMs ?? Math.max(0, now() - startedAt),
-            error: custodyRetentionError(outcome?.error, { workspacePreparationAmbiguous }),
-            stderrSummary: outcome?.stderrSummary || "",
-            ...(Number.isSafeInteger(outcome?.pid) ? { pid: outcome.pid } : {})
+            error: custodyRetentionError(releaseError, {
+              terminalProofAvailable: Boolean(terminalProof),
+              workspacePreparationAmbiguous
+            }),
+            stderrSummary: outcome?.stderrSummary || ""
           };
         }
-        if (outcome) outcome.custodyState = custodyState;
-      } catch (releaseError) {
-        try {
-          const orphaned = await writeCustody.markOrphanedWriteAccess({
-            executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey,
-            processIdentity: writerProcessIdentity,
-            reason: "custody-release-proof-failed"
-          });
-          custodyState = orphaned.state.toLowerCase();
-        } catch {
-          custodyState = "retention-failed";
-        }
-        outcome = {
-          ...baseOutcome({
-            profile,
-            runtime,
-            workspace: executionWorkspace,
-            executionId,
-            startedAt,
-            now,
-            custodyState
-          }),
-          status: outcome?.status === "timeout" ? "timeout" : "failed",
-          error: custodyRetentionError(releaseError, {
-            terminalProofAvailable: Boolean(terminalProof),
-            workspacePreparationAmbiguous
-          }),
-          stderrSummary: outcome?.stderrSummary || ""
-        };
       }
+    } finally {
+      resolveCustodyFinalization();
     }
   }
 

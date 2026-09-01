@@ -76,6 +76,10 @@ function validPid(pid) {
   return Number.isSafeInteger(pid) && pid > 0;
 }
 
+function remainingMs(deadlineAt, now) {
+  return Math.max(0, deadlineAt - now());
+}
+
 export function validateDurableProcessIdentity(identity, name = "process identity") {
   if (
     !identity ||
@@ -128,10 +132,26 @@ function queryWindowsProcessStartTime(
     env = process.env,
     timeoutMs = PROCESS_QUERY_TIMEOUT_MS,
     terminationTimeoutMs = PROCESS_QUERY_TERMINATION_TIMEOUT_MS,
+    deadlineAt,
+    now = Date.now,
+    abortSignal,
     schedule = setTimeout,
     cancelSchedule = clearTimeout
   } = {}
 ) {
+  const queryStartedAt = now();
+  // An outer lifecycle deadline can shorten this read-only observation, never
+  // stretch its own independent query budget. That keeps a stuck PowerShell
+  // child bounded even for long-running agent profiles.
+  const queryDeadlineAt = Number.isFinite(deadlineAt)
+    ? Math.min(deadlineAt, queryStartedAt + timeoutMs)
+    : queryStartedAt + timeoutMs;
+  if (abortSignal?.aborted) {
+    return Promise.resolve(Object.freeze({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-cancelled" }));
+  }
+  if (remainingMs(queryDeadlineAt, now) <= 0) {
+    return Promise.resolve(Object.freeze({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-deadline-expired" }));
+  }
   return new Promise((resolve) => {
     let child;
     try {
@@ -165,12 +185,14 @@ function queryWindowsProcessStartTime(
     let abandoned;
     let queryTimer;
     let terminationTimer;
+    let onAbort;
 
     const finish = (value) => {
       if (settled) return;
       settled = true;
       cancelSchedule(queryTimer);
       cancelSchedule(terminationTimer);
+      if (onAbort) abortSignal?.removeEventListener?.("abort", onAbort);
       resolve(Object.freeze(value));
     };
 
@@ -252,7 +274,13 @@ function queryWindowsProcessStartTime(
     // Arm the deadline only after every lifecycle listener is present. A
     // deterministic scheduler may invoke a zero-delay callback immediately,
     // and child.kill() is allowed to emit an error synchronously.
-    queryTimer = schedule(() => abandonQuery("query-timeout"), timeoutMs);
+    onAbort = () => abandonQuery("query-cancelled");
+    abortSignal?.addEventListener?.("abort", onAbort, { once: true });
+    if (abortSignal?.aborted) {
+      abandonQuery("query-cancelled");
+    } else {
+      queryTimer = schedule(() => abandonQuery("query-timeout"), remainingMs(queryDeadlineAt, now));
+    }
   });
 }
 

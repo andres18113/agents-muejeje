@@ -14,7 +14,8 @@ export class WorktreeManagerError extends Error {
     // evidence that the command had no effect.
     this.sideEffectsUnproven = options.sideEffectsUnproven === true;
     // True only when the exact Git child was observed to close after we asked
-    // it to die. Never implied by a timeout alone.
+    // it to die and any launched taskkill helper also proved its own close.
+    // Never implied by a timeout alone.
     this.terminationProven = options.terminationProven === true;
   }
 }

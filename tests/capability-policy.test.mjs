@@ -52,7 +52,7 @@ async function withTemporaryDirectory(prefix, callback) {
   try {
     await callback(directory);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
 }
 

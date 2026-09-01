@@ -66,7 +66,7 @@ async function withRepository(callback) {
     git(repositoryRoot, ["commit", "-m", "fixture base"]);
     await callback({ fixtureRoot, repositoryRoot, stateRoot });
   } finally {
-    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
 }
 
@@ -762,8 +762,10 @@ test("Windows Git termination targets the exact PID tree and never a process nam
     args: ["/PID", "31337", "/T", "/F"],
     options: { shell: false, windowsHide: true, stdio: "ignore" }
   });
-  // The direct handle is not also killed when the PID tree was targeted.
-  assert.equal(child.killCalls, 0);
+  // A hung taskkill is not proof of death. Its bounded helper failure falls
+  // back to the exact spawned Git handle, while close remains required before
+  // termination can be called proven.
+  assert.equal(child.killCalls, 1);
 
   // A Git child that does close after the PID-tree kill yields proven
   // termination while its side effects stay unproven.
