@@ -46,6 +46,15 @@ export const MAX_RECEIPTS_PER_CHANGE_SET = 64;
 export const MAX_POINTERS_PER_SCOPE = 32;
 export const MAX_RECEIPT_PATH_CHARS = 240;
 export const MAX_DISCOVERED_RECEIPTS = 16;
+/**
+ * Bounds on the authoritative reconciliation sweep. The sc index is allowed to
+ * fail, and its failure is silent by design, so its emptiness can never be
+ * reported as a proven absence of evidence without asking the cs tree. That
+ * question is answered under a hard bound, and hitting the bound is reported
+ * rather than rounded down to "complete".
+ */
+export const MAX_RECOVERY_CHANGE_SETS = 256;
+export const MAX_RECOVERY_RECEIPT_LOADS = 256;
 
 const RECEIPT_FILE_NAME = "receipt.json";
 const RECEIPTS_DIRECTORY = "cs";
@@ -404,6 +413,84 @@ export class ReviewReceiptStore {
   }
 
   /**
+   * Sweeps the authoritative cs tree for the receipts belonging to one scope.
+   *
+   * This exists because the sc index is explicitly non-evidentiary: an
+   * indexing failure is swallowed so it can never downgrade a durable receipt,
+   * which means an empty index is not proof that no receipt was ever written.
+   * Asking the authoritative tree is the only way "complete and empty" can be
+   * an honest answer, so that answer is never given without asking.
+   *
+   * The sweep is observational: it repairs nothing and writes nothing. It
+   * reports `truncated` when a bound stopped it and `failed` when it could not
+   * read what it needed, because in both cases it has proven nothing.
+   */
+  async #recoverScopeFromReceipts({ canonicalRootKey, scopeKey, known, limit }) {
+    const root = path.join(this.reviewsDirectory(canonicalRootKey), RECEIPTS_DIRECTORY);
+    let changeSetDirectories;
+    try {
+      changeSetDirectories = (await readdir(root, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name)
+        .sort();
+    } catch (error) {
+      // No authoritative tree at all is a real, provable absence.
+      if (error?.code === "ENOENT") return { status: "complete", recovered: [] };
+      return { status: "failed", recovered: [] };
+    }
+
+    const scanned = changeSetDirectories.slice(0, MAX_RECOVERY_CHANGE_SETS);
+    let truncated = changeSetDirectories.length > scanned.length;
+    let unreadable = false;
+    let loads = 0;
+    const recovered = [];
+
+    for (const changeSetName of scanned) {
+      if (recovered.length >= limit || loads >= MAX_RECOVERY_RECEIPT_LOADS) {
+        truncated = true;
+        break;
+      }
+      const changeSetDirectory = path.join(root, changeSetName);
+      let receiptDirectories;
+      try {
+        receiptDirectories = await this.#listReceiptDirectories(changeSetDirectory);
+      } catch {
+        unreadable = true;
+        continue;
+      }
+      for (const receiptName of receiptDirectories) {
+        if (recovered.length >= limit || loads >= MAX_RECOVERY_RECEIPT_LOADS) {
+          truncated = true;
+          break;
+        }
+        loads += 1;
+        const outcome = await this
+          .#loadReceipt(path.join(changeSetDirectory, receiptName, RECEIPT_FILE_NAME))
+          .catch(() => ({ skipped: { code: "review_receipt_unreadable" } }));
+        if (!outcome.receipt) {
+          // A receipt that will not validate cannot be attributed to a scope,
+          // so it counts as an unknown rather than as proven irrelevant.
+          unreadable = true;
+          continue;
+        }
+        const receiptScopeKey = reviewScopeKey({
+          agentType: outcome.receipt.reviewer.agentType,
+          targetSpec: outcome.receipt.binding.target.spec
+        });
+        if (receiptScopeKey !== scopeKey) continue;
+        if (known.has(outcome.receipt.reviewId)) continue;
+        known.add(outcome.receipt.reviewId);
+        recovered.push(outcome.receipt);
+      }
+    }
+
+    return {
+      status: truncated ? "truncated" : (unreadable ? "unreadable" : "complete"),
+      recovered
+    };
+  }
+
+  /**
    * Finds receipts for a review scope regardless of the repository's current
    * state. This is what makes a STALE verdict reachable at all.
    */
@@ -411,19 +498,13 @@ export class ReviewReceiptStore {
     const scopeKey = reviewScopeKey({ agentType, targetSpec });
     const directory = this.#scopeDirectory(canonicalRootKey, scopeKey);
 
-    let names;
+    let names = [];
     try {
       names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort().reverse();
     } catch (error) {
-      if (error?.code === "ENOENT") {
-        return Object.freeze({
-          status: "complete",
-          receipts: Object.freeze([]),
-          skipped: Object.freeze([]),
-          truncated: false
-        });
-      }
-      throw error;
+      // An absent index is not an absent history. It falls through to the
+      // authoritative sweep below rather than answering "complete" from here.
+      if (error?.code !== "ENOENT") throw error;
     }
 
     const receipts = [];
@@ -475,10 +556,58 @@ export class ReviewReceiptStore {
       }
       receipts.push(outcome.receipt);
     }
-    const truncated = names.length > selected.length;
+    let truncated = names.length > selected.length;
+
+    // The index may under-report for reasons it never records. Only the
+    // authoritative tree can turn "found nothing more" into "there is nothing
+    // more", so it is consulted whenever the index did not fill the bound.
+    let recovery = { status: "not-needed", recovered: [] };
+    if (receipts.length < limit) {
+      recovery = await this.#recoverScopeFromReceipts({
+        canonicalRootKey,
+        scopeKey,
+        known: new Set(receipts.map((receipt) => receipt.reviewId)),
+        // Only the room the index left, so a merged result can never quietly
+        // exceed the caller's bound and lose receipts in the final slice.
+        limit: limit - receipts.length
+      });
+      if (recovery.recovered.length > 0) {
+        receipts.push(...recovery.recovered);
+        // Newest first, exactly as the index-ordered path reports. The
+        // tiebreak compares code units rather than using localeCompare, so the
+        // order cannot shift with the host locale.
+        receipts.sort((left, right) => {
+          if (right.provenance.recordedAt !== left.provenance.recordedAt) {
+            return right.provenance.recordedAt - left.provenance.recordedAt;
+          }
+          if (right.reviewId === left.reviewId) return 0;
+          return right.reviewId > left.reviewId ? 1 : -1;
+        });
+        skipped.push({ code: "review_history_recovered_from_receipts" });
+      }
+      if (recovery.status === "truncated") {
+        truncated = true;
+        skipped.push({ code: "review_history_recovery_truncated" });
+      } else if (recovery.status === "unreadable") {
+        skipped.push({ code: "review_history_recovery_unreadable" });
+      } else if (recovery.status === "failed") {
+        skipped.push({ code: "review_history_recovery_failed" });
+      }
+    }
+
+    // Belt and braces: if a merge ever overflowed the bound, the drop is
+    // reported rather than hidden by the slice below.
+    if (receipts.length > limit) truncated = true;
+
+    // A sweep that could not read the authoritative tree has proven nothing
+    // either way, so completeness is unknown rather than assumed.
+    const status = recovery.status === "failed"
+      ? "indeterminate"
+      : (skipped.length > 0 || truncated ? "partial" : "complete");
+
     return Object.freeze({
-      status: skipped.length > 0 || truncated ? "partial" : "complete",
-      receipts: Object.freeze(receipts),
+      status,
+      receipts: Object.freeze(receipts.slice(0, limit)),
       skipped: Object.freeze(skipped),
       truncated
     });

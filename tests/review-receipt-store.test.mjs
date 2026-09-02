@@ -14,6 +14,7 @@ import {
 import {
   MAX_POINTERS_PER_SCOPE,
   MAX_RECEIPTS_PER_CHANGE_SET,
+  MAX_RECOVERY_CHANGE_SETS,
   ReviewReceiptStore
 } from "../src/review/receipt-store.mjs";
 import { createReceiptPublicationFence } from "../src/review/publication-fence.mjs";
@@ -625,5 +626,371 @@ test("the receipt tree never disturbs Phase 5 custody sharing the same repositor
     assert.equal(held.executionId, "writer-a");
     const reconciliation = await custody.reconcileExistingOwnership(ROOT_KEY);
     assert.equal(reconciliation.released, false);
+  });
+});
+
+/**
+ * The sc index is allowed to fail silently so that indexing can never downgrade
+ * a durable receipt. That same silence is what makes an empty index unable to
+ * stand on its own as evidence: nothing about it distinguishes "no review ever
+ * happened" from "the pointer was never written". These tests hold the store to
+ * answering that question from the authoritative cs tree instead.
+ */
+test("index loss cannot make durable evidence read as a proven empty history", async () => {
+  await withState(async (stateRoot) => {
+    const receipt = receiptFor({ changeSetSeed: 7, recordedAt: 5_000 });
+
+    // The authoritative receipt lands; scope indexing fails outright.
+    const publishing = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("scope index unavailable"), { code: "EACCES" });
+      }
+    });
+    const stored = await publishing.put({ canonicalRootKey: ROOT_KEY, receipt });
+    assert.equal(stored.stored, "created");
+    assert.ok(await stat(stored.path), "the authoritative receipt is durable");
+    assert.deepEqual(
+      await readdir(publishing.reviewsDirectory(ROOT_KEY)),
+      ["cs"],
+      "no scope index exists to discover through"
+    );
+
+    // A completely fresh store, with no memory of the publication attempt.
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+
+    assert.notEqual(
+      found.status === "complete" && found.receipts.length === 0,
+      true,
+      "durable evidence must never be reported as a proven absence"
+    );
+    assert.deepEqual(found.receipts.map((entry) => entry.reviewId), [receipt.reviewId]);
+    assert.equal(found.status, "partial");
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovered_from_receipts"));
+  });
+});
+
+test("recovery is scoped, deduplicated and ordered like the index path", async () => {
+  await withState(async (stateRoot) => {
+    const unindexed = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("no index"), { code: "EACCES" });
+      }
+    });
+    const older = receiptFor({ changeSetSeed: 1, recordedAt: 3_000 });
+    const newer = receiptFor({ changeSetSeed: 2, recordedAt: 9_000 });
+    // Same repository, different review scope: must not be recovered here.
+    const otherScope = receiptFor({ changeSetSeed: 3, recordedAt: 9_500, agentType: "security-review" });
+    for (const receipt of [older, newer, otherScope]) {
+      await unindexed.put({ canonicalRootKey: ROOT_KEY, receipt });
+    }
+    // One receipt that IS indexed, so the merge path is exercised too.
+    const indexed = receiptFor({ changeSetSeed: 4, recordedAt: 6_000 });
+    await store(stateRoot).put({ canonicalRootKey: ROOT_KEY, receipt: indexed });
+
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+
+    assert.deepEqual(
+      found.receipts.map((entry) => entry.reviewId),
+      [newer.reviewId, indexed.reviewId, older.reviewId],
+      "newest first, with the indexed receipt merged in exactly once"
+    );
+    assert.equal(
+      found.receipts.filter((entry) => entry.reviewId === indexed.reviewId).length,
+      1,
+      "an indexed receipt must not be duplicated by recovery"
+    );
+    assert.equal(
+      found.receipts.some((entry) => entry.reviewId === otherScope.reviewId),
+      false,
+      "recovery never crosses a review scope"
+    );
+  });
+});
+
+test("a recovery sweep that cannot complete says so instead of claiming completeness", async () => {
+  await withState(async (stateRoot) => {
+    // The authoritative tree cannot be enumerated at all: readdir fails with
+    // something other than ENOENT, which proves nothing about the history.
+    const receipts = new ReviewReceiptStore({ stateRoot });
+    const reviewsDirectory = receipts.reviewsDirectory(ROOT_KEY);
+    await mkdir(reviewsDirectory, { recursive: true });
+    await writeFile(path.join(reviewsDirectory, "cs"), "not a directory", "utf8");
+
+    const found = await receipts.discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+    assert.equal(found.status, "indeterminate");
+    assert.deepEqual(found.receipts, []);
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovery_failed"));
+  });
+});
+
+test("an unreadable authoritative entry is an unknown, never a proven absence", async () => {
+  await withState(async (stateRoot) => {
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("no index"), { code: "EACCES" });
+      }
+    });
+    const receipt = receiptFor({ changeSetSeed: 5, recordedAt: 4_000 });
+    const stored = await receipts.put({ canonicalRootKey: ROOT_KEY, receipt });
+    await writeFile(stored.path, "{ this is not a receipt", "utf8");
+
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+    assert.deepEqual(found.receipts, []);
+    assert.notEqual(found.status, "complete", "an unattributable receipt is not an absence");
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovery_unreadable"));
+  });
+});
+
+test("recovery stays bounded and reports the bound rather than guessing", async () => {
+  await withState(async (stateRoot) => {
+    const receipts = new ReviewReceiptStore({ stateRoot });
+    const found = await receipts.discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET,
+      limit: 1
+    });
+    // Nothing exists yet: an untouched repository is still a provable absence.
+    assert.equal(found.status, "complete");
+    assert.deepEqual(found.receipts, []);
+    assert.equal(found.truncated, false);
+    assert.ok(MAX_RECOVERY_CHANGE_SETS > 0, "the sweep is bounded by construction");
+
+    // With more scope-matching receipts than the caller's bound, the sweep
+    // fills the bound and reports that it stopped early.
+    const unindexed = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("no index"), { code: "EACCES" });
+      }
+    });
+    for (const seed of [1, 2, 3]) {
+      await unindexed.put({
+        canonicalRootKey: ROOT_KEY,
+        receipt: receiptFor({ changeSetSeed: seed, recordedAt: 3_000 + seed })
+      });
+    }
+    const bounded = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET,
+      limit: 1
+    });
+    assert.equal(bounded.receipts.length, 1);
+    assert.equal(bounded.status, "partial");
+    assert.equal(bounded.truncated, true);
+    assert.ok(bounded.skipped.some((entry) => entry.code === "review_history_recovery_truncated"));
+  });
+});
+
+/**
+ * Detached housekeeping, held to the claim that it is detached.
+ *
+ * The sc index is maintained after the authoritative receipt is durable and is
+ * not awaited by publication. That is only safe if its failure is inert in
+ * every direction: it must not reject into the process, must not be able to
+ * unmake the receipt, and must not touch custody.
+ */
+async function withoutUnhandledRejections(callback) {
+  const seen = [];
+  const record = (reason) => seen.push(reason);
+  process.on("unhandledRejection", record);
+  try {
+    await callback();
+    // Two macrotask turns: an unhandled rejection is reported after the
+    // microtask queue drains, so a single await would not have observed one.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    process.off("unhandledRejection", record);
+  }
+  return seen;
+}
+
+test("pointer failure after put returns cannot reject into the process", async () => {
+  await withState(async (stateRoot) => {
+    const releaseIndex = deferred();
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: async () => {
+        // Still pending when put() returns, then fails.
+        await releaseIndex.promise;
+        throw Object.assign(new Error("index exploded"), { code: "EIO" });
+      }
+    });
+    const receipt = receiptFor({ changeSetSeed: 11, recordedAt: 7_000 });
+
+    const unhandled = await withoutUnhandledRejections(async () => {
+      const stored = await receipts.put({
+        canonicalRootKey: ROOT_KEY,
+        receipt,
+        awaitIndex: false
+      });
+      assert.equal(stored.stored, "created", "publication does not wait for indexing");
+      assert.ok(await stat(stored.path));
+      // The caller has already been answered; only now does housekeeping fail.
+      releaseIndex.resolve();
+      await stored.indexing;
+    });
+    assert.deepEqual(unhandled, [], "detached housekeeping must never reject into the process");
+
+    // The receipt is untouched by the failure, and still discoverable.
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+    assert.deepEqual(found.receipts.map((entry) => entry.reviewId), [receipt.reviewId]);
+  });
+});
+
+test("an ignored indexing promise is inert even when nothing ever awaits it", async () => {
+  await withState(async (stateRoot) => {
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: async () => {
+        throw Object.assign(new Error("index exploded"), { code: "EIO" });
+      }
+    });
+    const unhandled = await withoutUnhandledRejections(async () => {
+      // Deliberately drop `indexing` on the floor, the way the binder does.
+      const stored = await receipts.put({
+        canonicalRootKey: ROOT_KEY,
+        receipt: receiptFor({ changeSetSeed: 12, recordedAt: 7_100 }),
+        awaitIndex: false
+      });
+      assert.equal(stored.stored, "created");
+    });
+    assert.deepEqual(unhandled, []);
+  });
+});
+
+test("the receipt store never touches write custody", async () => {
+  // Housekeeping runs detached and unsupervised, so the module that performs it
+  // must have no way to acquire, change, or release custody at all.
+  const source = await readFile(
+    path.join(import.meta.dirname, "..", "src", "review", "receipt-store.mjs"),
+    "utf8"
+  );
+  for (const forbidden of [
+    "reserveWriteAccess",
+    "activateWriteAccess",
+    "beginTermination",
+    "markSpawning",
+    "markOrphanedWriteAccess",
+    "releaseWriteAccess",
+    "releaseUnstartedWriteAccess",
+    "custodyManager",
+    "DurableWriteCustodyManager"
+  ]) {
+    assert.equal(
+      source.includes(forbidden),
+      false,
+      "receipt-store must not reference " + forbidden
+    );
+  }
+});
+
+test("a stalled scope index neither blocks publication nor unmakes the receipt", async () => {
+  await withState(async (stateRoot) => {
+    const indexReached = deferred();
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: async () => {
+        indexReached.resolve();
+        await new Promise(() => {});
+      }
+    });
+    const receipt = receiptFor({ changeSetSeed: 13, recordedAt: 7_200 });
+    const stored = await receipts.put({
+      canonicalRootKey: ROOT_KEY,
+      receipt,
+      awaitIndex: false
+    });
+
+    await indexReached.promise;
+    assert.equal(stored.stored, "created");
+    assert.equal(
+      await Promise.race([stored.indexing.then(() => "settled"), Promise.resolve("pending")]),
+      "pending",
+      "housekeeping is still stalled"
+    );
+
+    // Durable, valid and discoverable while the index is permanently stuck.
+    assert.equal(
+      validateReviewReceipt(JSON.parse(await readFile(stored.path, "utf8"))).reviewId,
+      receipt.reviewId
+    );
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET
+    });
+    assert.deepEqual(found.receipts.map((entry) => entry.reviewId), [receipt.reviewId]);
+    assert.notEqual(found.status, "complete", "an unindexed receipt is reported, not assumed away");
+  });
+});
+
+test("a merged history never exceeds the bound or drops a receipt silently", async () => {
+  await withState(async (stateRoot) => {
+    // One indexed receipt plus two that only exist authoritatively, asked for
+    // under a bound of two. The merge must respect the bound and must say that
+    // it stopped early rather than returning a short list as if it were whole.
+    const indexed = receiptFor({ changeSetSeed: 1, recordedAt: 9_000 });
+    await store(stateRoot).put({ canonicalRootKey: ROOT_KEY, receipt: indexed });
+
+    const unindexed = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("no index"), { code: "EACCES" });
+      }
+    });
+    for (const seed of [2, 3]) {
+      await unindexed.put({
+        canonicalRootKey: ROOT_KEY,
+        receipt: receiptFor({ changeSetSeed: seed, recordedAt: 8_000 + seed })
+      });
+    }
+
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET,
+      limit: 2
+    });
+
+    assert.equal(found.receipts.length, 2, "the caller's bound is respected");
+    assert.equal(
+      new Set(found.receipts.map((entry) => entry.reviewId)).size,
+      2,
+      "no receipt appears twice across the index and the sweep"
+    );
+    assert.equal(found.status, "partial");
+    assert.equal(found.truncated, true, "stopping early is reported, not rounded down");
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovery_truncated"));
+    assert.equal(
+      found.receipts[0].reviewId,
+      indexed.reviewId,
+      "the newest receipt still leads, whichever tree it came from"
+    );
   });
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readdir, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -624,5 +624,264 @@ test("a general-purpose target ref is recorded and inherited by a review of its 
       ref: "refs/heads/main",
       source: "worktree-metadata"
     });
+  });
+});
+
+/**
+ * The late publication-settlement release, exercised against the real durable
+ * custody manager, the real receipt store and the real binder.
+ *
+ * The earlier fence tests drive this path with a custody double that agrees to
+ * everything. That is enough to show ordering, and not enough to show safety:
+ * the entire claim is that the late callback is refused unless real ownership
+ * still authorizes it. So these hold it to the real record.
+ */
+async function coordinationKeyFor(repositoryRoot) {
+  return (await resolveRepositoryCoordinationIdentity(
+    await resolveCanonicalWorkspaceRoot(repositoryRoot)
+  )).canonicalRepositoryKey;
+}
+
+function deferredValue() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * A manual scheduler for the review-binding deadlines.
+ *
+ * Wall-clock timeouts cannot express the ordering under test here: the AFTER
+ * deadline has to expire strictly after the authoritative rename is issued and
+ * strictly before it completes, and real collection takes an unpredictable
+ * amount of that window. Driving the timers by hand makes the interleaving the
+ * test claims to exercise the one it actually exercises.
+ */
+function manualDeadlines() {
+  const timers = [];
+  return {
+    schedule: (callback) => {
+      const timer = { callback, fired: false, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    cancel: (timer) => {
+      if (timer) timer.cancelled = true;
+    },
+    // Fires pending deadlines in order until told to stop, so the quiescence
+    // timer scheduled in reaction to the AFTER timer is fired too.
+    driveUntil(stopped) {
+      return (async () => {
+        while (!stopped.done) {
+          const next = timers.find((timer) => !timer.cancelled && !timer.fired);
+          if (next) {
+            next.fired = true;
+            next.callback();
+          }
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      })();
+    }
+  };
+}
+
+function stalledRenameStore(stateRoot, { allowRename, renameEntered }) {
+  return new ReviewReceiptStore({
+    stateRoot,
+    renameFn: async (...args) => {
+      // Authority is crossed the instant the store issues this call, so the
+      // delegation's bounds expire with the write still genuinely in flight.
+      renameEntered.resolve();
+      await allowRename.promise;
+      return await rename(...args);
+    }
+  });
+}
+
+test("a receipt settling after quiescence releases real custody under the same guard", async () => {
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const allowRename = deferredValue();
+    const renameEntered = deferredValue();
+    const lateRelease = deferredValue();
+    const custody = custodyFor(stateRoot);
+    const deadlines = manualDeadlines();
+    const stopped = { done: false };
+
+    const pending = delegateAgent(
+      { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
+      {
+        writeCustody: custody,
+        runAgent: completedRunner(),
+        env: {},
+        receiptStore: stalledRenameStore(stateRoot, { allowRename, renameEntered }),
+        scheduleReviewBindingTimeout: deadlines.schedule,
+        cancelReviewBindingTimeout: deadlines.cancel,
+        onLateReviewPublicationRelease: (diagnostic) => lateRelease.resolve(diagnostic)
+      }
+    );
+
+    // Only once the authoritative rename is genuinely in flight do the
+    // deadlines expire. This is the exact window the fence exists for.
+    await renameEntered.promise;
+    const driver = deadlines.driveUntil(stopped);
+
+    const outcome = await pending;
+    stopped.done = true;
+    await driver;
+
+    const rootKey = await coordinationKeyFor(repositoryRoot);
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.custodyState, "retained", "a receipt may still land, so the slot is held");
+    assert.equal(
+      outcome.recoveryDiagnostics.mode,
+      "same-coordinator-publication-settlement"
+    );
+    assert.equal(outcome.reviewBinding.publication.status, "authoritative-pending");
+    const heldRecord = await custody.getWriteAccess(rootKey);
+    assert.notEqual(heldRecord?.state, "RELEASED", "custody is genuinely still held");
+    assert.notEqual(heldRecord, undefined, "the durable record is still owned");
+
+    // The exact authoritative publication now settles.
+    allowRename.resolve();
+    const diagnostic = await lateRelease.promise;
+    assert.equal(diagnostic.status, "released");
+    assert.equal(diagnostic.publication.disposition, "published");
+    assert.equal(diagnostic.executionId, outcome.executionId);
+
+    const releasedRecord = await custody.getWriteAccess(rootKey);
+    assert.equal(
+      releasedRecord === undefined || releasedRecord.state === "RELEASED",
+      true,
+      "the real durable record actually reached a terminal release"
+    );
+
+    // The receipt the late release waited for is real, valid and discoverable.
+    const found = await new ReviewReceiptStore({ stateRoot }).discoverForScope({
+      canonicalRootKey: rootKey,
+      agentType: "code-review",
+      targetSpec: NO_REVIEW_TARGET
+    });
+    assert.equal(found.receipts.length, 1);
+    assert.ok(validateReviewReceipt(found.receipts[0]));
+  });
+});
+
+test("a late release is refused when the durable record no longer authorizes it", async () => {
+  // Same interleaving, but the record stops authorizing this execution before
+  // the publication settles. The late callback must be refused by the real
+  // manager and must report retention rather than releasing anything.
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const allowRename = deferredValue();
+    const renameEntered = deferredValue();
+    const lateRelease = deferredValue();
+    const custody = custodyFor(stateRoot);
+    const deadlines = manualDeadlines();
+    const stopped = { done: false };
+
+    const pending = delegateAgent(
+      { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
+      {
+        writeCustody: custody,
+        runAgent: completedRunner(),
+        env: {},
+        receiptStore: stalledRenameStore(stateRoot, { allowRename, renameEntered }),
+        scheduleReviewBindingTimeout: deadlines.schedule,
+        cancelReviewBindingTimeout: deadlines.cancel,
+        onLateReviewPublicationRelease: (diagnostic) => lateRelease.resolve(diagnostic)
+      }
+    );
+    await renameEntered.promise;
+    const driver = deadlines.driveUntil(stopped);
+    const outcome = await pending;
+    stopped.done = true;
+    await driver;
+    assert.equal(outcome.custodyState, "retained");
+
+    const rootKey = await coordinationKeyFor(repositoryRoot);
+    // Authority moves away from this execution while the write is still live.
+    const stateDirectory = custody.repositoryStateDirectory(rootKey);
+    const recordPath = path.join(stateDirectory, "ownership", "record.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8"));
+    record.executionId = "a-different-owner";
+    await writeFile(recordPath, JSON.stringify(record), "utf8");
+
+    allowRename.resolve();
+    const diagnostic = await lateRelease.promise;
+    assert.equal(diagnostic.status, "retained", "a moved record must not be released late");
+    assert.ok(diagnostic.errorCode, "the refusal is reported with its cause");
+    assert.notEqual(
+      diagnostic.errorCode,
+      "terminal_proof_unavailable",
+      "the release was attempted and refused by the record, not skipped for lack of proof"
+    );
+
+    const afterRecord = await custody.getWriteAccess(rootKey);
+    assert.equal(afterRecord?.executionId, "a-different-owner");
+    assert.notEqual(afterRecord?.state, "RELEASED", "the new owner keeps its custody");
+  });
+});
+
+test("the real custody manager refuses a second release of the same execution", async () => {
+  // The late path and the synchronous path both end in one of these calls.
+  // Even if both somehow ran, the durable record is what decides, and it
+  // refuses a release it has already performed rather than releasing twice.
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const custody = custodyFor(stateRoot);
+    const outcome = await delegateAgent(
+      { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
+      { writeCustody: custody, runAgent: completedRunner(), env: {} }
+    );
+    assert.equal(outcome.custodyState, "released");
+
+    const rootKey = await coordinationKeyFor(repositoryRoot);
+    await assert.rejects(
+      custody.releaseWriteAccessAfterTerminal({
+        executionId: outcome.executionId,
+        canonicalRootKey: rootKey,
+        terminalProof: {
+          processIdentity: {
+            executionId: outcome.executionId,
+            agentType: "code-review",
+            repositoryRoot,
+            pid: 31_234,
+            startTime: "3123400",
+            source: "integration-identity"
+          },
+          event: "close",
+          code: 0,
+          signal: null,
+          observedAt: 3
+        }
+      }),
+      "a release that has already happened must not succeed a second time"
+    );
+  });
+});
+
+test("a publication that settles in time releases synchronously and arms nothing late", async () => {
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    let lateCalls = 0;
+    const custody = custodyFor(stateRoot);
+    const outcome = await delegateAgent(
+      { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
+      {
+        writeCustody: custody,
+        runAgent: completedRunner(),
+        env: {},
+        onLateReviewPublicationRelease: () => { lateCalls += 1; }
+      }
+    );
+
+    assert.equal(outcome.custodyState, "released");
+    assert.equal(outcome.reviewBinding.status, "bound");
+    assert.equal(outcome.reviewBinding.publication.status, "authoritative-settled");
+    assert.equal(outcome.recoveryDiagnostics.mode, "not-needed");
+
+    // Nothing may fire afterwards: there is no publication left to settle, so
+    // no receipt can appear after the custody that authorized it was returned.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(lateCalls, 0, "no late release may be armed once publication settled in time");
   });
 });

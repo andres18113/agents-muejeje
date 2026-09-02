@@ -502,3 +502,36 @@ test("the receipt binds all eight section digests", async () => {
   const stored = context.store.puts[0].receipt;
   assert.deepEqual(Object.keys(stored.binding.sections).sort(), [...SECTION_NAMES].sort());
 });
+
+test("recovered and unprovable histories reach the binding with their own codes", async () => {
+  // The store can now answer from the authoritative tree when the index did
+  // not. The binder must carry that distinction through rather than flattening
+  // a recovered or unprovable history into an ordinary complete one.
+  const recovered = binderWith({
+    store: storeWith([], [], {
+      status: "partial",
+      skipped: [{ code: "review_history_recovered_from_receipts" }]
+    })
+  });
+  const recoveredBefore = await runBefore(recovered);
+  assert.equal(recoveredBefore.receiptHistory.status, "partial");
+  assert.deepEqual(recoveredBefore.receiptHistory.diagnostics, [
+    { code: "review_history_recovered_from_receipts" }
+  ]);
+
+  const unprovable = binderWith({
+    store: storeWith([], [], {
+      status: "indeterminate",
+      skipped: [{ code: "review_history_recovery_failed" }]
+    })
+  });
+  const unprovableBefore = await runBefore(unprovable);
+  assert.equal(
+    unprovableBefore.receiptHistory.status,
+    "indeterminate",
+    "a history the store could not prove is never reported as complete"
+  );
+  assert.deepEqual(unprovableBefore.receiptHistory.diagnostics, [
+    { code: "review_history_recovery_failed" }
+  ]);
+});

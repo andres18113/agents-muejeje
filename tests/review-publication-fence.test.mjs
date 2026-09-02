@@ -773,3 +773,95 @@ test("a real binder cancelled at its gate leaves no receipt and still releases c
   assert.deepEqual(events, ["at-publication-gate", "custody-released"]);
   assert.ok(outcome.reviewBinding.reasons.some((reason) => reason.code === "review_binding_timeout"));
 });
+
+/**
+ * Falsification attempts against the late-release path itself.
+ *
+ * The integration tests prove the real durable record refuses an unauthorized
+ * late release. These prove the things above that record: that the settlement
+ * it keys on can fire only once, and that a failure anywhere in the detached
+ * callback stays inside it.
+ */
+test("an authoritative settlement can fire only once, so the late release runs once", async () => {
+  const fence = createReceiptPublicationFence();
+  assert.equal(beginReceiptPublication(fence.publication), true);
+  assert.throws(
+    () => beginReceiptPublication(fence.publication),
+    /may be crossed only once/u,
+    "authority cannot be crossed twice"
+  );
+
+  const settlement = {
+    status: "settled",
+    disposition: "published",
+    reviewId: "rr1:" + "b".repeat(64),
+    changeSetId: "cs1:" + "a".repeat(64)
+  };
+  assert.equal(settleReceiptPublication(fence.publication, settlement), true);
+  assert.equal(
+    settleReceiptPublication(fence.publication, { ...settlement, disposition: "failed" }),
+    false,
+    "a second settlement is refused, so no second release can be triggered"
+  );
+
+  const observed = await fence.authoritativeSettlement();
+  assert.equal(observed.disposition, "published", "the first settlement is the one that stands");
+  assert.equal(
+    await fence.authoritativeSettlement(),
+    observed,
+    "every observer sees the same single settlement"
+  );
+});
+
+test("a failing late-release callback cannot reject into the process", async () => {
+  const seen = [];
+  const record = (reason) => seen.push(reason);
+  process.on("unhandledRejection", record);
+  try {
+    const maySettle = deferred();
+    const attempted = deferred();
+    const world = delegationWorld({
+      afterHook: async ({ publication, events }) => {
+        beginReceiptPublication(publication);
+        events.push("publication-in-flight");
+        await maySettle.promise;
+        settleReceiptPublication(publication, {
+          status: "settled",
+          disposition: "published",
+          reviewId: "rr1:" + "b".repeat(64),
+          changeSetId: "cs1:" + "a".repeat(64)
+        });
+        return { status: "bound", coherence: COHERENCE.HELD, reasons: [], priorReviews: [] };
+      },
+      afterTimeoutMs: 10,
+      quiescenceTimeoutMs: 20
+    });
+    // Both the release and its diagnostic fail. Neither may escape.
+    world.dependencies.writeCustody.releaseWriteAccessAfterTerminal = async () => {
+      throw Object.assign(new Error("durable release failed"), { code: "write_custody_conflict" });
+    };
+    world.dependencies.onLateReviewPublicationRelease = () => {
+      attempted.resolve();
+      throw new Error("diagnostic sink exploded");
+    };
+
+    const outcome = await delegateAgent(
+      { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+      world.dependencies
+    );
+    assert.equal(outcome.custodyState, "retained");
+
+    maySettle.resolve();
+    await attempted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(seen, [], "a detached late release must never reject into the process");
+    assert.equal(
+      world.events.includes("custody-released"),
+      false,
+      "a failed release never reports itself as a release"
+    );
+  } finally {
+    process.off("unhandledRejection", record);
+  }
+});

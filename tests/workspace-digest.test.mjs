@@ -284,3 +284,212 @@ test("cancellation during an in-flight digest prevents every later filesystem op
     "open, read, after-stat and retry must not begin after cancellation"
   );
 });
+
+/**
+ * Cancellation at every boundary inside one entry's digest.
+ *
+ * The claim is not "the digest is cancellable" but the stronger one that after
+ * cancellation no NEW filesystem operation begins, while the operation already
+ * in flight is allowed to finish. A test that cancels before the digest starts
+ * would prove neither half, so each case here cancels from inside a specific
+ * in-flight call and then asserts the exact operation log.
+ */
+function tracingDeps({ cancelDuring, controller, kind = "file", size = 8 }) {
+  const operations = [];
+  // Two chunk-sized reads, so cancellation can land between them.
+  const bytes = Buffer.alloc(size, 0x61);
+  let offset = 0;
+  let lstatCalls = 0;
+
+  const maybeCancel = (stage) => {
+    if (cancelDuring === stage) controller.abort();
+  };
+
+  return {
+    operations,
+    cancelled: () => controller.signal.aborted,
+    lstatFn: async () => {
+      lstatCalls += 1;
+      const stage = lstatCalls === 1 ? "first-lstat" : "confirming-lstat";
+      operations.push(stage);
+      maybeCancel(stage);
+      return stat({ kind, size });
+    },
+    openFn: async () => {
+      operations.push("open");
+      maybeCancel("open");
+      return {
+        async read(buffer, position, length) {
+          operations.push("read");
+          maybeCancel("read");
+          const slice = bytes.subarray(offset, offset + Math.min(length, 4));
+          slice.copy(buffer, 0);
+          offset += slice.length;
+          return { bytesRead: slice.length };
+        },
+        async close() {
+          operations.push("close");
+        }
+      };
+    },
+    readlinkFn: async () => {
+      operations.push("readlink");
+      maybeCancel("readlink");
+      return Buffer.from("target", "utf8");
+    }
+  };
+}
+
+test("cancellation inside a digest lets the in-flight call finish and starts nothing new", async () => {
+  for (const [stage, kind, expected] of [
+    // Cancelled from inside the opening lstat: nothing else may begin.
+    ["first-lstat", "file", ["first-lstat"]],
+    // Cancelled from inside open(): the handle is closed, no read begins.
+    ["open", "file", ["first-lstat", "open", "close"]],
+    // Cancelled from inside the first chunk read: no second chunk begins.
+    ["read", "file", ["first-lstat", "open", "read", "close"]],
+    // Cancelled from inside readlink(): no confirming lstat begins.
+    ["readlink", "symlink", ["first-lstat", "readlink"]]
+  ]) {
+    const controller = new AbortController();
+    const dependencies = tracingDeps({ cancelDuring: stage, controller, kind });
+
+    await assert.rejects(
+      digestWorkspaceEntry("C:\\repo\\entry", dependencies),
+      (error) => {
+        assert.ok(error instanceof WorkspaceDigestError, stage);
+        assert.equal(error.reason, "collection_deadline_exceeded", stage);
+        return true;
+      },
+      "cancellation during " + stage + " must refuse rather than return a digest"
+    );
+
+    assert.deepEqual(
+      dependencies.operations,
+      expected,
+      "after cancelling during " + stage + ", no further filesystem operation may begin"
+    );
+  }
+});
+
+test("cancellation during the confirming stat finishes it and begins nothing further", async () => {
+  // The last bracket call was already authorized when it started, so it is
+  // allowed to finish. Every byte in the result was read before cancellation,
+  // and no operation begins afterwards - which is the whole guarantee. The
+  // collection around it still reports itself cancelled; this entry simply
+  // does not invent extra filesystem work to discover that.
+  const controller = new AbortController();
+  const dependencies = tracingDeps({
+    cancelDuring: "confirming-lstat",
+    controller,
+    kind: "symlink"
+  });
+
+  const result = await digestWorkspaceEntry("C:\\repo\\entry", dependencies);
+  assert.equal(result.kind, "link");
+  assert.deepEqual(
+    dependencies.operations,
+    ["first-lstat", "readlink", "confirming-lstat"],
+    "no operation may begin after the in-flight confirming stat completes"
+  );
+  assert.equal(controller.signal.aborted, true);
+});
+
+test("an unstable entry under cancellation is refused instead of re-read", async () => {
+  // The confirming stat disagrees, which normally earns the one permitted
+  // retry. Cancellation arrived during that confirming stat, so the retry -
+  // a fresh sequence of filesystem calls - must not begin.
+  const controller = new AbortController();
+  const operations = [];
+  let lstatCalls = 0;
+
+  await assert.rejects(
+    digestWorkspaceEntry("C:\\repo\\churning.txt", {
+      cancelled: () => controller.signal.aborted,
+      lstatFn: async () => {
+        lstatCalls += 1;
+        operations.push("lstat-" + lstatCalls);
+        if (lstatCalls === 2) {
+          controller.abort();
+          // Different size: the bracket disagrees and the entry is unstable.
+          return stat({ size: 99 });
+        }
+        return stat({ size: 4 });
+      },
+      openFn: async () => {
+        operations.push("open-" + (operations.filter((o) => o.startsWith("open")).length + 1));
+        return fileHandle(Buffer.from("data", "utf8"));
+      },
+      readlinkFn: async () => Buffer.alloc(0)
+    }),
+    (error) => {
+      assert.equal(error.reason, "collection_deadline_exceeded");
+      return true;
+    }
+  );
+
+  assert.deepEqual(
+    operations,
+    ["lstat-1", "open-1", "lstat-2"],
+    "the retry must not re-open or re-stat the entry after cancellation"
+  );
+});
+
+test("a retry is a new operation and never begins after cancellation", async () => {
+  // The entry vanishes, which normally earns exactly one retry. Cancellation
+  // arrives while that first failing attempt is still in flight, so the retry
+  // - a fresh sequence of filesystem calls - must not start.
+  const controller = new AbortController();
+  const operations = [];
+  let lstatCalls = 0;
+
+  await assert.rejects(
+    digestWorkspaceEntry("C:\\repo\\vanishing.txt", {
+      cancelled: () => controller.signal.aborted,
+      lstatFn: async () => {
+        lstatCalls += 1;
+        operations.push("lstat-" + lstatCalls);
+        // Cancellation lands during the attempt that is about to fail.
+        controller.abort();
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+      openFn: async () => {
+        operations.push("open");
+        throw new Error("must not be reached");
+      },
+      readlinkFn: async () => {
+        operations.push("readlink");
+        throw new Error("must not be reached");
+      }
+    }),
+    (error) => {
+      assert.equal(error.reason, "collection_deadline_exceeded");
+      return true;
+    }
+  );
+
+  assert.deepEqual(operations, ["lstat-1"], "the retry attempt must never begin");
+  assert.equal(lstatCalls, 1);
+});
+
+test("without cancellation the same vanishing entry really does retry", async () => {
+  // Guards the test above: the retry it forbids is one that otherwise happens,
+  // so a passing result cannot come from the retry having been removed.
+  let lstatCalls = 0;
+  await assert.rejects(
+    digestWorkspaceEntry("C:\\repo\\vanishing.txt", {
+      cancelled: () => false,
+      lstatFn: async () => {
+        lstatCalls += 1;
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+      openFn: async () => fileHandle(Buffer.alloc(0)),
+      readlinkFn: async () => Buffer.alloc(0)
+    }),
+    (error) => {
+      assert.equal(error.reason, "content_unreadable");
+      return true;
+    }
+  );
+  assert.equal(lstatCalls, 2, "the uncancelled path takes its one permitted retry");
+});
