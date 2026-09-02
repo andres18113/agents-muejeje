@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import {
   COLLECTOR_REASONS,
@@ -585,11 +586,29 @@ test("a persistently unstable file exhausts the retry budget as collector instab
 const RAW_NON_UTF8_PATH = Buffer.from([0x61, 0xff, 0x62]);
 const HEX_LOOKALIKE_PATH = Buffer.from("61ff62", "utf8");
 
+/**
+ * The two locator keys, each derived the way production derives its own.
+ *
+ * A UTF-8 entry is joined with node:path, so its separator is the host's - "\\"
+ * on Windows, "/" elsewhere. Spelling it by hand made this suite pass only on
+ * a POSIX host, which is precisely the mistake the test exists to catch.
+ *
+ * The raw-byte locator keeps its explicit 0x2f: that side is the simulated
+ * POSIX branch, forced by `platform: "linux"`, and the collector joins those
+ * bytes itself rather than through node:path. It is host-independent by
+ * construction and must stay literal.
+ */
+const HEX_LOOKALIKE_LOCATOR = "text:" + path.join(TOP_LEVEL, HEX_LOOKALIKE_PATH.toString("utf8"));
+const RAW_NON_UTF8_LOCATOR = "bytes:" + Buffer.concat([
+  Buffer.from(TOP_LEVEL, "utf8"),
+  Buffer.of(0x2f),
+  RAW_NON_UTF8_PATH
+]).toString("hex");
+
 function twoPathFilesystem() {
   const contents = new Map([
-    ["bytes:" + Buffer.concat([Buffer.from(TOP_LEVEL, "utf8"), Buffer.of(0x2f), RAW_NON_UTF8_PATH]).toString("hex"),
-      Buffer.from("bytes-file-contents", "utf8")],
-    ["text:" + TOP_LEVEL + "/61ff62", Buffer.from("hex-lookalike-contents", "utf8")]
+    [RAW_NON_UTF8_LOCATOR, Buffer.from("bytes-file-contents", "utf8")],
+    [HEX_LOOKALIKE_LOCATOR, Buffer.from("hex-lookalike-contents", "utf8")]
   ]);
   const addressed = [];
   const contentFor = (locator) => {
@@ -659,11 +678,9 @@ test("a raw non-UTF-8 path and a literal hex-looking path can never be hashed as
 
   // And the proof of how: the hex-encoded entry was addressed by raw bytes, the
   // UTF-8 entry by its name, and the hex spelling was never used as a pathname.
-  const rawLocator = "bytes:" +
-    Buffer.concat([Buffer.from(TOP_LEVEL, "utf8"), Buffer.of(0x2f), RAW_NON_UTF8_PATH]).toString("hex");
   assert.deepEqual(
     [...new Set(filesystem.addressed)].sort(),
-    [rawLocator, "text:" + TOP_LEVEL + "/61ff62"].sort()
+    [RAW_NON_UTF8_LOCATOR, HEX_LOOKALIKE_LOCATOR].sort()
   );
 });
 
@@ -698,7 +715,7 @@ test("a path this platform cannot address is indeterminate, never the hexadecima
   assert.equal(result.status, "indeterminate");
   assert.equal(result.reasons[0].code, "path_not_addressable");
   assert.equal(
-    filesystem.addressed.includes("text:" + TOP_LEVEL + "/61ff62"),
+    filesystem.addressed.includes(HEX_LOOKALIKE_LOCATOR),
     false,
     "the hex spelling must never become a pathname"
   );
