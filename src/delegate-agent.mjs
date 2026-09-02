@@ -5,6 +5,12 @@ import * as z from "zod/v4";
 import { AGENT_REGISTRY, getAgentProfile } from "./agent-registry.mjs";
 import { loadAgentContract } from "./agent-contracts.mjs";
 import {
+  RETAINED_CUSTODY_STATES,
+  delegateAgentOutputSchema,
+  projectDelegateAgentError,
+  projectDelegateAgentOutcomeForTransport
+} from "./delegate-outcome.mjs";
+import {
   describeRuntimeCapabilities,
   resolveCapabilityPolicy
 } from "./capability-policy.mjs";
@@ -16,6 +22,7 @@ import {
 } from "./claude-runner.mjs";
 import { composeAgentPrompt } from "./prompt-composer.mjs";
 import { PROCESS_WRITE_CUSTODY } from "./write-custody.mjs";
+import { isSupportedReasoningEffort } from "./reasoning-effort.mjs";
 import { isFullyQualifiedRef } from "./git-ref-name.mjs";
 import { COLLECTION_DEADLINE_MS, collectChangeSet } from "./changeset/collector.mjs";
 import { NO_REVIEW_TARGET } from "./changeset/target.mjs";
@@ -42,13 +49,6 @@ export const MAX_DELEGATE_TASK_CHARS = 100_000;
 const DEFAULT_MODEL = "opus";
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_CAPTURE_BYTES = 2 * 1024 * 1024;
-const SUPPORTED_REASONING_EFFORTS = new Set([
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max"
-]);
 
 export class DelegateAgentConfigurationError extends Error {
   constructor(message) {
@@ -189,10 +189,124 @@ async function finalizeReviewWithinDeadline(operation, {
     cancel(timer);
   }
 
+  const NOT_ATTEMPTED_PUBLICATION = Object.freeze({
+    status: "not-attempted",
+    authorityStarted: false,
+    settled: false
+  });
+  const CANCELLED_PUBLICATION = Object.freeze({
+    status: "cancelled-before-authority",
+    authorityStarted: false,
+    settled: false
+  });
+  const PENDING_PUBLICATION = Object.freeze({
+    status: "authoritative-pending",
+    authorityStarted: true,
+    settled: false
+  });
+  const settledPublication = (settlement) => Object.freeze({
+    ...settlement,
+    status: "authoritative-settled",
+    authorityStarted: true,
+    settled: true
+  });
+
+  // A binder result and the publication state are reported together and are
+  // never allowed to overwrite each other. In particular a returned binding is
+  // preserved even when its publication did not quiesce, and a binder rejection
+  // never downgrades an authority that was already crossed: authority, once
+  // crossed, cannot be withdrawn by anything the binder subsequently does.
+  const report = ({ result, publication, publicationUnquiesced, deadlineExceeded, lateSettlement }) =>
+    Object.freeze({
+      value: result?.value,
+      ...(result?.error ? { operationError: result.error } : {}),
+      publicationUnquiesced,
+      deadlineExceeded,
+      publication,
+      ...(lateSettlement ? { lateSettlement } : {})
+    });
+
+  /**
+   * Only ever entered with publication authority already started. It waits for
+   * the fence - not for the binder's callback contract - because only the fence
+   * observes the authoritative reviews/cs rename settling.
+   */
+  async function waitForPublicationQuiescence(observedResult, deadlineExceeded) {
+    let quiescenceTimer;
+    const quiescence = new Promise((resolve) => {
+      quiescenceTimer = schedule(() => resolve({ timedOut: true }), quiescenceTimeoutMs);
+    });
+    try {
+      const observed = observedResult
+        ? { operation: observedResult }
+        : await Promise.race([
+            settled.then((result) => ({ operation: result })),
+            fence.authoritativeSettlement().then((result) => ({ publication: result })),
+            quiescence
+          ]);
+      if (observed.publication) {
+        return report({
+          publication: settledPublication(observed.publication),
+          publicationUnquiesced: false,
+          deadlineExceeded
+        });
+      }
+      const result = observed.operation;
+      if (result && fence.publicationSettled()) {
+        return report({
+          result,
+          publication: settledPublication(await fence.authoritativeSettlement()),
+          publicationUnquiesced: false,
+          deadlineExceeded
+        });
+      }
+      // Either nothing has been observed yet, or the binder returned or
+      // rejected while an authoritative operation it issued is still live.
+      // Neither proves quiescence, so keep waiting on the fence alone.
+      const later = await Promise.race([
+        fence.authoritativeSettlement().then((publication) => ({ publication })),
+        quiescence
+      ]);
+      if (later.publication) {
+        return report({
+          result,
+          publication: settledPublication(later.publication),
+          publicationUnquiesced: false,
+          deadlineExceeded
+        });
+      }
+      return report({
+        result,
+        publication: PENDING_PUBLICATION,
+        publicationUnquiesced: true,
+        deadlineExceeded,
+        lateSettlement: fence.authoritativeSettlement()
+      });
+    } finally {
+      cancel(quiescenceTimer);
+    }
+  }
+
   if (outcome.result) {
-    if (outcome.result.error) throw outcome.result.error;
-    return Object.freeze({
-      value: outcome.result.value,
+    const result = outcome.result;
+    if (fence.publicationStarted() && !fence.publicationSettled()) {
+      return await waitForPublicationQuiescence(result, false);
+    }
+    if (fence.publicationSettled()) {
+      return report({
+        result,
+        publication: settledPublication(await fence.authoritativeSettlement()),
+        publicationUnquiesced: false,
+        deadlineExceeded: false
+      });
+    }
+    // Authority was never crossed, so no receipt exists or can appear. Only
+    // here is it safe to let a binder rejection propagate as an ordinary
+    // failure, because propagating it discards no publication state.
+    if (result.error) throw result.error;
+    return report({
+      result,
+      publication: NOT_ATTEMPTED_PUBLICATION,
       publicationUnquiesced: false,
       deadlineExceeded: false
     });
@@ -200,37 +314,16 @@ async function finalizeReviewWithinDeadline(operation, {
 
   fence.requestCancellation();
   if (!fence.publicationStarted()) {
-    // Authority is gone for good: no receipt can now be written, so nothing has
-    // to be waited for before custody is released.
-    return Object.freeze({
-      value: undefined,
+    // Authority is gone for good: the store's adjacent cancellation check can
+    // never cross the reviews/cs rename boundary after this point.
+    return report({
+      publication: CANCELLED_PUBLICATION,
       publicationUnquiesced: false,
       deadlineExceeded: true
     });
   }
 
-  let quiescenceTimer;
-  const quiescence = new Promise((resolve) => {
-    quiescenceTimer = schedule(() => resolve({ timedOut: true }), quiescenceTimeoutMs);
-  });
-  try {
-    const observed = await Promise.race([settled.then((result) => ({ result })), quiescence]);
-    if (observed.result) {
-      if (observed.result.error) throw observed.result.error;
-      return Object.freeze({
-        value: observed.result.value,
-        publicationUnquiesced: false,
-        deadlineExceeded: true
-      });
-    }
-    return Object.freeze({
-      value: undefined,
-      publicationUnquiesced: true,
-      deadlineExceeded: true
-    });
-  } finally {
-    cancel(quiescenceTimer);
-  }
+  return await waitForPublicationQuiescence(undefined, true);
 }
 
 function resolveReviewBindingSwitch(env) {
@@ -308,7 +401,7 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
     throw new DelegateAgentConfigurationError("An agent profile is required.");
   }
 
-  if (!SUPPORTED_REASONING_EFFORTS.has(profile.reasoningEffort)) {
+  if (!isSupportedReasoningEffort(profile.reasoningEffort)) {
     throw new DelegateAgentConfigurationError(
       "Agent profile '" + profile.id + "' has unsupported reasoning effort '" +
         String(profile.reasoningEffort) +
@@ -527,6 +620,121 @@ function custodyRetentionError(
 }
 
 /**
+ * The one place that decides which release the available terminal evidence
+ * authorizes, returning the exact call to make or nothing at all.
+ *
+ * Both the synchronous custody finalization and the late publication-settlement
+ * release ask this same question. Asking it in two places is how the late path
+ * quietly becomes more permissive than the path it stands in for, which on a
+ * custody boundary is the one drift that must not be possible.
+ */
+function authorizedCustodyRelease({
+  writeCustody,
+  executionId,
+  canonicalRootKey,
+  writerProcessStarted,
+  processProvenNotStarted,
+  workspacePreparationAmbiguous,
+  terminalProof,
+  unstartedReleaseAllowed
+}) {
+  if (
+    !writerProcessStarted &&
+    processProvenNotStarted &&
+    !workspacePreparationAmbiguous &&
+    unstartedReleaseAllowed
+  ) {
+    return () => writeCustody.releaseUnstartedWriteAccess({ executionId, canonicalRootKey });
+  }
+  // A proof without a processIdentity is supervised close evidence: this
+  // coordinator spawned the exact child and saw it close before a durable
+  // identity could be captured. Custody validates that claim.
+  if (writerProcessStarted && terminalProof) {
+    return terminalProof.supervisedByCoordinator === true
+      ? () => writeCustody.releaseWriteAccessAfterSupervisedClose({
+          executionId,
+          canonicalRootKey,
+          terminalProof
+        })
+      : () => writeCustody.releaseWriteAccessAfterTerminal({
+          executionId,
+          canonicalRootKey,
+          terminalProof
+        });
+  }
+  return undefined;
+}
+
+function buildTerminationDiagnostics({
+  lifecycleEvidence,
+  writerProcessStarted,
+  writerProcessIdentity,
+  terminalProof,
+  processProvenNotStarted
+}) {
+  const forced = lifecycleEvidence?.terminationResult;
+  // Three states, not two: proven quiescent, proven unquiescent, and no
+  // destructive helper involved at all. Only the first two are reportable
+  // booleans; the third stays absent rather than being reported as `false`.
+  const helperQuiescenceProven = forced?.helperQuiescenceUnproven === true
+    ? false
+    : (forced?.taskkillHelperCloseProven === true ? true : undefined);
+  return Object.freeze({
+    processStarted: writerProcessStarted,
+    processIdentity: writerProcessIdentity
+      ? "recorded"
+      : (processProvenNotStarted ? "not-started" : "unavailable"),
+    terminalProof: terminalProof?.event === "close"
+      ? "close"
+      : (processProvenNotStarted ? "not-required" : "unavailable"),
+    forcedTerminationStatus: typeof forced?.status === "string" ? forced.status : "not-attempted",
+    ...(typeof forced?.method === "string" ? { method: forced.method } : {}),
+    ...(typeof forced?.reason === "string" ? { reason: forced.reason } : {}),
+    ...(typeof forced?.destructiveHelperAuthorized === "boolean"
+      ? { destructiveHelperAuthorized: forced.destructiveHelperAuthorized }
+      : {}),
+    ...(typeof helperQuiescenceProven === "boolean" ? { helperQuiescenceProven } : {})
+  });
+}
+
+function buildRecoveryDiagnostics({
+  custodyState,
+  custodyReason,
+  lateTerminalRecoveryAllowed,
+  lateReviewReleaseArmed
+}) {
+  if (lateReviewReleaseArmed) {
+    return Object.freeze({
+      automatic: true,
+      manualInterventionRequired: false,
+      mode: "same-coordinator-publication-settlement",
+      reason: "review_receipt_publication_unquiesced"
+    });
+  }
+  if (custodyState === "orphaned" && lateTerminalRecoveryAllowed) {
+    return Object.freeze({
+      automatic: true,
+      manualInterventionRequired: false,
+      mode: "same-coordinator-terminal-proof",
+      ...(custodyReason ? { reason: custodyReason } : {})
+    });
+  }
+  if (RETAINED_CUSTODY_STATES.includes(custodyState)) {
+    return Object.freeze({
+      automatic: false,
+      manualInterventionRequired: true,
+      mode: "manual-required",
+      ...(custodyReason ? { reason: custodyReason } : {})
+    });
+  }
+  return Object.freeze({
+    automatic: false,
+    manualInterventionRequired: false,
+    mode: "not-needed"
+  });
+}
+
+/**
  * Executes exactly one explicit profile delegation. Dependencies are injectable
  * so unit tests can verify composition and lifecycle behavior without a real
  * Claude process.
@@ -590,7 +798,15 @@ export async function delegateAgent(input, dependencies = {}) {
   let writerProcessStarted = false;
   let writerProcessIdentity;
   let terminalProof;
+  let lifecycleEvidence;
+  let lateTerminalRecoveryAllowed = false;
+  const custodyReasons = [];
+  let custodyReason;
   let processProvenNotStarted = false;
+  // Where a worktree may have been left when preparation failed before the
+  // delegation could adopt it. Nothing deletes it, so its location is the only
+  // thing that makes the resulting retention actionable.
+  let retainedWorktreeRoot;
   // Set when a Git process started during worktree preparation and its effect
   // on the repository could not be observed. Custody must then be retained.
   let workspacePreparationAmbiguous = false;
@@ -616,6 +832,16 @@ export async function delegateAgent(input, dependencies = {}) {
   // expired and did not quiesce inside its own bound. It means "a receipt may
   // still land", which forbids releasing the custody that authorized it.
   let reviewPublicationUnquiesced = false;
+  let reviewPublication = Object.freeze({
+    status: "not-attempted",
+    authorityStarted: false,
+    settled: false
+  });
+  let lateReviewPublicationSettlement;
+  let lateReviewReleaseArmed = false;
+  // Assigned during custody finalization and reused by the late
+  // publication-settlement release, so both consult one decision.
+  let releaseAuthorizedBy;
   let resolveCustodyFinalization;
   const custodyFinalization = new Promise((resolve) => {
     resolveCustodyFinalization = resolve;
@@ -715,7 +941,12 @@ export async function delegateAgent(input, dependencies = {}) {
           status: "unavailable",
           coherence: reviewCoherence,
           reasons: [{ code: "review_binding_internal_error", detail: error?.code || error?.name }],
-          priorReviews: []
+          priorReviews: [],
+          receiptHistory: {
+            status: "indeterminate",
+            receipts: [],
+            diagnostics: [{ code: "review_history_unavailable" }]
+          }
         };
       }
     }
@@ -840,6 +1071,7 @@ export async function delegateAgent(input, dependencies = {}) {
         : undefined
     });
     writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
+    lifecycleEvidence = execution;
     writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
     terminalProof = execution?.terminalProof;
 
@@ -861,6 +1093,11 @@ export async function delegateAgent(input, dependencies = {}) {
       ...(Number.isSafeInteger(execution.pid) ? { pid: execution.pid } : {})
     };
   } catch (error) {
+    lifecycleEvidence = error;
+    lateTerminalRecoveryAllowed = error?.lateRecoveryAllowed === true;
+    if (!executionWorkspace.workspaceRoot && typeof error?.worktreeRoot === "string") {
+      retainedWorktreeRoot = error.worktreeRoot;
+    }
     writerProcessStarted = writerProcessStarted || error?.processStarted === true || Boolean(error?.processIdentity);
     writerProcessIdentity = writerProcessIdentity || error?.processIdentity;
     terminalProof = error?.terminalProof;
@@ -894,7 +1131,13 @@ export async function delegateAgent(input, dependencies = {}) {
           status: "unavailable",
           coherence: reviewBeforeState.coherence ?? reviewCoherence,
           reasons: reviewBeforeState.reasons ?? [{ code: "review_binding_unavailable" }],
-          priorReviews: reviewBeforeState.priorReviews ?? []
+          priorReviews: reviewBeforeState.priorReviews ?? [],
+          receiptHistory: reviewBeforeState.receiptHistory ?? {
+            status: "indeterminate",
+            receipts: reviewBeforeState.priorReviews ?? [],
+            diagnostics: [{ code: "review_history_status_missing" }]
+          },
+          publication: reviewPublication
         };
       } else try {
         const stateForAfter = reviewBeforeState && reviewBeforeState.coherence !== reviewCoherence
@@ -919,18 +1162,61 @@ export async function delegateAgent(input, dependencies = {}) {
         );
         reviewBinding = finalized.value;
         reviewPublicationUnquiesced = finalized.publicationUnquiesced === true;
+        reviewPublication = finalized.publication;
+        lateReviewPublicationSettlement = finalized.lateSettlement;
         if (!reviewBinding) {
-          reviewBinding = {
-            status: "unavailable",
-            coherence: reviewCoherence,
-            reasons: [
-              { code: "review_binding_timeout" },
-              ...(reviewPublicationUnquiesced
-                ? [{ code: "review_receipt_publication_unquiesced" }]
-                : [])
-            ],
-            priorReviews: reviewBeforeState?.priorReviews ?? []
+          const history = reviewBeforeState?.receiptHistory ?? {
+            status: "indeterminate",
+            receipts: reviewBeforeState?.priorReviews ?? [],
+            diagnostics: [{ code: "review_history_status_missing" }]
           };
+          // The binder produced no reportable value. Why it did not is itself
+          // evidence: a rejection observed after publication authority had
+          // already been crossed is an internal binder failure, not a timeout,
+          // and saying "timeout" there would misdescribe why custody is held.
+          const absenceReason = finalized.operationError
+            ? {
+                code: "review_binding_internal_error",
+                detail: finalized.operationError?.code || finalized.operationError?.name
+              }
+            : { code: "review_binding_timeout" };
+          reviewBinding = reviewPublication.disposition === "published"
+            ? {
+                status: "bound",
+                coherence: COHERENCE.HELD,
+                reasons: [
+                  { code: "review_binding_deadline_exceeded" },
+                  ...(finalized.operationError ? [absenceReason] : [])
+                ],
+                changeSetId: reviewPublication.changeSetId,
+                beforeChangeSetId: reviewPublication.changeSetId,
+                afterChangeSetId: reviewPublication.changeSetId,
+                reviewId: reviewPublication.reviewId,
+                priorReviews: history.receipts,
+                receiptHistory: history
+              }
+            : {
+                status: "unavailable",
+                coherence: reviewCoherence,
+                reasons: [
+                  absenceReason,
+                  ...(reviewPublicationUnquiesced
+                    ? [{ code: "review_receipt_publication_unquiesced" }]
+                    : [])
+                ],
+                priorReviews: history.receipts,
+                receiptHistory: history
+              };
+        } else if (finalized.operationError) {
+          // A real binding value alongside a rejection can only come from a
+          // binder that resolved and then failed after its authority crossed.
+          reviewBindingReasons.push({
+            code: "review_binding_internal_error",
+            detail: finalized.operationError?.code || finalized.operationError?.name
+          });
+          if (finalized.deadlineExceeded) {
+            reviewBindingReasons.push({ code: "review_binding_deadline_exceeded" });
+          }
         } else if (finalized.deadlineExceeded) {
           // The binding outran its bound but was then observed to finish while
           // its publication was being waited on. Discarding a real result to
@@ -938,15 +1224,41 @@ export async function delegateAgent(input, dependencies = {}) {
           // to prevent, so the expired bound is recorded beside the result.
           reviewBindingReasons.push({ code: "review_binding_deadline_exceeded" });
         }
+        reviewBinding = { ...reviewBinding, publication: reviewPublication };
       } catch (error) {
         reviewBinding = {
           status: "unavailable",
           coherence: reviewCoherence,
           reasons: [{ code: "review_binding_internal_error", detail: error?.code }],
-          priorReviews: []
+          priorReviews: [],
+          receiptHistory: {
+            status: "indeterminate",
+            receipts: [],
+            diagnostics: [{ code: "review_history_unavailable" }]
+          },
+          publication: reviewPublication
         };
       }
     }
+
+    // Bound to the evidence this invocation actually gathered, so the
+    // synchronous release below and the late publication-settlement release
+    // further down cannot answer the same question differently.
+    releaseAuthorizedBy = (unstartedReleaseAllowed) => authorizedCustodyRelease({
+      writeCustody,
+      executionId,
+      canonicalRootKey: workspace.canonicalRepositoryKey,
+      writerProcessStarted,
+      processProvenNotStarted,
+      workspacePreparationAmbiguous,
+      terminalProof,
+      unstartedReleaseAllowed
+    });
+    // A completed write execution must present terminal proof; only a failed
+    // one, or a coherent review, may release on "never started".
+    const synchronousRelease = releaseAuthorizedBy(
+      outcome?.status !== "completed" || custodyPlan === "coherent-review"
+    );
 
     try {
       if (reservation) {
@@ -957,37 +1269,17 @@ export async function delegateAgent(input, dependencies = {}) {
             // durable after the custody it cites was gone, so the slot stays
             // retained and reconciles under the unchanged Phase 5 rules.
             custodyState = "retained";
+            custodyReason = "review_receipt_publication_unquiesced";
+            custodyReasons.push({ code: custodyReason });
             reviewBindingReasons.push({
               code: "coherent_admission_retained",
               detail: "review_receipt_publication_unquiesced"
             });
-          } else if (
-            !writerProcessStarted &&
-            processProvenNotStarted &&
-            !workspacePreparationAmbiguous &&
-            (outcome?.status !== "completed" || custodyPlan === "coherent-review")
-          ) {
-            const released = await writeCustody.releaseUnstartedWriteAccess({
-              executionId,
-              canonicalRootKey: workspace.canonicalRepositoryKey
-            });
+            lateReviewReleaseArmed = Boolean(lateReviewPublicationSettlement);
+          } else if (synchronousRelease) {
+            const released = await synchronousRelease();
             custodyState = released.state.toLowerCase();
-          } else if (writerProcessStarted && terminalProof) {
-            // A proof without a processIdentity is supervised close evidence:
-            // this coordinator spawned the exact child and saw it close before a
-            // durable identity could be captured. Custody validates that claim.
-            const released = terminalProof.supervisedByCoordinator === true
-              ? await writeCustody.releaseWriteAccessAfterSupervisedClose({
-                  executionId,
-                  canonicalRootKey: workspace.canonicalRepositoryKey,
-                  terminalProof
-                })
-              : await writeCustody.releaseWriteAccessAfterTerminal({
-                  executionId,
-                  canonicalRootKey: workspace.canonicalRepositoryKey,
-                  terminalProof
-                });
-            custodyState = released.state.toLowerCase();
+            reservation = released;
           } else {
             const orphaned = await writeCustody.markOrphanedWriteAccess({
               executionId,
@@ -998,6 +1290,11 @@ export async function delegateAgent(input, dependencies = {}) {
                 : "terminal-proof-unavailable"
             });
             custodyState = orphaned.state.toLowerCase();
+            reservation = orphaned;
+            custodyReason = workspacePreparationAmbiguous
+              ? "worktree-preparation-ambiguous"
+              : "terminal-proof-unavailable";
+            custodyReasons.push({ code: custodyReason });
             if (custodyPlan === "write") {
               outcome = {
                 ...baseOutcome({
@@ -1029,8 +1326,16 @@ export async function delegateAgent(input, dependencies = {}) {
               reason: "custody-release-proof-failed"
             });
             custodyState = orphaned.state.toLowerCase();
+            reservation = orphaned;
+            custodyReason = "custody-release-proof-failed";
+            custodyReasons.push({
+              code: custodyReason,
+              ...(typeof releaseError?.code === "string" ? { detail: releaseError.code } : {})
+            });
           } catch {
             custodyState = "retention-failed";
+            custodyReason = "custody-retention-failed";
+            custodyReasons.push({ code: custodyReason });
           }
           if (custodyPlan === "write") {
             outcome = {
@@ -1064,8 +1369,76 @@ export async function delegateAgent(input, dependencies = {}) {
     }
   }
 
+  if (lateReviewReleaseArmed) {
+    // A bounded quiescence timeout is uncertainty, not permanent ownership.
+    // Only this exact publication promise and this still-live coordinator may
+    // attempt the guarded release, using the same terminal evidence the
+    // synchronous path would have required. Ownership/revision checks inside
+    // custody reject a moved or foreign record and leave it fail-closed.
+    const lateRelease = lateReviewPublicationSettlement.then(async (publicationSettlement) => {
+      await custodyFinalization;
+      if (publicationSettlement?.status !== "settled" || !reservation) return;
+      try {
+        // Exactly the release the synchronous path would have performed: this
+        // is a coherent review, so the unstarted case is permitted here for
+        // the same reason it is there.
+        const release = releaseAuthorizedBy?.(true);
+        if (!release) {
+          await dependencies.onLateReviewPublicationRelease?.({
+            status: "retained",
+            executionId,
+            publication: publicationSettlement,
+            errorCode: "terminal_proof_unavailable"
+          });
+          return;
+        }
+        await release();
+        await dependencies.onLateReviewPublicationRelease?.({
+          status: "released",
+          executionId,
+          publication: publicationSettlement
+        });
+      } catch (error) {
+        try {
+          await dependencies.onLateReviewPublicationRelease?.({
+            status: "retained",
+            executionId,
+            publication: publicationSettlement,
+            errorCode: error?.code || error?.name
+          });
+        } catch {
+          // Diagnostics cannot grant release authority or destabilize the MCP.
+        }
+      }
+    });
+    // Nothing awaits this deliberately detached release, so it must never be
+    // able to surface as an unhandled rejection in the MCP process.
+    void lateRelease.catch(() => {});
+  }
+
   if (outcome && custodyPlan === "coherent-review") {
     outcome.reviewBinding = mergeReviewBindingReasons(reviewBinding, reviewBindingReasons);
+  }
+
+  if (outcome) {
+    if (retainedWorktreeRoot) outcome.retainedWorktreeRoot = retainedWorktreeRoot;
+    outcome.durableCustodyState = typeof reservation?.state === "string"
+      ? reservation.state.toLowerCase()
+      : custodyState;
+    outcome.custodyReasons = Object.freeze(custodyReasons);
+    outcome.terminationDiagnostics = buildTerminationDiagnostics({
+      lifecycleEvidence,
+      writerProcessStarted,
+      writerProcessIdentity,
+      terminalProof,
+      processProvenNotStarted
+    });
+    outcome.recoveryDiagnostics = buildRecoveryDiagnostics({
+      custodyState,
+      custodyReason,
+      lateTerminalRecoveryAllowed,
+      lateReviewReleaseArmed
+    });
   }
 
   return outcome;
@@ -1096,8 +1469,11 @@ export function formatDelegateAgentOutcome(outcome) {
     "ExecutionId: " + outcome.executionId,
     "Status: " + outcome.status,
     "AccessMode: " + outcome.accessMode,
+    "EffectiveCwd: " + outcome.effectiveCwd,
     "CanonicalRoot: " + outcome.canonicalRoot,
+    "CanonicalRootSource: " + (outcome.canonicalRootSource || "unknown"),
     "CustodyState: " + outcome.custodyState,
+    "DurableCustodyState: " + (outcome.durableCustodyState || outcome.custodyState),
     "Model: " + outcome.model,
     "ReasoningEffort: " + outcome.reasoningEffort,
     "TimeoutMs: " + outcome.timeoutMs,
@@ -1112,24 +1488,76 @@ export function formatDelegateAgentOutcome(outcome) {
   if (outcome.worktreeRoot) {
     lines.push("WorktreeRoot: " + outcome.worktreeRoot);
   }
+  if (outcome.retainedWorktreeRoot) {
+    lines.push("RetainedWorktreeRoot: " + outcome.retainedWorktreeRoot);
+  }
   if (outcome.baseCommit) {
     lines.push("BaseCommit: " + outcome.baseCommit);
+  }
+  if (outcome.custodyReasons?.length) {
+    lines.push(
+      "CustodyReasons: " + outcome.custodyReasons.slice(0, 32).map((reason) => reason.code).join(", ")
+    );
+  }
+  if (outcome.recoveryDiagnostics) {
+    lines.push("RecoveryMode: " + outcome.recoveryDiagnostics.mode);
+    lines.push(
+      "ManualInterventionRequired: " +
+        String(outcome.recoveryDiagnostics.manualInterventionRequired === true)
+    );
+  }
+  if (outcome.terminationDiagnostics) {
+    lines.push("ProcessStarted: " + String(outcome.terminationDiagnostics.processStarted));
+    lines.push("ProcessIdentity: " + outcome.terminationDiagnostics.processIdentity);
+    lines.push("TerminalProof: " + outcome.terminationDiagnostics.terminalProof);
+    lines.push(
+      "ForcedTerminationStatus: " + outcome.terminationDiagnostics.forcedTerminationStatus
+    );
   }
   if (outcome.reviewBinding) {
     const binding = outcome.reviewBinding;
     lines.push("ReviewBinding: " + binding.status);
     lines.push("ReviewCoherence: " + binding.coherence);
-    const changeSetId = binding.changeSetId || binding.beforeChangeSetId;
-    if (changeSetId) lines.push("ChangeSetId: " + changeSetId);
+    if (binding.changeSetId) lines.push("ChangeSetId: " + binding.changeSetId);
+    if (binding.beforeChangeSetId) lines.push("BeforeChangeSetId: " + binding.beforeChangeSetId);
+    if (binding.afterChangeSetId) lines.push("AfterChangeSetId: " + binding.afterChangeSetId);
     if (binding.reviewId) lines.push("ReviewId: " + binding.reviewId);
-    if (binding.priorReviews?.length) {
-      lines.push(
-        "PriorReviews: " + binding.priorReviews.length + " for this review scope (" +
-          binding.priorReviews.map((prior) => prior.agentType + " " + prior.verdict).join(", ") + ")"
-      );
+    const history = binding.receiptHistory;
+    if (history) {
+      lines.push("ReceiptHistoryStatus: " + history.status);
+      lines.push("PriorReviews: " + history.receipts.length);
+      for (const prior of history.receipts.slice(0, 16)) {
+        const details = [
+          prior.reviewId,
+          prior.agentType,
+          prior.verdict,
+          prior.changeSetId,
+          prior.changedSections?.length ? "changed=" + prior.changedSections.join("+") : "",
+          prior.basisDifferences?.length ? "basis=" + prior.basisDifferences.join("+") : ""
+        ].filter(Boolean);
+        lines.push("PriorReview: " + details.join(" "));
+      }
+      if (history.diagnostics?.length) {
+        lines.push(
+          "ReceiptHistoryDiagnostics: " +
+            history.diagnostics.slice(0, 16).map((reason) => reason.code).join(", ")
+        );
+      }
+    } else if (binding.priorReviews?.length) {
+      lines.push("ReceiptHistoryStatus: indeterminate");
+      lines.push("PriorReviews: " + binding.priorReviews.length);
+    }
+    if (binding.publication) {
+      lines.push("ReceiptPublication: " + binding.publication.status);
+      if (binding.publication.disposition) {
+        lines.push("ReceiptPublicationDisposition: " + binding.publication.disposition);
+      }
     }
     if (binding.reasons?.length) {
-      lines.push("ReviewBindingReasons: " + binding.reasons.map((reason) => reason.code).join(", "));
+      lines.push(
+        "ReviewBindingReasons: " +
+          binding.reasons.slice(0, 32).map((reason) => reason.code).join(", ")
+      );
     }
   }
 
@@ -1174,9 +1602,10 @@ export const delegateAgentInputSchema = z.object({
     )
 });
 
-function mcpText(text, isError = false) {
+function mcpText(text, structuredContent, isError = false) {
   return {
     content: [{ type: "text", text }],
+    structuredContent,
     ...(isError ? { isError: true } : {})
   };
 }
@@ -1187,7 +1616,8 @@ export function registerDelegateAgentTool(server, { delegate = delegateAgent } =
     {
       description:
         "Run one explicitly selected registered specialist in a fresh Claude Code process. The task is a dynamic assignment supplied by the Lead.",
-      inputSchema: delegateAgentInputSchema
+      inputSchema: delegateAgentInputSchema,
+      outputSchema: delegateAgentOutputSchema
     },
     async ({ agent_type: agentType, task, cwd, target_ref: targetRef }) => {
       try {
@@ -1199,11 +1629,16 @@ export function registerDelegateAgentTool(server, { delegate = delegateAgent } =
         });
         return mcpText(
           formatDelegateAgentOutcome(outcome),
+          projectDelegateAgentOutcomeForTransport(outcome),
           outcome.status !== "completed"
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return mcpText("delegate_agent failed:\n" + message, true);
+        return mcpText(
+          "delegate_agent failed:\n" + message,
+          projectDelegateAgentError(error),
+          true
+        );
       }
     }
   );

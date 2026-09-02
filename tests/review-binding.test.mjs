@@ -309,12 +309,23 @@ test("neither method ever throws, whatever a dependency does", async () => {
 
 // --- prior review discovery: the STALE path --------------------------------
 
-function storeWith(receipts, skipped = []) {
+// Mirrors the real store's discovery contract, including the completeness
+// status it reports. A double that omits `status` is a different contract and
+// is exercised separately below.
+function storeWith(receipts, skipped = [], discovery = {}) {
   return {
     puts: [],
     async put(entry) { this.puts.push(entry); return { stored: "created", path: "x" }; },
     async listForChangeSet() { return { receipts: [], skipped: [] }; },
-    async discoverForScope() { return { receipts, skipped }; }
+    async discoverForScope() {
+      return {
+        status: skipped.length > 0 ? "partial" : "complete",
+        truncated: false,
+        receipts,
+        skipped,
+        ...discovery
+      };
+    }
   };
 }
 
@@ -382,11 +393,48 @@ test("a corrupt receipt filtered by the real store remains visible as INDETERMIN
     changeSetId: "cs1:" + "2".repeat(64),
     recordedAt: 123,
     verdict: "INDETERMINATE",
-    changedSections: []
+    changedSections: [],
+    basisDifferences: [],
+    reasons: [{ code: "review_receipt_corrupt" }]
   }]);
+  assert.equal(before.receiptHistory.status, "partial");
+  assert.deepEqual(before.receiptHistory.diagnostics, [{ code: "review_receipt_corrupt" }]);
 });
 
-test("a discovery failure degrades to no prior reviews rather than failing", async () => {
+test("a discovery that does not state its completeness is never read as complete", async () => {
+  // Absence of a status is absence of evidence about completeness. Treating it
+  // as "complete" would turn an unknown history into a proven empty one.
+  const silent = binderWith({
+    store: {
+      puts: [],
+      async put() { return { stored: "created", path: "x" }; },
+      async discoverForScope() { return { receipts: [], skipped: [] }; }
+    }
+  });
+  const before = await runBefore(silent);
+  assert.equal(before.status, "collected");
+  assert.equal(before.receiptHistory.status, "indeterminate");
+  assert.deepEqual(before.receiptHistory.diagnostics, [
+    { code: "review_history_status_unrecognized" }
+  ]);
+
+  const truncated = binderWith({
+    store: storeWith([], [], { status: "partial", truncated: true })
+  });
+  const truncatedBefore = await runBefore(truncated);
+  assert.equal(truncatedBefore.receiptHistory.status, "partial");
+  assert.deepEqual(truncatedBefore.receiptHistory.diagnostics, [
+    { code: "review_history_truncated" }
+  ]);
+
+  const empty = binderWith({ store: storeWith([]) });
+  const emptyBefore = await runBefore(empty);
+  assert.equal(emptyBefore.receiptHistory.status, "complete");
+  assert.deepEqual(emptyBefore.receiptHistory.diagnostics, []);
+  assert.deepEqual(emptyBefore.priorReviews, []);
+});
+
+test("a discovery failure is indeterminate rather than an ordinary empty history", async () => {
   const context = binderWith({
     store: {
       puts: [],
@@ -397,6 +445,10 @@ test("a discovery failure degrades to no prior reviews rather than failing", asy
   const before = await runBefore(context);
   assert.equal(before.status, "collected");
   assert.deepEqual(before.priorReviews, []);
+  assert.equal(before.receiptHistory.status, "indeterminate");
+  assert.deepEqual(before.receiptHistory.diagnostics, [
+    { code: "review_history_discovery_failed" }
+  ]);
 });
 
 test("prior reviews survive into the after result", async () => {

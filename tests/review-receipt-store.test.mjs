@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,6 +16,7 @@ import {
   MAX_RECEIPTS_PER_CHANGE_SET,
   ReviewReceiptStore
 } from "../src/review/receipt-store.mjs";
+import { createReceiptPublicationFence } from "../src/review/publication-fence.mjs";
 import {
   DurableWriteCustodyManager,
   repositoryIdForCanonicalRootKey
@@ -26,6 +27,14 @@ const ROOT_KEY = "c:\\repo";
 const DIGEST = "a".repeat(64);
 
 const TARGET = reviewTargetSpec({ ref: "refs/remotes/origin/main", source: "request" });
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 async function withState(callback) {
   const root = await mkdtemp(path.join(os.tmpdir(), "claude-agents-receipts-"));
@@ -295,6 +304,89 @@ test("a scope-index failure never downgrades an already durable receipt", async 
   });
 });
 
+test("the authoritative fence is adjacent to the receipt rename and excludes scope indexing", async () => {
+  await withState(async (stateRoot) => {
+    const renameIssued = deferred();
+    const allowRename = deferred();
+    const indexReached = deferred();
+    const receipt = receiptFor();
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      renameFn: async (...args) => {
+        renameIssued.resolve();
+        await allowRename.promise;
+        return await rename(...args);
+      },
+      beforeScopeIndex: async () => {
+        indexReached.resolve();
+        await new Promise(() => {});
+      }
+    });
+    const fence = createReceiptPublicationFence();
+    const pending = receipts.put({
+      canonicalRootKey: ROOT_KEY,
+      receipt,
+      publication: fence.publication,
+      awaitIndex: false
+    });
+
+    await renameIssued.promise;
+    assert.equal(fence.publicationStarted(), true);
+    assert.equal(fence.publicationSettled(), false);
+    fence.requestCancellation();
+    allowRename.resolve();
+
+    const stored = await pending;
+    await indexReached.promise;
+    assert.equal(fence.publicationSettled(), true);
+    const settlement = await fence.authoritativeSettlement();
+    assert.equal(settlement.disposition, "published");
+    assert.equal(settlement.reviewId, receipt.reviewId);
+    assert.ok(await stat(stored.path), "authoritative reviews/cs evidence is already durable");
+    assert.equal(
+      await Promise.race([stored.indexing.then(() => "settled"), Promise.resolve("pending")]),
+      "pending",
+      "reviews/sc housekeeping remains outside publication quiescence"
+    );
+  });
+});
+
+test("cancellation before the store rename boundary can never publish a late receipt", async () => {
+  await withState(async (stateRoot) => {
+    const boundaryReached = deferred();
+    const allowBoundary = deferred();
+    const receipt = receiptFor();
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      beforeAuthoritativeRename: async () => {
+        boundaryReached.resolve();
+        await allowBoundary.promise;
+      }
+    });
+    const fence = createReceiptPublicationFence();
+    const pending = receipts.put({
+      canonicalRootKey: ROOT_KEY,
+      receipt,
+      publication: fence.publication,
+      awaitIndex: false
+    });
+    await boundaryReached.promise;
+    fence.requestCancellation();
+    allowBoundary.resolve();
+
+    await assert.rejects(pending, (error) => {
+      assert.equal(error.code, "review_receipt_publication_cancelled");
+      return true;
+    });
+    assert.equal(fence.publicationStarted(), false);
+    const listed = await receipts.listForChangeSet({
+      canonicalRootKey: ROOT_KEY,
+      changeSetId: receipt.binding.changeSetId
+    });
+    assert.deepEqual(listed.receipts, []);
+  });
+});
+
 test("an invalid change-set lookup cannot escape the receipt tree", async () => {
   await withState(async (stateRoot) => {
     const listed = await store(stateRoot).listForChangeSet({
@@ -474,6 +566,7 @@ test("a discovered receipt is fully validated, and a dangling or lying pointer i
       agentType: "code-review",
       targetSpec: TARGET
     });
+    assert.equal(found.status, "partial");
     assert.deepEqual(found.receipts.map((r) => r.reviewId), [receipt.reviewId]);
     assert.equal(found.skipped.length, 4);
     assert.ok(found.skipped.some((entry) => entry.code === "review_pointer_invalid"));
@@ -485,6 +578,7 @@ test("a discovered receipt is fully validated, and a dangling or lying pointer i
       agentType: "code-review",
       targetSpec: TARGET
     });
+    assert.equal(after.status, "partial");
     assert.deepEqual(after.receipts, []);
     const corrupt = after.skipped.find((entry) => entry.code === "review_receipt_corrupt");
     assert.equal(corrupt.reviewId, receipt.reviewId);
@@ -499,6 +593,8 @@ test("discovery on an untouched repository is empty rather than an error", async
       agentType: "code-review",
       targetSpec: TARGET
     });
+    assert.equal(found.status, "complete");
+    assert.equal(found.truncated, false);
     assert.deepEqual(found.receipts, []);
     assert.deepEqual(found.skipped, []);
   });

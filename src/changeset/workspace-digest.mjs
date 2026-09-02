@@ -42,6 +42,12 @@ function fail(reason, detail, cause) {
   });
 }
 
+function ensureCollectionActive(cancelled) {
+  if (cancelled?.()) {
+    fail("collection_deadline_exceeded", "collection was cancelled");
+  }
+}
+
 /**
  * Domain-separated framing, so a symlink whose target string happens to equal a
  * regular file's contents cannot collide with it.
@@ -73,16 +79,18 @@ function statsAgree(before, after) {
   return true;
 }
 
-async function readBlobBytes(absolutePath, size, budget, openFn) {
+async function readBlobBytes(absolutePath, size, budget, openFn, cancelled) {
   if (size > MAX_CONTENT_BYTES_PER_FILE) fail("content_too_large", absolutePath);
   if (budget && size > budget.remainingBytes) fail("content_too_large", absolutePath);
 
+  ensureCollectionActive(cancelled);
   const handle = await openFn(absolutePath, "r");
   try {
     const chunks = [];
     const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
     let total = 0;
     for (;;) {
+      ensureCollectionActive(cancelled);
       const { bytesRead } = await handle.read(buffer, 0, READ_CHUNK_BYTES, null);
       if (bytesRead === 0) break;
       total += bytesRead;
@@ -96,7 +104,8 @@ async function readBlobBytes(absolutePath, size, budget, openFn) {
   }
 }
 
-async function digestOnce(absolutePath, { expect, budget, lstatFn, openFn, readlinkFn }) {
+async function digestOnce(absolutePath, { expect, budget, lstatFn, openFn, readlinkFn, cancelled }) {
+  ensureCollectionActive(cancelled);
   const before = await lstatFn(absolutePath, { bigint: true });
 
   let kind;
@@ -109,10 +118,12 @@ async function digestOnce(absolutePath, { expect, budget, lstatFn, openFn, readl
     fail("unsupported_file_type", absolutePath + " is a " + kind);
   }
 
+  ensureCollectionActive(cancelled);
   const bytes = kind === "link"
     ? await readlinkFn(absolutePath, { encoding: "buffer" })
-    : await readBlobBytes(absolutePath, Number(before.size), budget, openFn);
+    : await readBlobBytes(absolutePath, Number(before.size), budget, openFn, cancelled);
 
+  ensureCollectionActive(cancelled);
   const after = await lstatFn(absolutePath, { bigint: true });
   if (!statsAgree(before, after)) fail("content_unstable", absolutePath);
 
@@ -133,9 +144,10 @@ export async function digestWorkspaceEntry(absolutePath, {
   budget,
   lstatFn = lstat,
   openFn = open,
-  readlinkFn = readlink
+  readlinkFn = readlink,
+  cancelled
 } = {}) {
-  const dependencies = { expect, budget, lstatFn, openFn, readlinkFn };
+  const dependencies = { expect, budget, lstatFn, openFn, readlinkFn, cancelled };
   try {
     return await digestOnce(absolutePath, dependencies);
   } catch (error) {
@@ -147,6 +159,9 @@ export async function digestWorkspaceEntry(absolutePath, {
       fail("content_unreadable", absolutePath, error);
     }
     try {
+      // Cancellation may have arrived while the failed first attempt was in
+      // flight. A retry is a new collection operation and must not begin.
+      ensureCollectionActive(cancelled);
       return await digestOnce(absolutePath, dependencies);
     } catch (retryError) {
       if (retryError instanceof WorkspaceDigestError) throw retryError;

@@ -693,6 +693,7 @@ async function digestEntry(locator, { budget, cancelled, display, lstatFn, openF
   try {
     return await digestWorkspaceEntry(locator, {
       budget,
+      cancelled,
       ...(lstatFn ? { lstatFn } : {}),
       ...(openFn ? { openFn } : {}),
       ...(readlinkFn ? { readlinkFn } : {})

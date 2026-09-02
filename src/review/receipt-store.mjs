@@ -9,6 +9,11 @@ import {
   ReviewReceiptError,
   validateReviewReceipt
 } from "./receipt-schema.mjs";
+import {
+  beginReceiptPublication,
+  receiptPublicationCancelled,
+  settleReceiptPublication
+} from "./publication-fence.mjs";
 
 /**
  * How receipts reach the disk, and how an older one is found again.
@@ -103,8 +108,19 @@ function conflictError(error) {
 export class ReviewReceiptStore {
   #stateRoot;
   #createNonce;
+  #rename;
+  #beforeAuthoritativeRename;
+  #afterAuthoritativeRenameIssued;
+  #beforeScopeIndex;
 
-  constructor({ stateRoot, createNonce = randomUUID } = {}) {
+  constructor({
+    stateRoot,
+    createNonce = randomUUID,
+    renameFn = rename,
+    beforeAuthoritativeRename,
+    afterAuthoritativeRenameIssued,
+    beforeScopeIndex
+  } = {}) {
     if (typeof stateRoot !== "string" || stateRoot.length === 0) {
       throw new ReviewReceiptError("A durable state root is required for the review receipt store.", {
         code: "review_receipt_invalid"
@@ -112,6 +128,10 @@ export class ReviewReceiptStore {
     }
     this.#stateRoot = path.resolve(stateRoot);
     this.#createNonce = createNonce;
+    this.#rename = renameFn;
+    this.#beforeAuthoritativeRename = beforeAuthoritativeRename;
+    this.#afterAuthoritativeRenameIssued = afterAuthoritativeRenameIssued;
+    this.#beforeScopeIndex = beforeScopeIndex;
   }
 
   reviewsDirectory(canonicalRootKey) {
@@ -139,7 +159,7 @@ export class ReviewReceiptStore {
    * nothing. An unindexed receipt is merely harder to discover; a dangling
    * pointer would be a lie that discovery has to defend against on every read.
    */
-  async put({ canonicalRootKey, receipt }) {
+  async put({ canonicalRootKey, receipt, publication, awaitIndex = true }) {
     const validated = validateReviewReceipt(receipt);
     if (!validated) {
       throw new ReviewReceiptError("Refusing to store an invalid review receipt.", {
@@ -181,10 +201,72 @@ export class ReviewReceiptStore {
     await mkdir(staging);
     try {
       await writeFileDurably(path.join(staging, RECEIPT_FILE_NAME), serialized);
+      if (typeof this.#beforeAuthoritativeRename === "function") {
+        await this.#beforeAuthoritativeRename({ receipt: validated, finalPath });
+      }
+      if (receiptPublicationCancelled(publication)) {
+        throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
+          code: "review_receipt_publication_cancelled"
+        });
+      }
+
+      // This is the authoritative boundary: the cancellation check, authority
+      // marker and reviews/cs rename invocation are synchronous and adjacent.
+      // The later reviews/sc pointer is explicitly outside this fence.
+      if (publication && !beginReceiptPublication(publication)) {
+        throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
+          code: "review_receipt_publication_cancelled"
+        });
+      }
+
+      let renameIssued;
       try {
-        await rename(staging, finalDirectory);
-        stored = "created";
+        renameIssued = this.#rename(staging, finalDirectory);
       } catch (error) {
+        settleReceiptPublication(publication, {
+          status: "settled",
+          disposition: "failed",
+          reviewId: validated.reviewId,
+          changeSetId: validated.binding.changeSetId,
+          errorCode: error?.code || "rename_failed"
+        });
+        throw error;
+      }
+      const authoritative = Promise.resolve(renameIssued).then(
+        () => {
+          settleReceiptPublication(publication, {
+            status: "settled",
+            disposition: "published",
+            reviewId: validated.reviewId,
+            changeSetId: validated.binding.changeSetId
+          });
+          return { published: true };
+        },
+        (error) => {
+          settleReceiptPublication(publication, {
+            status: "settled",
+            disposition: conflictError(error) ? "conflict" : "failed",
+            reviewId: validated.reviewId,
+            changeSetId: validated.binding.changeSetId,
+            errorCode: error?.code || "rename_failed"
+          });
+          return { error };
+        }
+      );
+      void authoritative.catch(() => {});
+      if (typeof this.#afterAuthoritativeRenameIssued === "function") {
+        await this.#afterAuthoritativeRenameIssued({
+          receipt: validated,
+          finalPath,
+          authoritative
+        });
+      }
+
+      const renameOutcome = await authoritative;
+      if (!renameOutcome.error) {
+        stored = "created";
+      } else {
+        const error = renameOutcome.error;
         if (!conflictError(error)) throw error;
         // Something is already there. Identical content is an idempotent
         // repeat; different content under the same truncated prefix is a
@@ -202,8 +284,14 @@ export class ReviewReceiptStore {
       if (await pathExists(staging)) await rm(staging, { recursive: true, force: true });
     }
 
-    await this.#recordPointer(canonicalRootKey, validated);
-    return Object.freeze({ stored, path: finalPath });
+    // Scope indexing is non-evidentiary housekeeping. It starts after the
+    // durable receipt is settled and is intentionally not awaited by put(), so
+    // a stalled reviews/sc directory can neither downgrade the receipt nor
+    // retain coherent-review custody.
+    const indexing = this.#recordPointer(canonicalRootKey, validated);
+    void indexing.catch(() => {});
+    if (awaitIndex) await indexing;
+    return Object.freeze({ stored, path: finalPath, indexing });
   }
 
   async #listReceiptDirectories(changeSetDirectory) {
@@ -218,6 +306,9 @@ export class ReviewReceiptStore {
 
   async #recordPointer(canonicalRootKey, receipt) {
     try {
+      if (typeof this.#beforeScopeIndex === "function") {
+        await this.#beforeScopeIndex({ receipt });
+      }
       const scopeKey = reviewScopeKey({
         agentType: receipt.reviewer.agentType,
         targetSpec: receipt.binding.target.spec
@@ -325,14 +416,20 @@ export class ReviewReceiptStore {
       names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort().reverse();
     } catch (error) {
       if (error?.code === "ENOENT") {
-        return Object.freeze({ receipts: Object.freeze([]), skipped: Object.freeze([]) });
+        return Object.freeze({
+          status: "complete",
+          receipts: Object.freeze([]),
+          skipped: Object.freeze([]),
+          truncated: false
+        });
       }
       throw error;
     }
 
     const receipts = [];
     const skipped = [];
-    for (const name of names.slice(0, limit)) {
+    const selected = names.slice(0, limit);
+    for (const name of selected) {
       let pointer;
       try {
         pointer = JSON.parse(await readFile(path.join(directory, name), "utf8"));
@@ -378,6 +475,12 @@ export class ReviewReceiptStore {
       }
       receipts.push(outcome.receipt);
     }
-    return Object.freeze({ receipts: Object.freeze(receipts), skipped: Object.freeze(skipped) });
+    const truncated = names.length > selected.length;
+    return Object.freeze({
+      status: skipped.length > 0 || truncated ? "partial" : "complete",
+      receipts: Object.freeze(receipts),
+      skipped: Object.freeze(skipped),
+      truncated
+    });
   }
 }

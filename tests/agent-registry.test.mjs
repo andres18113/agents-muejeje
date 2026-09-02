@@ -381,7 +381,7 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
   assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /env:\s*process\.env,/);
   // No process is ever terminated by name, anywhere in the tree.
   for (const name of sourceFiles) {
-    assert.doesNotMatch(sourceByFile[name], /\/IM/, name + " must not kill by image name");
+    assert.doesNotMatch(sourceByFile[name], /\/IM\b/, name + " must not kill by image name");
     assert.doesNotMatch(sourceByFile[name], /imagename/iu, name + " must not kill by image name");
   }
 
@@ -427,13 +427,24 @@ test("tracked routing policy and documentation name only the consolidated profil
   assert.match(routingPolicy, /`unbound` means no verified review subject exists/);
   assert.doesNotMatch(routingPolicy, /delegate_agent\(agent_type="verify"\)/);
   assert.doesNotMatch(readme, /agents\/verify\.md/);
-  assert.match(readme, /npm ci/);
-  assert.match(readme, /npm run ci/);
+  assert.match(readme, /npm\.cmd ci/);
+  assert.match(readme, /npm\.cmd run ci/);
+  assert.match(readme, /npm\.cmd run check:text/);
   assert.match(readme, /policy\/codex-agent-routing\.md/);
   assert.match(readme, /The orchestrator excluded its own managed writers during the review interval/);
   assert.match(readme, /CLAUDE_AGENTS_REVIEW_BINDING/);
-  assert.match(installer, /Run: npm ci/);
+  // Windows-correct prerequisite diagnostics: the installer must resolve and
+  // report the real Node/npm/Codex/Claude it will register, refuse an
+  // unsupported Node major, and quote commands that actually run in PowerShell.
+  assert.match(installer, /Run: npm\.cmd ci; then run: npm\.cmd run ci/);
+  assert.match(installer, /Get-Command npm\.cmd -ErrorAction Stop/);
+  assert.match(installer, /Node\.js 20 or newer is required/);
+  assert.match(installer, /Write-Host "npm:\s+\$NpmVersion \(\$Npm\)"/);
+  assert.match(installer, /Write-Host "Codex:\s+\$CodexVersion \(\$Codex\)"/);
+  assert.match(installer, /Write-Host "Claude:\s+\$ClaudeVersion \(\$Claude\)"/);
+  assert.doesNotMatch(installer, /^& codex /mu);
   assert.doesNotMatch(installer, /AGENTS\.md/);
+  assert.match(readme, /npm\.cmd run diagnose/);
 
   for (const legacyIdentifier of ["claude_review", "claude_critic", "claude_verify"]) {
     assert.equal(routingPolicy.includes(legacyIdentifier), false);

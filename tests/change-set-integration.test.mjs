@@ -465,7 +465,8 @@ test("after the repository changes, the earlier review is discovered and reporte
     assert.equal(prior.verdict, "STALE");
     assert.deepEqual(prior.changedSections, ["worktree"]);
 
-    assert.match(formatDelegateAgentOutcome(second), /PriorReviews: \d+ for this review scope/u);
+    assert.match(formatDelegateAgentOutcome(second), /ReceiptHistoryStatus: complete/u);
+    assert.match(formatDelegateAgentOutcome(second), /PriorReviews: \d+/u);
   });
 });
 

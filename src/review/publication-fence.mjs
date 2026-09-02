@@ -31,12 +31,28 @@ export const RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS = 30_000;
 
 export function createReceiptPublicationFence() {
   const controller = new AbortController();
-  const guard = { publicationStarted: false };
+  const guard = { publicationStarted: false, publicationSettled: false };
+  let resolveSettlement;
+  const settlement = new Promise((resolve) => {
+    resolveSettlement = resolve;
+  });
+  const publication = Object.freeze({
+    signal: controller.signal,
+    guard,
+    settle: (result) => {
+      if (!guard.publicationStarted || guard.publicationSettled) return false;
+      guard.publicationSettled = true;
+      resolveSettlement(Object.freeze({ ...result }));
+      return true;
+    }
+  });
   return Object.freeze({
-    /** Handed to the binder; it is the only thing that may set the guard. */
-    publication: Object.freeze({ signal: controller.signal, guard }),
+    /** Handed through the binder to the receipt store. */
+    publication,
     requestCancellation: () => controller.abort(),
     publicationStarted: () => guard.publicationStarted === true,
+    publicationSettled: () => guard.publicationSettled === true,
+    authoritativeSettlement: () => settlement,
     cancellationRequested: () => controller.signal.aborted === true
   });
 }
@@ -55,5 +71,19 @@ export function receiptPublicationCancelled(publication) {
  * what makes "cancelled" and "started" mutually exclusive.
  */
 export function beginReceiptPublication(publication) {
-  if (publication?.guard) publication.guard.publicationStarted = true;
+  if (!publication?.guard || receiptPublicationCancelled(publication)) return false;
+  if (publication.guard.publicationStarted) {
+    throw new Error("Receipt publication authority may be crossed only once.");
+  }
+  publication.guard.publicationStarted = true;
+  return true;
+}
+
+/**
+ * Records that the authoritative rename attempt has settled. It says nothing
+ * about later scope-index housekeeping, which is deliberately outside the
+ * evidence publication boundary.
+ */
+export function settleReceiptPublication(publication, result) {
+  return publication?.settle?.(result) === true;
 }

@@ -8,9 +8,12 @@ import { reviewTargetSpec } from "../src/changeset/target.mjs";
 import { delegateAgent } from "../src/delegate-agent.mjs";
 import { COHERENCE } from "../src/review/coherent-admission.mjs";
 import {
+  beginReceiptPublication,
   createReceiptPublicationFence,
-  receiptPublicationCancelled
+  receiptPublicationCancelled,
+  settleReceiptPublication
 } from "../src/review/publication-fence.mjs";
+import { projectDelegateAgentOutcome } from "../src/delegate-outcome.mjs";
 import { createReviewBinder } from "../src/review/review-binding.mjs";
 import { validateReviewReceipt } from "../src/review/receipt-schema.mjs";
 
@@ -117,8 +120,24 @@ function reviewWorld({ beforeReceiptPublication, afterReceiptPublicationIssued }
   const receipts = [];
   const receiptStore = {
     async put(entry) {
-      events.push("receipt-durable");
-      receipts.push(entry.receipt);
+      await beforeReceiptPublication?.({ receipt: entry.receipt });
+      if (!beginReceiptPublication(entry.publication)) {
+        throw Object.assign(new Error("publication cancelled"), {
+          code: "review_receipt_publication_cancelled"
+        });
+      }
+      const authoritative = Promise.resolve().then(() => {
+        events.push("receipt-durable");
+        receipts.push(entry.receipt);
+        settleReceiptPublication(entry.publication, {
+          status: "settled",
+          disposition: "published",
+          reviewId: entry.receipt.reviewId,
+          changeSetId: entry.receipt.binding.changeSetId
+        });
+      });
+      await afterReceiptPublicationIssued?.({ receipt: entry.receipt, authoritative });
+      await authoritative;
       return { stored: "created", path: "receipt.json" };
     },
     async listForChangeSet() { return { receipts: [], skipped: [] }; },
@@ -128,9 +147,7 @@ function reviewWorld({ beforeReceiptPublication, afterReceiptPublicationIssued }
     collectChangeSet: async () => exactCollection(),
     coherentAdmission: { verifyStillHeld: async () => ({ held: true }) },
     receiptStore,
-    now: () => 1_000,
-    beforeReceiptPublication,
-    afterReceiptPublicationIssued
+    now: () => 1_000
   });
   return { events, receipts, receiptStore, binder };
 }
@@ -224,7 +241,7 @@ test("a publication already issued cannot have its authority withdrawn", async (
  * ordering claim is about real custody release rather than about the binder in
  * isolation.
  */
-function delegationWorld({ afterHook, quiescenceTimeoutMs, afterTimeoutMs = 10 } = {}) {
+function delegationWorld({ afterHook, quiescenceTimeoutMs, afterTimeoutMs = 10, runAgent } = {}) {
   const events = [];
   const receipts = [];
   const writeCustody = {
@@ -273,7 +290,7 @@ function delegationWorld({ afterHook, quiescenceTimeoutMs, afterTimeoutMs = 10 }
         async admit() { return { coherence: COHERENCE.HELD, record: { state: "RESERVED" } }; }
       },
       reviewBinder,
-      runAgent: completedReviewRunner(),
+      runAgent: runAgent || completedReviewRunner(),
       reviewBindingAfterTimeoutMs: afterTimeoutMs,
       ...(quiescenceTimeoutMs === undefined ? {} : { reviewReceiptQuiescenceTimeoutMs: quiescenceTimeoutMs })
     }
@@ -285,10 +302,16 @@ test("custody release never overtakes a receipt write that was already issued", 
     afterHook: async ({ publication, events, receipts }) => {
       // Cross the boundary immediately, then stay in flight well past the
       // AFTER deadline. The delegation must wait rather than release.
-      publication.guard.publicationStarted = true;
+      beginReceiptPublication(publication);
       await new Promise((resolve) => setTimeout(resolve, 120));
       events.push("receipt-durable");
       receipts.push("rr1");
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
       return { status: "bound", coherence: COHERENCE.HELD, reasons: [], priorReviews: [] };
     },
     afterTimeoutMs: 10,
@@ -321,8 +344,14 @@ test("custody release never overtakes a receipt write that was already issued", 
 test("a late binding result is never discarded in favour of the timer's guess", async () => {
   const world = delegationWorld({
     afterHook: async ({ publication }) => {
-      publication.guard.publicationStarted = true;
+      beginReceiptPublication(publication);
       await new Promise((resolve) => setTimeout(resolve, 60));
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
       return {
         status: "bound",
         coherence: COHERENCE.HELD,
@@ -354,7 +383,7 @@ test("a late binding result is never discarded in favour of the timer's guess", 
 test("a publication that never quiesces retains custody instead of releasing it", async () => {
   const world = delegationWorld({
     afterHook: ({ publication, events, receipts }) => {
-      publication.guard.publicationStarted = true;
+      beginReceiptPublication(publication);
       // Never settles: the deadline observed uncertainty and proved nothing.
       return new Promise(() => {
         events.push("publication-in-flight");
@@ -382,6 +411,256 @@ test("a publication that never quiesces retains custody instead of releasing it"
   assert.ok(codes.includes("review_binding_timeout"));
   assert.ok(codes.includes("review_receipt_publication_unquiesced"));
   assert.ok(codes.includes("coherent_admission_retained"));
+});
+
+test("a publication settling after the quiescence timeout takes the guarded late-release path", async () => {
+  const maySettle = deferred();
+  const lateReleaseObserved = deferred();
+  const world = delegationWorld({
+    afterHook: async ({ publication, events, receipts }) => {
+      beginReceiptPublication(publication);
+      events.push("publication-in-flight");
+      await maySettle.promise;
+      receipts.push("durable");
+      events.push("receipt-durable");
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
+      return {
+        status: "bound",
+        coherence: COHERENCE.HELD,
+        reasons: [],
+        changeSetId: "cs1:" + "a".repeat(64),
+        reviewId: "rr1:" + "b".repeat(64),
+        priorReviews: []
+      };
+    },
+    afterTimeoutMs: 10,
+    quiescenceTimeoutMs: 20
+  });
+  world.dependencies.onLateReviewPublicationRelease = (diagnostic) => {
+    if (diagnostic.status === "released") lateReleaseObserved.resolve();
+  };
+
+  const outcome = await delegateAgent(
+    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    world.dependencies
+  );
+  assert.equal(outcome.custodyState, "retained");
+  assert.equal(
+    outcome.recoveryDiagnostics.mode,
+    "same-coordinator-publication-settlement"
+  );
+  assert.deepEqual(world.events, ["publication-in-flight"]);
+
+  maySettle.resolve();
+  await lateReleaseObserved.promise;
+  assert.deepEqual(
+    world.events,
+    ["publication-in-flight", "receipt-durable", "custody-released"],
+    "the same publication must settle before the same coordinator releases custody"
+  );
+});
+
+test("settled authoritative publication is enough to release even if later housekeeping stalls", async () => {
+  const world = delegationWorld({
+    afterHook: async ({ publication, events, receipts }) => {
+      beginReceiptPublication(publication);
+      receipts.push("durable");
+      events.push("receipt-durable");
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
+      await new Promise(() => {});
+    },
+    afterTimeoutMs: 10,
+    quiescenceTimeoutMs: 20
+  });
+
+  const outcome = await delegateAgent(
+    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    world.dependencies
+  );
+  assert.equal(outcome.custodyState, "released");
+  assert.equal(outcome.reviewBinding.status, "bound");
+  assert.equal(outcome.reviewBinding.publication.status, "authoritative-settled");
+  assert.deepEqual(world.events, ["receipt-durable", "custody-released"]);
+});
+
+test("a binder that fails after crossing the boundary still cannot release custody", async () => {
+  // A rejection is not a withdrawal of authority. The receipt write this binder
+  // issued is still live when the binder itself fails, so custody must be held
+  // exactly as it would be for a binder that simply never returned.
+  const maySettle = deferred();
+  const lateReleaseObserved = deferred();
+  const world = delegationWorld({
+    afterHook: async ({ publication, events, receipts }) => {
+      beginReceiptPublication(publication);
+      events.push("publication-in-flight");
+      void maySettle.promise.then(() => {
+        receipts.push("durable");
+        events.push("receipt-durable");
+        settleReceiptPublication(publication, {
+          status: "settled",
+          disposition: "published",
+          reviewId: "rr1:" + "b".repeat(64),
+          changeSetId: "cs1:" + "a".repeat(64)
+        });
+      });
+      throw Object.assign(new Error("binder failed after publishing"), {
+        code: "binder_failed_late"
+      });
+    },
+    afterTimeoutMs: 200,
+    quiescenceTimeoutMs: 20
+  });
+  world.dependencies.onLateReviewPublicationRelease = (diagnostic) => {
+    if (diagnostic.status === "released") lateReleaseObserved.resolve();
+  };
+
+  const outcome = await delegateAgent(
+    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    world.dependencies
+  );
+  assert.equal(outcome.status, "completed", "a binder failure never changes the execution");
+  assert.equal(outcome.custodyState, "retained");
+  assert.deepEqual(
+    world.events,
+    ["publication-in-flight"],
+    "custody must not be released while an authorized receipt write is still live"
+  );
+  const codes = outcome.reviewBinding.reasons.map((reason) => reason.code);
+  assert.ok(codes.includes("review_binding_internal_error"));
+  assert.ok(codes.includes("review_receipt_publication_unquiesced"));
+  assert.equal(
+    codes.includes("review_binding_timeout"),
+    false,
+    "a rejection observed inside the bound is not a timeout"
+  );
+  assert.equal(outcome.reviewBinding.publication.status, "authoritative-pending");
+  assert.equal(
+    outcome.recoveryDiagnostics.mode,
+    "same-coordinator-publication-settlement"
+  );
+
+  maySettle.resolve();
+  await lateReleaseObserved.promise;
+  assert.deepEqual(
+    world.events,
+    ["publication-in-flight", "receipt-durable", "custody-released"]
+  );
+});
+
+test("a returned binding survives a publication that never quiesces", async () => {
+  // The binder produced real evidence and the deadline proved nothing about the
+  // write. Retaining custody is right; discarding the identities the binder
+  // already established is not.
+  const world = delegationWorld({
+    afterHook: ({ publication, events }) => {
+      beginReceiptPublication(publication);
+      events.push("publication-in-flight");
+      return {
+        status: "bound",
+        coherence: COHERENCE.HELD,
+        reasons: [],
+        changeSetId: "cs1:" + "a".repeat(64),
+        beforeChangeSetId: "cs1:" + "a".repeat(64),
+        afterChangeSetId: "cs1:" + "a".repeat(64),
+        reviewId: "rr1:" + "b".repeat(64),
+        priorReviews: [],
+        receiptHistory: { status: "complete", receipts: [], diagnostics: [] }
+      };
+    },
+    afterTimeoutMs: 200,
+    quiescenceTimeoutMs: 20
+  });
+
+  const outcome = await delegateAgent(
+    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    world.dependencies
+  );
+  assert.equal(outcome.custodyState, "retained");
+  assert.equal(outcome.reviewBinding.status, "bound");
+  assert.equal(outcome.reviewBinding.beforeChangeSetId, "cs1:" + "a".repeat(64));
+  assert.equal(outcome.reviewBinding.afterChangeSetId, "cs1:" + "a".repeat(64));
+  assert.equal(outcome.reviewBinding.reviewId, "rr1:" + "b".repeat(64));
+  assert.equal(outcome.reviewBinding.publication.status, "authoritative-pending");
+  assert.equal(outcome.reviewBinding.publication.settled, false);
+  assert.deepEqual(world.events, ["publication-in-flight"]);
+
+  const projected = projectDelegateAgentOutcome(outcome);
+  assert.equal(projected.review.status, "bound");
+  assert.equal(projected.review.beforeChangeSetId, "cs1:" + "a".repeat(64));
+  assert.equal(projected.review.afterChangeSetId, "cs1:" + "a".repeat(64));
+  assert.equal(projected.review.publication.settled, false);
+  assert.equal(projected.custody.retained, true);
+  assert.equal(
+    projected.custody.recovery.mode,
+    "same-coordinator-publication-settlement"
+  );
+});
+
+test("the late release is never more permissive than the synchronous one", async () => {
+  // Same retained-unquiesced situation, but this run has no terminal proof.
+  // The synchronous path would have orphaned rather than released here, so the
+  // late path must refuse too: a bounded wait cannot buy release authority
+  // that the evidence never granted.
+  const maySettle = deferred();
+  const lateOutcome = deferred();
+  const startedWithoutProof = async (argumentsForRunner) => {
+    await argumentsForRunner.onChildStarted?.(Object.freeze({
+      executionId: "fence-execution",
+      agentType: "code-review",
+      repositoryRoot: WORKSPACE.repositoryRoot,
+      pid: 42_001,
+      startTime: "4200001",
+      source: "publication-fence-test",
+      startedAt: 1
+    }));
+    return { result: "review result", durationMs: 5, processStarted: true };
+  };
+  const world = delegationWorld({
+    runAgent: startedWithoutProof,
+    afterHook: async ({ publication, events }) => {
+      beginReceiptPublication(publication);
+      events.push("publication-in-flight");
+      await maySettle.promise;
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
+      return { status: "bound", coherence: COHERENCE.HELD, reasons: [], priorReviews: [] };
+    },
+    afterTimeoutMs: 10,
+    quiescenceTimeoutMs: 20
+  });
+  world.dependencies.onLateReviewPublicationRelease = (diagnostic) => {
+    lateOutcome.resolve(diagnostic);
+  };
+
+  const outcome = await delegateAgent(
+    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    world.dependencies
+  );
+  assert.equal(outcome.custodyState, "retained");
+
+  maySettle.resolve();
+  const diagnostic = await lateOutcome.promise;
+  assert.equal(diagnostic.status, "retained");
+  assert.equal(diagnostic.errorCode, "terminal_proof_unavailable");
+  assert.equal(
+    world.events.includes("custody-released"),
+    false,
+    "no release may happen without the terminal evidence the synchronous path requires"
+  );
 });
 
 test("a binding that never reaches its boundary releases custody at once", async () => {
@@ -412,8 +691,23 @@ test("a real binder cancelled at its gate leaves no receipt and still releases c
   const receipts = [];
   const receiptStore = {
     async put(entry) {
+      events.push("at-publication-gate");
+      // Parked well past the AFTER deadline, so cancellation lands strictly
+      // before the store's authoritative rename boundary.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (!beginReceiptPublication(entry.publication)) {
+        throw Object.assign(new Error("publication cancelled"), {
+          code: "review_receipt_publication_cancelled"
+        });
+      }
       events.push("receipt-durable");
       receipts.push(entry.receipt);
+      settleReceiptPublication(entry.publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: entry.receipt.reviewId,
+        changeSetId: entry.receipt.binding.changeSetId
+      });
       return { stored: "created", path: "receipt.json" };
     },
     async listForChangeSet() { return { receipts: [], skipped: [] }; },
@@ -425,13 +719,7 @@ test("a real binder cancelled at its gate leaves no receipt and still releases c
     receiptStore,
     // The delegation stamps the execution with a real clock, and a receipt is
     // only valid when it was recorded no earlier than the execution completed.
-    now: Date.now,
-    beforeReceiptPublication: async () => {
-      events.push("at-publication-gate");
-      // Parked well past the AFTER deadline, so cancellation lands strictly
-      // before the boundary.
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
+    now: Date.now
   });
 
   const writeCustody = {

@@ -2,6 +2,7 @@ import { canonicalJson, sha256Hex } from "../canonical-json.mjs";
 import { SECTION_NAMES, changeSetIdFromSectionDigests } from "../changeset/descriptor.mjs";
 import { validateReviewTargetContext } from "../changeset/target.mjs";
 import { AGENT_REGISTRY } from "../agent-registry.mjs";
+import { isSupportedReasoningEffort } from "../reasoning-effort.mjs";
 
 /**
  * What a review receipt legally is.
@@ -50,7 +51,6 @@ const CHANGE_SET_ID = /^cs1:[0-9a-f]{64}$/u;
 const REVIEW_ID = /^rr1:[0-9a-f]{64}$/u;
 const MODEL_SELECTOR_SOURCES = new Set(["default", "operator-override"]);
 const MODEL_STRATEGIES = new Set(["configurable", "inherit", "complementary"]);
-const REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 
 function hasExactKeys(value, keys) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -180,7 +180,7 @@ export function validateReviewReceipt(value) {
     if (typeof reviewer.modelSelector !== "string" || reviewer.modelSelector.length === 0) return undefined;
     if (!MODEL_SELECTOR_SOURCES.has(reviewer.modelSelectorSource)) return undefined;
     if (!MODEL_STRATEGIES.has(reviewer.modelStrategy)) return undefined;
-    if (!REASONING_EFFORTS.has(reviewer.reasoningEffort)) return undefined;
+    if (!isSupportedReasoningEffort(reviewer.reasoningEffort)) return undefined;
 
     if (!hasExactKeys(assignment, ["sha256", "chars"])) return undefined;
     if (!HEX_64.test(assignment.sha256)) return undefined;

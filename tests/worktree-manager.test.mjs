@@ -15,7 +15,8 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { delegateAgent } from "../src/delegate-agent.mjs";
+import { delegateAgent, formatDelegateAgentOutcome } from "../src/delegate-agent.mjs";
+import { projectDelegateAgentOutcome } from "../src/delegate-outcome.mjs";
 import { PROCESS_IDENTITY_STATUS } from "../src/process-identity.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
 import {
@@ -846,5 +847,33 @@ test("an unproven Git termination leaves the operation identity on the record", 
     // The exact Git process identity survives for reconciliation.
     assert.equal(retained.gitOperation.kind, "worktree-add");
     assert.ok(Number.isSafeInteger(retained.gitOperation.pid));
+
+    // Nothing deletes what Git may already have created, so the outcome has to
+    // say where it is. "A worktree may exist somewhere" is not actionable.
+    const expectedWorktreeRoot = custody.worktreeRootFor({
+      canonicalRootKey: repositoryKey,
+      executionId: "unproven-preparation"
+    });
+    assert.equal(outcome.retainedWorktreeRoot, expectedWorktreeRoot);
+    assert.equal(outcome.worktreeRoot, undefined, "the delegation never adopted it");
+    const formatted = formatDelegateAgentOutcome(outcome);
+    assert.match(formatted, /RetainedWorktreeRoot: /u);
+    assert.match(formatted, /CustodyReasons: worktree-preparation-ambiguous/u);
+    assert.match(formatted, /RecoveryMode: manual-required/u);
+    assert.match(formatted, /ManualInterventionRequired: true/u);
+
+    const projected = projectDelegateAgentOutcome(outcome);
+    assert.equal(projected.workspace.worktree.root, expectedWorktreeRoot);
+    assert.equal(projected.workspace.worktree.retained, true);
+    assert.equal(projected.workspace.worktree.adopted, false);
+    assert.equal(projected.custody.orphaned, true);
+    assert.equal(projected.custody.recovery.manualInterventionRequired, true);
+    assert.equal(projected.custody.recovery.mode, "manual-required");
+    assert.equal(projected.custody.recovery.reason, "worktree-preparation-ambiguous");
+    assert.deepEqual(
+      projected.custody.reasons.map((reason) => reason.code),
+      ["worktree-preparation-ambiguous"]
+    );
+    assert.equal(projected.custody.termination.processStarted, false);
   });
 });

@@ -22,6 +22,11 @@ import {
 } from "../src/review/receipt-basis.mjs";
 import { resolveCapabilityPolicy } from "../src/capability-policy.mjs";
 import { getAgentProfile } from "../src/agent-registry.mjs";
+import { resolveAgentRuntime } from "../src/delegate-agent.mjs";
+import {
+  SUPPORTED_REASONING_EFFORTS,
+  isSupportedReasoningEffort
+} from "../src/reasoning-effort.mjs";
 
 const DIGEST = "a".repeat(64);
 
@@ -97,6 +102,50 @@ test("a receipt round-trips through canonical JSON and verifies itself", () => {
   const revived = validateReviewReceipt(JSON.parse(canonicalJson(receipt)));
   assert.ok(revived);
   assert.equal(revived.reviewId, receipt.reviewId);
+});
+
+test("runtime and receipt validation share the complete reasoning-effort domain", () => {
+  // One domain, exercised end to end: a runtime this server will resolve must
+  // stay representable as durable review evidence. A private second copy is
+  // how `xhigh` and `max` became valid to run and impossible to record.
+  assert.deepEqual(SUPPORTED_REASONING_EFFORTS, ["low", "medium", "high", "xhigh", "max"]);
+  const profile = getAgentProfile("code-review");
+  for (const reasoningEffort of SUPPORTED_REASONING_EFFORTS) {
+    assert.equal(isSupportedReasoningEffort(reasoningEffort), true);
+
+    // The runtime resolver accepts it ...
+    const runtime = resolveAgentRuntime({ ...profile, reasoningEffort }, { env: {} });
+    assert.equal(runtime.reasoningEffort, reasoningEffort);
+
+    // ... the reviewer basis carries exactly it ...
+    const reviewer = reviewerBasis({
+      agentType: profile.id,
+      contract: "contract text",
+      capabilityPolicy: resolveCapabilityPolicy(profile),
+      runtime
+    });
+    assert.equal(reviewer.reasoningEffort, reasoningEffort);
+
+    // ... and validation admits the receipt built from that basis.
+    const receipt = buildReviewReceipt({ ...parts(), reviewer });
+    const validated = validateReviewReceipt(receipt);
+    assert.equal(validated?.reviewer.reasoningEffort, reasoningEffort);
+    assert.equal(validated?.reviewId, receipt.reviewId);
+  }
+
+  assert.equal(isSupportedReasoningEffort("ultra"), false);
+  assert.throws(
+    () => buildReviewReceipt({
+      ...parts(),
+      reviewer: { ...parts().reviewer, reasoningEffort: "ultra" }
+    }),
+    { code: "review_receipt_invalid" },
+    "an effort outside the shared domain is refused as evidence"
+  );
+  assert.throws(
+    () => resolveAgentRuntime({ ...profile, reasoningEffort: "ultra" }, { env: {} }),
+    /unsupported reasoning effort/u
+  );
 });
 
 test("the review id is computed with the field absent, never with a placeholder", () => {

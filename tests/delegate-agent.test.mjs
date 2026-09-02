@@ -20,6 +20,10 @@ import {
   resolveDelegationWorkingDirectory
 } from "../src/delegate-agent.mjs";
 import {
+  delegateAgentOutputSchema,
+  projectDelegateAgentOutcome
+} from "../src/delegate-outcome.mjs";
+import {
   ClaudeExitError,
   ClaudeOutputCaptureOverflowError,
   ClaudeRunnerError,
@@ -1307,6 +1311,8 @@ test("contract-loader failures become MCP errors and do not call the runner", as
   });
   assert.equal(registration.name, "delegate_agent");
   assert.equal(response.isError, true);
+  assert.equal(delegateAgentOutputSchema.safeParse(response.structuredContent).success, true);
+  assert.equal(response.structuredContent.status, "rejected");
   assert.match(response.content[0].text, /delegate_agent failed:\ncontract missing for test/);
 });
 
@@ -1339,8 +1345,12 @@ test("MCP handler exposes completed metadata and treats failed execution as an e
   });
   assert.equal(registration.name, "delegate_agent");
   assert.equal(registration.definition.inputSchema, delegateAgentInputSchema);
+  assert.equal(registration.definition.outputSchema, delegateAgentOutputSchema);
   const success = await registration.handler({ agent_type: "explore", task: "inspect", cwd: projectRoot });
   assert.equal(success.isError, undefined);
+  assert.equal(delegateAgentOutputSchema.safeParse(success.structuredContent).success, true);
+  assert.equal(success.structuredContent.schema, "claude-agents-mcp/delegate-outcome/v1");
+  assert.equal(success.structuredContent.execution.id, "execution-success");
   assert.match(success.content[0].text, /Agent: explore/);
   assert.match(success.content[0].text, /ExecutionId: execution-success/);
   assert.match(success.content[0].text, /Status: completed/);
@@ -1370,6 +1380,8 @@ test("MCP handler exposes completed metadata and treats failed execution as an e
   });
   const failure = await registration.handler({ agent_type: "explore", task: "inspect" });
   assert.equal(failure.isError, true);
+  assert.equal(delegateAgentOutputSchema.safeParse(failure.structuredContent).success, true);
+  assert.equal(failure.structuredContent.execution.error.code, "claude_timeout");
   assert.match(failure.content[0].text, /Status: timeout/);
   assert.match(failure.content[0].text, /Error: timed out/);
 });
@@ -2712,6 +2724,16 @@ test("a later exact close releases same-coordinator ORPHANED custody", async () 
   const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
   assert.equal(outcome.custodyState, "orphaned");
   assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+  const publicOutcome = projectDelegateAgentOutcome(outcome);
+  assert.equal(publicOutcome.custody.orphaned, true);
+  assert.equal(publicOutcome.custody.durableState, "orphaned");
+  assert.equal(publicOutcome.custody.termination.processIdentity, "recorded");
+  assert.equal(publicOutcome.custody.termination.terminalProof, "unavailable");
+  assert.equal(publicOutcome.custody.recovery.automatic, true);
+  assert.equal(
+    publicOutcome.custody.recovery.mode,
+    "same-coordinator-terminal-proof"
+  );
 
   child.emit("close", null, "SIGTERM");
   await afterRunnerStarts();

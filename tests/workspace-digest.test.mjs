@@ -245,3 +245,42 @@ test("a vanished file is retried once and then reported unreadable", async () =>
   );
   assert.equal(attempts, 2);
 });
+
+test("cancellation during an in-flight digest prevents every later filesystem operation", async () => {
+  const controller = new AbortController();
+  let finishFirstLstat;
+  const firstLstat = new Promise((resolve) => {
+    finishFirstLstat = resolve;
+  });
+  const operations = [];
+
+  const pending = digestWorkspaceEntry("C:\\repo\\cancelled.txt", {
+    cancelled: () => controller.signal.aborted,
+    lstatFn: async () => {
+      operations.push("lstat-before");
+      await firstLstat;
+      return stat({ size: 4 });
+    },
+    openFn: async () => {
+      operations.push("open");
+      return fileHandle(Buffer.from("data", "utf8"));
+    },
+    readlinkFn: async () => {
+      operations.push("readlink");
+      return Buffer.alloc(0);
+    }
+  });
+
+  controller.abort();
+  finishFirstLstat();
+
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.reason, "collection_deadline_exceeded");
+    return true;
+  });
+  assert.deepEqual(
+    operations,
+    ["lstat-before"],
+    "open, read, after-stat and retry must not begin after cancellation"
+  );
+});

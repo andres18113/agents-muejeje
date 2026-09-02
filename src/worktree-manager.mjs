@@ -24,6 +24,10 @@ export class WorktreeManagerError extends Error {
     // it to die and any launched taskkill helper also proved its own close.
     // Never implied by a timeout alone.
     this.terminationProven = options.terminationProven === true;
+    // Where a partially or fully created worktree may have been left. Nothing
+    // here ever deletes one, so a failure that omits the location is not an
+    // actionable diagnostic.
+    if (typeof options.worktreeRoot === "string") this.worktreeRoot = options.worktreeRoot;
   }
 }
 
@@ -210,11 +214,38 @@ export class GitWorktreeManager {
    *   workspaceRoot  the isolated worktree the worker actually operates in
    *   effectiveCwd   the requested directory re-anchored inside workspaceRoot
    */
-  async prepare({ executionId, canonicalRepositoryKey, repositoryRoot, effectiveCwd }) {
+  async prepare(request) {
     const workspaceRoot = this.#writeCustody.worktreeRootFor({
-      canonicalRootKey: canonicalRepositoryKey,
-      executionId
+      canonicalRootKey: request.canonicalRepositoryKey,
+      executionId: request.executionId
     });
+    try {
+      return await this.#prepareInto(workspaceRoot, request);
+    } catch (error) {
+      // Preparation never removes what Git may already have created, so the
+      // retained location travels with the failure. "A worktree may exist" is
+      // not something an operator can act on without being told where.
+      if (
+        error && typeof error === "object" &&
+        error.worktreeRoot === undefined &&
+        Object.isExtensible(error)
+      ) {
+        // Annotating must never be able to replace the real failure, so a
+        // frozen or sealed error is left exactly as it was raised.
+        try {
+          error.worktreeRoot = workspaceRoot;
+        } catch {
+          // The original error is the one that matters.
+        }
+      }
+      throw error;
+    }
+  }
+
+  async #prepareInto(
+    workspaceRoot,
+    { executionId, canonicalRepositoryKey, repositoryRoot, effectiveCwd }
+  ) {
     if (await pathExists(workspaceRoot)) {
       throw new WorktreeManagerError("The isolated worktree path already exists: " + workspaceRoot, {
         code: "worktree_path_conflict"
