@@ -6,6 +6,10 @@ import { COHERENCE } from "./coherent-admission.mjs";
 import { assignmentBasis, resultBasis, reviewerBasis } from "./receipt-basis.mjs";
 import { buildReviewReceipt, COHERENT_ADMISSION_KIND } from "./receipt-schema.mjs";
 import { evaluateFreshness } from "./freshness.mjs";
+import {
+  beginReceiptPublication,
+  receiptPublicationCancelled
+} from "./publication-fence.mjs";
 import { formatReviewSubjectBlock } from "./review-subject.mjs";
 
 /**
@@ -46,6 +50,21 @@ function reasons(...codes) {
     typeof code === "string" ? Object.freeze({ code }) : Object.freeze(code)));
 }
 
+/**
+ * The non-identity-bearing description of one observation. Counts come from the
+ * descriptor rather than being recomputed, so a summary can never disagree with
+ * the sections it describes.
+ */
+function receiptSummary(descriptor) {
+  return {
+    headCommit: descriptor.head.commit,
+    branch: descriptor.summary.branch,
+    detached: descriptor.summary.detached,
+    mergeBase: descriptor.summary.mergeBase,
+    counts: { ...descriptor.summary.counts }
+  };
+}
+
 function unavailable(coherence, reasonList, extra = {}) {
   return Object.freeze({
     status: "unavailable",
@@ -62,7 +81,12 @@ export function createReviewBinder({
   receiptStore,
   evaluateFreshnessFn = evaluateFreshness,
   now = Date.now,
-  producerVersion = "claude-agents-mcp/0.2.0"
+  producerVersion = "claude-agents-mcp/0.2.0",
+  // Seams that pause the receipt write exactly around its durable boundary, so
+  // the fence's two cases can be forced rather than hoped for. They mirror the
+  // Phase 5 custody publication seams and exist for the test suite only.
+  beforeReceiptPublication,
+  afterReceiptPublicationIssued
 } = {}) {
 
   /**
@@ -199,7 +223,15 @@ export function createReviewBinder({
     }
   }
 
-  async function after({ beforeState, workspace, outcome, executionId, startedAt, completedAt }) {
+  async function after({
+    beforeState,
+    workspace,
+    outcome,
+    executionId,
+    startedAt,
+    completedAt,
+    publication
+  }) {
     try {
       if (!beforeState || beforeState.status === "unavailable") {
         return unavailable(beforeState?.coherence ?? COHERENCE.NOT_ATTEMPTED,
@@ -298,13 +330,16 @@ export function createReviewBinder({
             resolution: descriptor.target.resolution,
             commit: descriptor.target.commit
           },
-          summary: {
-            headCommit: descriptor.head.commit,
-            branch: descriptor.summary.branch,
-            detached: descriptor.summary.detached,
-            mergeBase: descriptor.summary.mergeBase,
-            counts: { ...descriptor.summary.counts }
-          }
+          // Both observations, named for what they are. The reviewer was shown
+          // the BEFORE summary and nothing else, so a single "summary" field
+          // filled from AFTER would present metadata the reviewer never saw as
+          // if it were the subject it worked from. The two are equal whenever
+          // nothing moved, and when they differ that difference is a fact worth
+          // keeping rather than one worth hiding. Neither is hashed into the
+          // change-set identity: this changes what the receipt records, not
+          // what the subject is.
+          beforeSummary: receiptSummary(beforeState.current.descriptor),
+          afterSummary: receiptSummary(descriptor)
         },
         coherence: {
           admission: COHERENT_ADMISSION_KIND,
@@ -330,11 +365,41 @@ export function createReviewBinder({
         }
       });
 
+      // The publication boundary. Everything above this point may be abandoned
+      // by a caller's deadline with no durable consequence; from here on a
+      // receipt can become real, so the fence decides who still has authority.
+      if (receiptPublicationCancelled(publication)) {
+        return unavailable(beforeState.coherence,
+          reasons({ code: "review_receipt_publication_cancelled" }),
+          { beforeChangeSetId: beforeState.current.changeSetId, priorReviews });
+      }
+      if (typeof beforeReceiptPublication === "function") {
+        await beforeReceiptPublication({ receipt });
+      }
+      if (receiptPublicationCancelled(publication)) {
+        return unavailable(beforeState.coherence,
+          reasons({ code: "review_receipt_publication_cancelled" }),
+          { beforeChangeSetId: beforeState.current.changeSetId, priorReviews });
+      }
+
+      // No await separates the check above from the guard below. That adjacency
+      // is the whole mechanism: a cancellation either lands before the check -
+      // and then nothing is ever written - or after the guard is set, and then
+      // the caller learns it must wait for quiescence instead of releasing
+      // custody. There is no interleaving in which it does neither.
+      beginReceiptPublication(publication);
+      const issued = Promise.resolve().then(() => receiptStore.put({
+        canonicalRootKey: workspace.canonicalRepositoryKey,
+        receipt
+      }));
+      // Keep any rejection observed while a seam intentionally pauses after the
+      // write was issued; it is still awaited below and stays authoritative.
+      void issued.catch(() => {});
+      if (typeof afterReceiptPublicationIssued === "function") {
+        await afterReceiptPublicationIssued({ receipt });
+      }
       try {
-        await receiptStore.put({
-          canonicalRootKey: workspace.canonicalRepositoryKey,
-          receipt
-        });
+        await issued;
       } catch (error) {
         return unavailable(beforeState.coherence,
           reasons({ code: "review_receipt_persist_failed", detail: error?.code || error?.name }),

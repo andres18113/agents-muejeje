@@ -58,7 +58,14 @@ function receiptFor({
       target: targetSpec.kind === "none"
         ? { spec: targetSpec, resolution: "none", commit: null }
         : { spec: targetSpec, resolution: "resolved", commit: "1".repeat(40) },
-      summary: {
+      beforeSummary: {
+        headCommit: "2".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: null,
+        counts: { index: 0, worktree: 0, unmerged: 0, untracked: 0, submodules: 0 }
+      },
+      afterSummary: {
         headCommit: "2".repeat(40),
         branch: "main",
         detached: false,

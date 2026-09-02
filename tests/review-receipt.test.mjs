@@ -41,7 +41,14 @@ function parts(overrides = {}) {
         resolution: "resolved",
         commit: "1".repeat(40)
       },
-      summary: {
+      beforeSummary: {
+        headCommit: "2".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: "3".repeat(40),
+        counts: { index: 1, worktree: 2, unmerged: 0, untracked: 1, submodules: 0 }
+      },
+      afterSummary: {
         headCommit: "2".repeat(40),
         branch: "main",
         detached: false,
@@ -122,8 +129,9 @@ const MUTATIONS = [
       sections: p.binding.sections
     });
   }],
-  ["binding.summary.branch", (p) => { p.binding.summary.branch = "other"; }],
-  ["binding.summary.counts", (p) => { p.binding.summary.counts.index = 9; }],
+  ["binding.beforeSummary.branch", (p) => { p.binding.beforeSummary.branch = "other"; }],
+  ["binding.afterSummary.branch", (p) => { p.binding.afterSummary.branch = "other"; }],
+  ["binding.beforeSummary.counts", (p) => { p.binding.beforeSummary.counts.index = 9; }],
   ["coherence.custodyExecutionId", (p) => { p.coherence.custodyExecutionId = "other"; }],
   ["coherence.beforeAt", (p) => { p.coherence.beforeAt = 1_001; }],
   ["reviewer.modelSelector", (p) => { p.reviewer.modelSelector = "sonnet"; }],
@@ -171,14 +179,22 @@ const REJECTIONS = [
     ...r.binding, changeSetId: "cs1:" + "b".repeat(64)
   } })],
   ["a wrong-width summary head", (r) => ({ ...r, binding: {
-    ...r.binding, summary: { ...r.binding.summary, headCommit: "2".repeat(64) }
+    ...r.binding, beforeSummary: { ...r.binding.beforeSummary, headCommit: "2".repeat(64) }
   } })],
   ["a wrong-width merge base", (r) => ({ ...r, binding: {
-    ...r.binding, summary: { ...r.binding.summary, mergeBase: "3".repeat(64) }
+    ...r.binding, afterSummary: { ...r.binding.afterSummary, mergeBase: "3".repeat(64) }
   } })],
   ["a non-string branch", (r) => ({ ...r, binding: {
-    ...r.binding, summary: { ...r.binding.summary, branch: 7 }
+    ...r.binding, beforeSummary: { ...r.binding.beforeSummary, branch: 7 }
   } })],
+  ["a binding carrying one undifferentiated summary", (r) => {
+    const { beforeSummary, afterSummary, ...rest } = r.binding;
+    return { ...r, binding: { ...rest, summary: beforeSummary } };
+  }],
+  ["a binding missing its after summary", (r) => {
+    const { afterSummary, ...rest } = r.binding;
+    return { ...r, binding: rest };
+  }],
   ["an unknown admission kind", (r) => ({ ...r, coherence: { ...r.coherence, admission: "handshake" } })],
   ["an unknown model selector source", (r) => ({ ...r, reviewer: { ...r.reviewer, modelSelectorSource: "guessed" } })]
 ];

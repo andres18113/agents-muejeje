@@ -27,7 +27,14 @@ function receiptWith({ sections = baseSections(), reviewer = {} } = {}) {
       objectFormat: "sha1",
       sections,
       target: { spec: TARGET, resolution: "resolved", commit: "1".repeat(40) },
-      summary: {
+      beforeSummary: {
+        headCommit: "2".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: null,
+        counts: { index: 0, worktree: 0, unmerged: 0, untracked: 0, submodules: 0 }
+      },
+      afterSummary: {
         headCommit: "2".repeat(40),
         branch: "main",
         detached: false,

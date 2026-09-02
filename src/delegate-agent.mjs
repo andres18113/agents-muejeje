@@ -20,6 +20,10 @@ import { isFullyQualifiedRef } from "./git-ref-name.mjs";
 import { COLLECTION_DEADLINE_MS, collectChangeSet } from "./changeset/collector.mjs";
 import { NO_REVIEW_TARGET } from "./changeset/target.mjs";
 import { COHERENCE, createCoherentAdmission } from "./review/coherent-admission.mjs";
+import {
+  RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
+  createReceiptPublicationFence
+} from "./review/publication-fence.mjs";
 import { ReviewReceiptStore } from "./review/receipt-store.mjs";
 import { resolveReviewTargetSpec } from "./review/target-provenance.mjs";
 import {
@@ -140,23 +144,92 @@ const TARGET_REF_PROFILES = Object.freeze(["general-purpose", "code-review", "se
 // never retain the shared ownership slot forever.
 export const REVIEW_BINDING_FINALIZATION_TIMEOUT_MS = COLLECTION_DEADLINE_MS + 10_000;
 
+/**
+ * Runs the AFTER binding under an outer bound, and fences its receipt
+ * publication across that bound.
+ *
+ * The bound stops this coordinator from waiting; it does not stop the binder,
+ * and treating it as though it did is exactly how a receipt ends up landing
+ * after the custody that authorized it was released. So the timeout does two
+ * further things. It cancels the fence, which permanently removes publication
+ * authority from a binder that has not yet crossed its durable boundary. And
+ * when the boundary has already been crossed - authority can no longer be
+ * withdrawn - it waits for the write to quiesce before returning, because the
+ * caller's next act is to release coherent-review custody.
+ *
+ * That quiescence wait is bounded too, and its expiry is not evidence of
+ * anything. `publicationUnquiesced` says exactly that: we do not know whether a
+ * receipt landed, so the caller must retain custody rather than release it.
+ *
+ * If the binding does settle while we wait, its result is returned rather than
+ * discarded. The same principle cuts both ways: a timer's guess must not
+ * override an observation, in either direction. `deadlineExceeded` records that
+ * the bound was passed, so a late-but-real binding is reported as what it is
+ * rather than as a timeout.
+ */
 async function finalizeReviewWithinDeadline(operation, {
   timeoutMs = REVIEW_BINDING_FINALIZATION_TIMEOUT_MS,
+  quiescenceTimeoutMs = RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
   schedule = setTimeout,
   cancel = clearTimeout
 } = {}) {
+  const fence = createReceiptPublicationFence();
+  const settled = Promise.resolve()
+    .then(() => operation(fence.publication))
+    .then((value) => ({ value }), (error) => ({ error }));
+
   let timer;
   const timeout = new Promise((resolve) => {
     timer = schedule(() => resolve({ timedOut: true }), timeoutMs);
   });
+  let outcome;
   try {
-    const settled = await Promise.race([
-      Promise.resolve().then(operation).then((value) => ({ value })),
-      timeout
-    ]);
-    return settled.timedOut ? undefined : settled.value;
+    outcome = await Promise.race([settled.then((result) => ({ result })), timeout]);
   } finally {
     cancel(timer);
+  }
+
+  if (outcome.result) {
+    if (outcome.result.error) throw outcome.result.error;
+    return Object.freeze({
+      value: outcome.result.value,
+      publicationUnquiesced: false,
+      deadlineExceeded: false
+    });
+  }
+
+  fence.requestCancellation();
+  if (!fence.publicationStarted()) {
+    // Authority is gone for good: no receipt can now be written, so nothing has
+    // to be waited for before custody is released.
+    return Object.freeze({
+      value: undefined,
+      publicationUnquiesced: false,
+      deadlineExceeded: true
+    });
+  }
+
+  let quiescenceTimer;
+  const quiescence = new Promise((resolve) => {
+    quiescenceTimer = schedule(() => resolve({ timedOut: true }), quiescenceTimeoutMs);
+  });
+  try {
+    const observed = await Promise.race([settled.then((result) => ({ result })), quiescence]);
+    if (observed.result) {
+      if (observed.result.error) throw observed.result.error;
+      return Object.freeze({
+        value: observed.result.value,
+        publicationUnquiesced: false,
+        deadlineExceeded: true
+      });
+    }
+    return Object.freeze({
+      value: undefined,
+      publicationUnquiesced: true,
+      deadlineExceeded: true
+    });
+  } finally {
+    cancel(quiescenceTimer);
   }
 }
 
@@ -539,6 +612,10 @@ export async function delegateAgent(input, dependencies = {}) {
     : COHERENCE.NOT_ATTEMPTED;
   let reviewBeforeState;
   let reviewBinding;
+  // Set only when a receipt write was already in flight when the AFTER deadline
+  // expired and did not quiesce inside its own bound. It means "a receipt may
+  // still land", which forbids releasing the custody that authorized it.
+  let reviewPublicationUnquiesced = false;
   let resolveCustodyFinalization;
   const custodyFinalization = new Promise((resolve) => {
     resolveCustodyFinalization = resolve;
@@ -823,28 +900,43 @@ export async function delegateAgent(input, dependencies = {}) {
         const stateForAfter = reviewBeforeState && reviewBeforeState.coherence !== reviewCoherence
           ? { ...reviewBeforeState, coherence: reviewCoherence }
           : reviewBeforeState;
-        reviewBinding = await finalizeReviewWithinDeadline(
-          () => reviewBinder.after({
+        const finalized = await finalizeReviewWithinDeadline(
+          (publication) => reviewBinder.after({
             beforeState: stateForAfter,
             workspace,
             outcome,
             executionId,
             startedAt,
-            completedAt: now()
+            completedAt: now(),
+            publication
           }),
           {
             timeoutMs: dependencies.reviewBindingAfterTimeoutMs,
+            quiescenceTimeoutMs: dependencies.reviewReceiptQuiescenceTimeoutMs,
             schedule: dependencies.scheduleReviewBindingTimeout,
             cancel: dependencies.cancelReviewBindingTimeout
           }
         );
+        reviewBinding = finalized.value;
+        reviewPublicationUnquiesced = finalized.publicationUnquiesced === true;
         if (!reviewBinding) {
           reviewBinding = {
             status: "unavailable",
             coherence: reviewCoherence,
-            reasons: [{ code: "review_binding_timeout" }],
+            reasons: [
+              { code: "review_binding_timeout" },
+              ...(reviewPublicationUnquiesced
+                ? [{ code: "review_receipt_publication_unquiesced" }]
+                : [])
+            ],
             priorReviews: reviewBeforeState?.priorReviews ?? []
           };
+        } else if (finalized.deadlineExceeded) {
+          // The binding outran its bound but was then observed to finish while
+          // its publication was being waited on. Discarding a real result to
+          // preserve the timer's guess would be the same error the fence exists
+          // to prevent, so the expired bound is recorded beside the result.
+          reviewBindingReasons.push({ code: "review_binding_deadline_exceeded" });
         }
       } catch (error) {
         reviewBinding = {
@@ -859,7 +951,17 @@ export async function delegateAgent(input, dependencies = {}) {
     try {
       if (reservation) {
         try {
-          if (
+          if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {
+            // A receipt write is still in flight and its quiescence was never
+            // observed. Releasing the slot now could let a receipt become
+            // durable after the custody it cites was gone, so the slot stays
+            // retained and reconciles under the unchanged Phase 5 rules.
+            custodyState = "retained";
+            reviewBindingReasons.push({
+              code: "coherent_admission_retained",
+              detail: "review_receipt_publication_unquiesced"
+            });
+          } else if (
             !writerProcessStarted &&
             processProvenNotStarted &&
             !workspacePreparationAmbiguous &&

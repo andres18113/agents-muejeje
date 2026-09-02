@@ -375,13 +375,32 @@ test("a published TERMINATING still cannot authorize taskkill for a reused or de
 
 test("the durable ordering invariant holds end to end through runClaudeAgent", async () => {
   // The architectural implication, observed through the real runner, the real
-  // DurableWriteCustodyManager and a real record file: whenever a taskkill
-  // helper is created, the record read at that exact instant already says
-  // TERMINATING. The two scenarios differ only in whether the durable
-  // transition is allowed to publish.
-  for (const [label, transitionPublishes, expectedLaunches] of [
-    ["published transition", true, 1],
-    ["failed transition", false, 0]
+  // DurableWriteCustodyManager and a real record file:
+  //
+  //     a taskkill helper was launched  =>  the record read at that exact
+  //                                         instant already said TERMINATING.
+  //
+  // It is an implication, not an equivalence, and the two directions need
+  // different assertions.
+  //
+  // Publishing TERMINATING opens the durable gate; it does not oblige anything
+  // to walk through it. A second, independent gate takes a fresh PID+StartTime
+  // comparison inside a subdeadline carved from the same fixed proof-of-death
+  // grace, and declining there - falling back to the exact ChildProcess handle -
+  // is correct behaviour, not a defect. Demanding a launch would be demanding
+  // that production weaken one of the two gates.
+  //
+  // Publication itself is likewise not guaranteed by permitting it: the real
+  // custody manager fsyncs and renames, and on a slow or loaded machine that
+  // can outrun its transition subdeadline. An outrun transition is simply an
+  // unpublished one, and the safety direction still bites - it authorizes
+  // nothing.
+  //
+  // So the scenario below chooses only whether publication is *permitted*, and
+  // every assertion is driven by what the transition actually did.
+  for (const [label, transitionPermitted] of [
+    ["publication permitted", true],
+    ["publication refused", false]
   ]) {
     await withStateRoot(async (stateRoot) => {
       const custody = custodyManager(stateRoot);
@@ -400,6 +419,7 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
       const helper = new EventEmitter();
       helper.kill = () => true;
 
+      let terminationResult;
       await assert.rejects(runClaudeAgent({
         prompt: "assignment body",
         cwd: canonicalRoot,
@@ -434,7 +454,7 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
             mutationSignal
           }),
         onTerminationStarted: (processIdentity, { mutationSignal } = {}) => {
-          if (!transitionPublishes) {
+          if (!transitionPermitted) {
             return Promise.reject(new WriteCustodyError("publication refused", {
               code: "write_custody_persist_failed"
             }));
@@ -457,10 +477,17 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
         })
       }), (error) => {
         assert.equal(error.processStarted, true, label);
+        terminationResult = error.terminationResult;
         return true;
       });
 
-      assert.equal(launches.length, expectedLaunches, label + " taskkill launch count");
+      const transition = terminationResult.durableTransition;
+      // "not-required" cannot arise here: this execution has both a process
+      // identity and a durable lifecycle callback, so publication is the only
+      // thing that can open the gate.
+      const published = transition.status === "completed";
+      const persisted = JSON.parse(await readFile(recordPath, "utf8"));
+
       // The invariant itself, stated directly and checked for every launch.
       for (const durableStateAtLaunch of launches) {
         assert.equal(
@@ -469,8 +496,56 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
           label + ": taskkill launched while the record said " + durableStateAtLaunch
         );
       }
-      const persisted = JSON.parse(await readFile(recordPath, "utf8"));
-      assert.equal(persisted.state, transitionPublishes ? "TERMINATING" : "ACTIVE", label);
+
+      // Authorization tracks publication exactly, in both directions.
+      assert.equal(
+        terminationResult.destructiveHelperAuthorized,
+        published,
+        label + ": only a published TERMINATING may authorize the destructive helper"
+      );
+
+      if (!published) {
+        // An unpublished transition fixes the count at zero. This is the
+        // safety direction and it is never permitted to vary.
+        assert.equal(launches.length, 0, label + " taskkill launch count");
+        assert.ok(
+          child.killCalls >= 1,
+          label + ": the exact child handle is still asked to die"
+        );
+      } else {
+        assert.ok(launches.length <= 1, label + " launches at most one helper");
+        if (launches.length === 0) {
+          // Zero launches under an open durable gate is legitimate, but only
+          // as a fallback to the exact handle - never as taskkill by another
+          // route.
+          assert.notEqual(
+            terminationResult.method,
+            "taskkill",
+            label + ": a declined launch must have fallen back to the exact handle"
+          );
+        }
+      }
+
+      if (!transitionPermitted) {
+        // Refusal is deterministic: the callback rejects before custody touches
+        // anything, so nothing can publish and the record cannot have moved.
+        assert.equal(published, false, label);
+        assert.equal(transition.status, "failed", label);
+        assert.equal(persisted.state, "ACTIVE", label);
+      } else if (published) {
+        assert.equal(persisted.state, "TERMINATING", label);
+      } else {
+        // A transition that outran its subdeadline had its authority withdrawn.
+        // Withdrawal before the rename leaves ACTIVE; a rename already issued
+        // still lands, because cancellation cannot unmake it. Both are correct,
+        // and neither authorized anything - which the assertions above already
+        // proved.
+        assert.equal(transition.cancellationRequested, true, label);
+        assert.ok(
+          ["ACTIVE", "TERMINATING"].includes(persisted.state),
+          label + ": unexpected state " + persisted.state
+        );
+      }
     });
   }
 });

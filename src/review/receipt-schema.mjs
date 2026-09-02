@@ -17,6 +17,14 @@ import { AGENT_REGISTRY } from "../agent-registry.mjs";
  * model actually served the request, or anything about ignored files. It is
  * unsigned, so it proves content integrity and not authorship.
  *
+ * The binding carries two summaries rather than one, because there were two
+ * observations. `beforeSummary` describes the state the reviewer was actually
+ * shown; `afterSummary` describes the state confirmed after it finished. Both
+ * sit outside the change-set identity, so they are equal whenever nothing
+ * moved - and when a branch is renamed or a merge base shifts mid-review they
+ * differ, which is a fact the receipt records instead of quietly presenting the
+ * later one as what the reviewer saw.
+ *
  * reviewId is the digest of the body with reviewId absent - never with a
  * placeholder - so a receipt verifies itself by recomputation. Validation uses
  * exact key sets at every level and refuses anything unexpected: the in-toto
@@ -51,6 +59,21 @@ function hasExactKeys(value, keys) {
 
 function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * A non-identity-bearing description of one observation: branch name, merge
+ * base and counts. Two of them appear on a receipt because there were two
+ * observations, and neither is allowed to stand in for the other.
+ */
+function validSummary(summary, objectId) {
+  if (!hasExactKeys(summary, ["headCommit", "branch", "detached", "mergeBase", "counts"])) return false;
+  if (summary.headCommit !== null && !objectId.test(summary.headCommit)) return false;
+  if (summary.branch !== null && typeof summary.branch !== "string") return false;
+  if (typeof summary.detached !== "boolean") return false;
+  if (summary.mergeBase !== null && !objectId.test(summary.mergeBase)) return false;
+  if (!hasExactKeys(summary.counts, ["index", "worktree", "unmerged", "untracked", "submodules"])) return false;
+  return Object.values(summary.counts).every(safeCount);
 }
 
 function reviewCapableAgentTypes() {
@@ -122,7 +145,9 @@ export function validateReviewReceipt(value) {
 
     const { binding, coherence, reviewer, assignment, execution, result, provenance } = value;
 
-    if (!hasExactKeys(binding, ["changeSetId", "objectFormat", "sections", "target", "summary"])) return undefined;
+    if (!hasExactKeys(binding, [
+      "changeSetId", "objectFormat", "sections", "target", "beforeSummary", "afterSummary"
+    ])) return undefined;
     if (!CHANGE_SET_ID.test(binding.changeSetId)) return undefined;
     if (binding.objectFormat !== "sha1" && binding.objectFormat !== "sha256") return undefined;
     if (!hasExactKeys(binding.sections, SECTION_NAMES)) return undefined;
@@ -132,18 +157,10 @@ export function validateReviewReceipt(value) {
       sections: binding.sections
     })) return undefined;
     if (!validateReviewTargetContext(binding.target, { objectFormat: binding.objectFormat })) return undefined;
-    if (!hasExactKeys(binding.summary, ["headCommit", "branch", "detached", "mergeBase", "counts"])) {
-      return undefined;
-    }
     const objectId = new RegExp("^[0-9a-f]{" + (binding.objectFormat === "sha1" ? 40 : 64) + "}$", "u");
-    if (binding.summary.headCommit !== null && !objectId.test(binding.summary.headCommit)) return undefined;
-    if (binding.summary.branch !== null && typeof binding.summary.branch !== "string") return undefined;
-    if (typeof binding.summary.detached !== "boolean") return undefined;
-    if (binding.summary.mergeBase !== null && !objectId.test(binding.summary.mergeBase)) return undefined;
-    if (!hasExactKeys(binding.summary.counts, ["index", "worktree", "unmerged", "untracked", "submodules"])) {
-      return undefined;
+    for (const summary of [binding.beforeSummary, binding.afterSummary]) {
+      if (!validSummary(summary, objectId)) return undefined;
     }
-    if (!Object.values(binding.summary.counts).every(safeCount)) return undefined;
 
     if (!hasExactKeys(coherence, ["admission", "custodyExecutionId", "beforeAt", "afterAt"])) return undefined;
     if (coherence.admission !== COHERENT_ADMISSION_KIND) return undefined;

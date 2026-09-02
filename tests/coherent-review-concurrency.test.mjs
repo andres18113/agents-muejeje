@@ -384,7 +384,14 @@ function crashReceipt(workspace) {
       objectFormat: "sha1",
       sections,
       target: { spec: NO_REVIEW_TARGET, resolution: "none", commit: null },
-      summary: {
+      beforeSummary: {
+        headCommit: "1".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: null,
+        counts: { index: 0, worktree: 0, unmerged: 0, untracked: 0, submodules: 0 }
+      },
+      afterSummary: {
         headCommit: "1".repeat(40),
         branch: "main",
         detached: false,
