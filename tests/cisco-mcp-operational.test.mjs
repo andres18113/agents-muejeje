@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,11 +18,21 @@ import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.m
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs");
 const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
-const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
 
-const REAL_CISCO_MCP_DIR = "C:\\Users\\Andres\\Desktop\\Universidad\\Uce\\Cuarto\\Infra\\Cisco-MCP";
-const REAL_RUNTIME_RIPV2_DIR = path.join(REAL_CISCO_MCP_DIR, ".claude", "worktrees", "runtime-ripv2");
-const KNOWN_REVISION = "2b8327e48b5166bfef862463e0ca508e37232bc7";
+const OPTIONAL_CISCO_MCP_DIR = process.env.CLAUDE_AGENTS_CISCO_MCP_DIR;
+const OPTIONAL_CISCO_MCP_REVISION = process.env.CLAUDE_AGENTS_CISCO_MCP_REVISION;
+
+function findCsc() {
+  const candidates = [
+    process.env.CSC_PATH,
+    "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe",
+    "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "csc.exe";
+}
 
 function git(cwd, args) {
   const result = spawnSync("git", args, {
@@ -31,17 +41,29 @@ function git(cwd, args) {
     shell: false,
     windowsHide: true
   });
-  assert.equal(result.status, 0, "git " + args.join(" ") + " failed: " + (result.stderr || result.stdout));
+  if (result.status !== 0 || result.error) {
+    const errorDetails = [
+      result.error ? `error: ${result.error.message || result.error}` : null,
+      result.signal ? `signal: ${result.signal}` : null,
+      result.status !== null ? `exit status: ${result.status}` : "status: null",
+      result.stderr ? `stderr: ${result.stderr.trim()}` : null,
+      result.stdout ? `stdout: ${result.stdout.trim()}` : null
+    ].filter(Boolean).join("; ");
+    assert.fail(`git ${args.join(" ")} in '${cwd}' failed: ${errorDetails}`);
+  }
   return result.stdout.trim();
 }
 
 function ensureFakeClaude() {
   if (!existsSync(fakeClaudeExe)) {
-    const res = spawnSync(cscPath, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
+    const csc = findCsc();
+    const res = spawnSync(csc, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
       windowsHide: true,
       shell: false
     });
-    assert.equal(res.status, 0, "Failed to compile FakeClaude.cs: " + (res.stderr || res.stdout));
+    if (res.status !== 0 || res.error) {
+      assert.fail("Failed to compile FakeClaude.cs: " + (res.error?.message || res.stderr || res.stdout));
+    }
   }
 }
 
@@ -53,22 +75,89 @@ function captureGitSnapshot(cwd) {
   };
 }
 
+async function populateSyntheticComplexRepo(repoDir) {
+  git(repoDir, ["init", "-b", "main"]);
+  git(repoDir, ["config", "core.autocrlf", "false"]);
+  git(repoDir, ["config", "user.name", "Deterministic Verification"]);
+  git(repoDir, ["config", "user.email", "verify@example.invalid"]);
+  git(repoDir, ["config", "commit.gpgsign", "false"]);
+
+  const files = {
+    "README.md": `# Synthetic Complex Enterprise MCP Repository
+
+This fixture emulates enterprise complexity: deeply nested module paths, domain/infrastructure separation,
+multi-branch topology configurations, and complex file hierarchies that stress Windows path-length limits
+and worktree isolation mechanisms.
+`,
+    "package.json": JSON.stringify({
+      name: "synthetic-complex-enterprise-mcp",
+      version: "1.0.0",
+      description: "Deterministic complex fixture for operational verification",
+      type: "module"
+    }, null, 2),
+    [path.join("src", "index.mjs")]: `// Entrypoint for synthetic complex MCP\nexport const VERSION = "1.0.0";\n`,
+    [path.join("src", "packet_tracer_mcp", "domain", "protocols", "routing_information_protocol_version_two_engine.mjs")]: `// RIPv2 Engine implementation with complex routing state logic\nexport class RipV2Engine {\n  constructor(routerId) { this.routerId = routerId; this.routes = new Map(); }\n  advertise(prefix, metric) { this.routes.set(prefix, { metric, timestamp: Date.now() }); }\n}\n`,
+    [path.join("src", "packet_tracer_mcp", "infrastructure", "execution", "enterprise_configuration_runtime.mjs")]: `// Deep nested infrastructure runtime execution layer\nexport class EnterpriseConfigurationRuntime {\n  constructor(config) { this.config = config; }\n  executeCommand(cmd) { return { status: "success", output: cmd + " executed" }; }\n}\n`,
+    [path.join("src", "packet_tracer_mcp", "application", "controllers", "device_interface_controller.mjs")]: `// Controller layer managing network topology endpoints\nexport class DeviceInterfaceController {\n  constructor(runtime) { this.runtime = runtime; }\n}\n`,
+    [path.join("config", "topology_profiles", "enterprise_datacenter_spine_leaf_topology.json")]: JSON.stringify({
+      topology: "spine-leaf",
+      nodes: 24,
+      vlans: [10, 20, 30, 99],
+      mtu: 9000
+    }, null, 2),
+    [path.join("tests", "integration", "enterprise_network_simulation_integration_test.mjs")]: `// Integration verification suite for simulated topology\nexport function testSimulation() { return true; }\n`,
+    [path.join("docs", "architecture", "decisions", "0001_enterprise_execution_topology_design.md")]: `# ADR 0001: Enterprise Execution Topology Design\n\nDeterministic operational design specification.\n`
+  };
+
+  for (const [relPath, content] of Object.entries(files)) {
+    const fullPath = path.join(repoDir, relPath);
+    await mkdir(path.dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content, "utf8");
+  }
+
+  git(repoDir, ["add", "-A"]);
+  git(repoDir, ["commit", "-m", "feat: initial synthetic complex enterprise architecture"]);
+
+  git(repoDir, ["checkout", "-b", "feature/packet-tracer-capability-discovery"]);
+  const extraPath = path.join(repoDir, "src", "packet_tracer_mcp", "infrastructure", "execution", "discovery_adapter.mjs");
+  await writeFile(extraPath, `export const DISCOVERY_ENABLED = true;\n`, "utf8");
+  git(repoDir, ["add", "-A"]);
+  git(repoDir, ["commit", "-m", "feat: add capability discovery adapter"]);
+}
+
 async function withDisposableCiscoRepo(callback) {
   const fixtureRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), "cisco-mcp-disposable-")));
   const repoCopy = path.join(fixtureRoot, "repo");
 
-  // Snapshot the real repositories before any operations to ensure they remain untouched
-  const realCiscoSnapshotBefore = captureGitSnapshot(REAL_CISCO_MCP_DIR);
+  const useRealCisco = typeof OPTIONAL_CISCO_MCP_DIR === "string" && existsSync(OPTIONAL_CISCO_MCP_DIR);
+  let realCiscoSnapshotBefore = null;
   let realRuntimeRipv2SnapshotBefore = null;
-  if (existsSync(REAL_RUNTIME_RIPV2_DIR)) {
-    realRuntimeRipv2SnapshotBefore = captureGitSnapshot(REAL_RUNTIME_RIPV2_DIR);
+  let realRuntimeRipv2Dir = null;
+
+  if (useRealCisco) {
+    realCiscoSnapshotBefore = captureGitSnapshot(OPTIONAL_CISCO_MCP_DIR);
+    realRuntimeRipv2Dir = path.join(OPTIONAL_CISCO_MCP_DIR, ".claude", "worktrees", "runtime-ripv2");
+    if (existsSync(realRuntimeRipv2Dir)) {
+      realRuntimeRipv2SnapshotBefore = captureGitSnapshot(realRuntimeRipv2Dir);
+    }
   }
 
   try {
-    // Clone locally into the disposable fixture with core.autocrlf=false
-    git(fixtureRoot, ["-c", "core.autocrlf=false", "clone", REAL_CISCO_MCP_DIR, repoCopy]);
-    git(repoCopy, ["config", "core.autocrlf", "false"]);
-    git(repoCopy, ["checkout", KNOWN_REVISION]);
+    if (useRealCisco) {
+      git(fixtureRoot, ["-c", "core.autocrlf=false", "clone", OPTIONAL_CISCO_MCP_DIR, repoCopy]);
+      git(repoCopy, ["config", "core.autocrlf", "false"]);
+      if (OPTIONAL_CISCO_MCP_REVISION) {
+        git(repoCopy, ["checkout", OPTIONAL_CISCO_MCP_REVISION]);
+      }
+    } else {
+      const syntheticSource = path.join(fixtureRoot, "synthetic-source");
+      await mkdir(syntheticSource, { recursive: true });
+      await populateSyntheticComplexRepo(syntheticSource);
+
+      git(fixtureRoot, ["-c", "core.autocrlf=false", "clone", syntheticSource, repoCopy]);
+      git(repoCopy, ["config", "core.autocrlf", "false"]);
+    }
+
     git(repoCopy, ["config", "user.name", "Deterministic Verification"]);
     git(repoCopy, ["config", "user.email", "verify@example.invalid"]);
     git(repoCopy, ["config", "commit.gpgsign", "false"]);
@@ -83,27 +172,27 @@ async function withDisposableCiscoRepo(callback) {
 
     await callback({ fixtureRoot, repoCopy, scenarioFile, env });
   } finally {
-    // Verify real repositories are completely untouched
-    const realCiscoSnapshotAfter = captureGitSnapshot(REAL_CISCO_MCP_DIR);
-    assert.deepEqual(
-      realCiscoSnapshotAfter,
-      realCiscoSnapshotBefore,
-      "CRITICAL INVARIANT VIOLATION: Real Cisco-MCP was modified!"
-    );
-
-    if (realRuntimeRipv2SnapshotBefore && existsSync(REAL_RUNTIME_RIPV2_DIR)) {
-      const realRuntimeRipv2SnapshotAfter = captureGitSnapshot(REAL_RUNTIME_RIPV2_DIR);
+    if (useRealCisco && realCiscoSnapshotBefore) {
+      const realCiscoSnapshotAfter = captureGitSnapshot(OPTIONAL_CISCO_MCP_DIR);
       assert.deepEqual(
-        realRuntimeRipv2SnapshotAfter,
-        realRuntimeRipv2SnapshotBefore,
-        "CRITICAL INVARIANT VIOLATION: Real runtime-ripv2 worktree was modified!"
+        realCiscoSnapshotAfter,
+        realCiscoSnapshotBefore,
+        "CRITICAL INVARIANT VIOLATION: Real Cisco-MCP was modified!"
       );
+      if (realRuntimeRipv2SnapshotBefore && existsSync(realRuntimeRipv2Dir)) {
+        const realRuntimeRipv2SnapshotAfter = captureGitSnapshot(realRuntimeRipv2Dir);
+        assert.deepEqual(
+          realRuntimeRipv2SnapshotAfter,
+          realRuntimeRipv2SnapshotBefore,
+          "CRITICAL INVARIANT VIOLATION: Real runtime-ripv2 worktree was modified!"
+        );
+      }
     }
 
-    // Clean up disposable clone
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
+
 
 test("source-worktree safety & Cisco-MCP compatibility: writer delegations isolate changes in detached worktree without touching source repo", async () => {
   ensureFakeClaude();

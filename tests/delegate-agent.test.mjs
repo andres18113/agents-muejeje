@@ -267,6 +267,44 @@ function afterRunnerStarts() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+function manualClock(initialTime = 1_000) {
+  let time = initialTime;
+  let nextId = 1;
+  const timers = new Map();
+  let onSchedule = null;
+  return {
+    now: () => time,
+    setOnSchedule(fn) {
+      onSchedule = fn;
+    },
+    schedule(callback, delay) {
+      const id = nextId++;
+      const timer = { callback, at: time + Math.max(0, delay) };
+      timers.set(id, timer);
+      if (onSchedule) onSchedule(id, timer);
+      return id;
+    },
+    cancelSchedule(id) {
+      timers.delete(id);
+    },
+    advanceTo(target) {
+      time = target;
+      let fired;
+      do {
+        fired = false;
+        for (const [id, timer] of [...timers.entries()]) {
+          if (timer.at <= time) {
+            timers.delete(id);
+            timer.callback();
+            fired = true;
+          }
+        }
+      } while (fired && [...timers.values()].some((t) => t.at <= time));
+    },
+    pendingTimers: () => timers.size
+  };
+}
+
 function terminateFakeChild(child, options = {}) {
   return terminateClaudeChild(child, {
     ...options,
@@ -756,6 +794,7 @@ test("normal exact child close returns active writer custody", async () => {
 });
 
 test("write custody remains TERMINATING through taskkill completion until exact child close proves terminal", async () => {
+  const clock = manualClock();
   const custody = new WriteCustodyManager();
   const root = projectRoot;
   const otherRoot = os.tmpdir();
@@ -766,6 +805,10 @@ test("write custody remains TERMINATING through taskkill completion until exact 
   const taskkillStartedPromise = new Promise((resolve) => {
     taskkillStarted = resolve;
   });
+  let writerStarted;
+  const writerStartedPromise = new Promise((resolve) => {
+    writerStarted = resolve;
+  });
   const ids = [
     "writer-a",
     "writer-b",
@@ -775,7 +818,8 @@ test("write custody remains TERMINATING through taskkill completion until exact 
     "writer-after"
   ];
   let nextId = 0;
-  const runtime = writerRuntime(10);
+  const runtime = writerRuntime(1_000);
+  const terminationTimeoutMs = 5_000;
   const writerDependencies = {
     writeCustody: custody,
     createExecutionId: () => ids[nextId++],
@@ -784,12 +828,22 @@ test("write custody remains TERMINATING through taskkill completion until exact 
     runAgent: (argumentsForRunner) => runClaudeAgent({
       ...argumentsForRunner,
       runtime,
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancelSchedule,
+      async onChildStarted(processIdentity) {
+        await argumentsForRunner.onChildStarted(processIdentity);
+        writerStarted();
+      },
       createSettings: fakeSettings(),
       spawnProcess: () => child,
-      terminationTimeoutMs: 50,
+      terminationTimeoutMs,
       terminateChild: (target, options) => terminateClaudeChild(target, {
         ...options,
         platform: "win32",
+        now: clock.now,
+        schedule: clock.schedule,
+        cancelSchedule: clock.cancelSchedule,
         spawnTerminator() {
           taskkillStarted();
           return terminator;
@@ -802,8 +856,14 @@ test("write custody remains TERMINATING through taskkill completion until exact 
     { agentType: "task", task: "run exactly one command", cwd: root },
     writerDependencies
   );
-  await taskkillStartedPromise;
+  await writerStartedPromise;
+  await afterRunnerStarts();
   const rootKey = workspaceForTest(root).canonicalRepositoryKey;
+  assert.equal(custody.getWriteAccess(rootKey).state, "ACTIVE");
+
+  // Explicitly trigger execution timeout via manual clock
+  clock.advanceTo(clock.now() + runtime.timeoutMs);
+  await taskkillStartedPromise;
   assert.equal(custody.getWriteAccess(rootKey).state, "TERMINATING");
 
   let secondRunnerCalled = false;
@@ -846,6 +906,7 @@ test("write custody remains TERMINATING through taskkill completion until exact 
   assert.equal(otherWriter.status, "completed");
   assert.equal(otherWriter.custodyState, "released");
 
+  // Explicitly control taskkill helper close
   terminator.emit("close", 0, null);
   await afterRunnerStarts();
   assert.equal(custody.getWriteAccess(rootKey).state, "TERMINATING");
@@ -864,6 +925,7 @@ test("write custody remains TERMINATING through taskkill completion until exact 
   assert.equal(afterTaskkill.error.code, "write_custody_conflict");
   assert.equal(afterTaskkillRunnerCalled, false);
 
+  // Emit exact child close while still inside the controlled termination window
   child.emit("close", null, "SIGKILL");
   const firstOutcome = await first;
   assert.equal(firstOutcome.status, "timeout");
@@ -884,6 +946,89 @@ test("write custody remains TERMINATING through taskkill completion until exact 
   assert.equal(afterTerminal.status, "completed");
   assert.equal(afterTerminal.custodyState, "released");
 });
+
+test("termination deadline crossed without exact child close fails closed with claude_termination_unproven and retains ORPHANED custody", async () => {
+  const clock = manualClock();
+  const custody = new WriteCustodyManager();
+  const root = projectRoot;
+  const child = stalledChildForTermination();
+  const terminator = new EventEmitter();
+  terminator.kill = () => true;
+  let taskkillStarted;
+  const taskkillStartedPromise = new Promise((resolve) => {
+    taskkillStarted = resolve;
+  });
+  let writerStarted;
+  const writerStartedPromise = new Promise((resolve) => {
+    writerStarted = resolve;
+  });
+  const ids = ["timeout-unproven-1", "timeout-unproven-2"];
+  let nextId = 0;
+  const runtime = writerRuntime(1_000);
+  const terminationTimeoutMs = 5_000;
+  const writerDependencies = {
+    writeCustody: custody,
+    createExecutionId: () => ids[nextId++],
+    resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+    resolveRuntime: () => runtime,
+    runAgent: (argumentsForRunner) => runClaudeAgent({
+      ...argumentsForRunner,
+      runtime,
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancelSchedule,
+      async onChildStarted(processIdentity) {
+        await argumentsForRunner.onChildStarted(processIdentity);
+        writerStarted();
+      },
+      createSettings: fakeSettings(),
+      spawnProcess: () => child,
+      terminationTimeoutMs,
+      terminateChild: (target, options) => terminateClaudeChild(target, {
+        ...options,
+        platform: "win32",
+        now: clock.now,
+        schedule: clock.schedule,
+        cancelSchedule: clock.cancelSchedule,
+        spawnTerminator() {
+          taskkillStarted();
+          return terminator;
+        }
+      })
+    })
+  };
+
+  const first = delegateAgent(
+    { agentType: "task", task: "run exactly one command", cwd: root },
+    writerDependencies
+  );
+  await writerStartedPromise;
+  await afterRunnerStarts();
+  const rootKey = workspaceForTest(root).canonicalRepositoryKey;
+  assert.equal(custody.getWriteAccess(rootKey).state, "ACTIVE");
+
+  // Advance clock to trigger execution timeout
+  clock.advanceTo(clock.now() + runtime.timeoutMs);
+  await taskkillStartedPromise;
+  assert.equal(custody.getWriteAccess(rootKey).state, "TERMINATING");
+
+  // Taskkill helper completes
+  terminator.emit("close", 0, null);
+  await afterRunnerStarts();
+
+  // Deliberately cross the termination deadline WITHOUT emitting child close
+  clock.advanceTo(clock.now() + terminationTimeoutMs + 100);
+
+  // 5. Outcome must fail closed with claude_termination_unproven and ORPHANED custody
+  const firstOutcome = await first;
+  assert.equal(firstOutcome.status, "timeout");
+  assert.equal(firstOutcome.error.code, "claude_termination_unproven");
+  assert.equal(firstOutcome.custodyState, "orphaned");
+  assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
+
+  child.emit("close", null, "SIGKILL");
+});
+
 
 test("taskkill failure or timeout retains ORPHANED custody and only readers remain admissible", async () => {
   for (const terminatorMode of ["failed", "timeout"]) {
