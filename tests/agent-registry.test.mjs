@@ -458,7 +458,7 @@ test("tracked routing policy and documentation name only the consolidated profil
   }
 });
 
-test("documentation enforces operational workflow: worktree review and commit-ish integration", async () => {
+test("documentation enforces operational workflow: committed worktree review and cherry-pick integration", async () => {
   const [routingPolicy, readme] = await Promise.all([
     readFile(routingPolicyPath, "utf8"),
     readFile(path.join(projectRoot, "README.md"), "utf8")
@@ -468,10 +468,12 @@ test("documentation enforces operational workflow: worktree review and commit-is
   assert.match(readme, /cwd.*worktreeRoot/i);
   assert.match(routingPolicy, /never run `?git merge.*worktreeRoot`?/i);
   assert.match(readme, /never run `?git merge.*worktreeRoot`?/i);
-  assert.match(routingPolicy, /apply.*changes\.patch/);
-  assert.match(readme, /apply.*changes\.patch/);
-  assert.match(routingPolicy, /cherry-pick/);
-  assert.match(readme, /cherry-pick/);
+  assert.match(routingPolicy, /advisory.*pre-commit/i);
+  assert.match(readme, /advisory.*pre-commit/i);
+  assert.match(routingPolicy, /cherry-pick \$reviewedCommitSha/);
+  assert.match(readme, /cherry-pick \$reviewedCommitSha/);
+  assert.match(routingPolicy, /Do not use `?git diff > changes\.patch`? as the canonical workflow/);
+  assert.match(readme, /Do not use `?git diff > changes\.patch`? as the canonical workflow/);
 });
 
 test("package metadata and Windows CI provide clean deterministic validation", async () => {

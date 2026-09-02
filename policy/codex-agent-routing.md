@@ -72,19 +72,22 @@ Codex Lead orchestrates and owns all lifecycle decisions. Specialists never auto
 1. **Mutating delegation (`general-purpose`)**:
    Codex delegates with `agent_type="general-purpose"` and `cwd` set to the repository root. The specialist executes inside an isolated, detached worktree under `%LOCALAPPDATA%\claude-agents-mcp\state-v1\worktrees\...`. The source repository remains untouched. The returned structured outcome reports the isolated workspace in `workspace.worktree.root` (`worktreeRoot`).
 
-2. **Lead inspection and deterministic gates**:
-   Codex inspects the specialist's uncommitted changes directly in `worktreeRoot` (`git -C <worktreeRoot> status`, `git -C <worktreeRoot> diff`) and runs project verification gates there.
+2. **Lead inspection and deterministic gates in worktree**:
+   Codex inspects the specialist's uncommitted changes directly in `worktreeRoot` (`git -C <worktreeRoot> status`, `git -C <worktreeRoot> diff`) and runs project verification gates there. Any preliminary review executed before commit is advisory for that pre-commit state and must not be presented as exact binding of the resulting commit.
 
-3. **Bound review against that exact worktree (`code-review` / `security-review`)**:
-   Codex delegates `code-review` with **`cwd` set to `<worktreeRoot>`** (not the source repository). This ensures the Git-visible `ChangeSet` digests the specialist's changes and the resulting `ReviewReceipt` binds the exact uncommitted state being evaluated. Reviewers remain strictly read-only.
+3. **Codex Lead commit creation in worktree**:
+   When Codex decides changes are acceptable to prepare, Codex Lead creates the explicit commit inside `worktreeRoot`:
+   `git -C "<worktreeRoot>" add -A`, `git -C "<worktreeRoot>" commit -m "..."`, and reads `$reviewedCommitSha = git -C "<worktreeRoot>" rev-parse HEAD`. Committing produces a new exact Git/ChangeSet state.
 
-4. **Codex Lead acceptance and explicit integration**:
-   A worktree directory path is not a Git commit-ish; Codex must never run `git merge <worktreeRoot>` or `git merge --squash <worktreeRoot>`. If Codex decides to accept the reviewed changes, Codex derives an explicit patch or commit from `worktreeRoot` and integrates it into the target branch:
-   - **Patch integration**: `git -C "<worktreeRoot>" diff > changes.patch`, then `git -C "<sourceRepo>" apply --check changes.patch && git -C "<sourceRepo>" apply changes.patch`.
-   - **Commit-ish integration**: `git -C "<worktreeRoot>" commit -am "..."` followed by `git -C "<sourceRepo>" cherry-pick <commitSha>`.
+4. **Bound review against that committed state (`code-review` / `security-review`)**:
+   Codex delegates `code-review` with **`cwd` set to `<worktreeRoot>`** (not the source repository). The reviewer inspects the Git-visible `ChangeSet` where HEAD is now `$reviewedCommitSha`. The resulting `ReviewReceipt` binds this exact committed state, and Codex verifies it reports `FRESH`. Reviewers remain strictly read-only and never execute Git write commands.
 
-5. **Post-integration verification**:
-   Codex reruns relevant target-branch gates in `<sourceRepo>` to confirm end-to-end correctness. The isolated worktree remains intact on disk for auditability.
+5. **Codex Lead integration via cherry-pick**:
+   A worktree directory path is not a Git commit-ish; Codex must never run `git merge <worktreeRoot>` or `git merge --squash <worktreeRoot>`. Do not use `git diff > changes.patch` as the canonical workflow because it can omit untracked files and PowerShell redirection introduces avoidable encoding differences. Codex Lead integrates the exact reviewed commit SHA:
+   `git -C "<targetRepo>" cherry-pick $reviewedCommitSha`.
+
+6. **Post-integration verification and final verdict**:
+   Codex reruns relevant target-branch gates in `<targetRepo>` to confirm end-to-end correctness. Codex Lead alone owns the final verdict before pushing. The isolated worktree remains intact on disk for auditability.
 
 ## Briefs, review, and evidence
 
