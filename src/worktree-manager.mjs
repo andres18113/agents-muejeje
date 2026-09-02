@@ -66,11 +66,12 @@ export async function runGit(
   {
     maxOutputBytes = MAX_GIT_OUTPUT_BYTES,
     timeoutMs = GIT_COMMAND_TIMEOUT_MS,
+    enableLongPaths = false,
     ...options
   } = {}
 ) {
   try {
-    const result = await runGitCommand(args, { ...options, maxOutputBytes, timeoutMs });
+    const result = await runGitCommand(args, { enableLongPaths, ...options, maxOutputBytes, timeoutMs });
     return Object.freeze({ stdout: result.stdout, stderr: result.stderr });
   } catch (error) {
     throw asWorktreeManagerError(error);
@@ -290,6 +291,7 @@ export class GitWorktreeManager {
     const worktreeAdd = this.#runGit(["worktree", "add", "--detach", workspaceRoot, baseCommit], {
       cwd: repositoryRoot,
       disableHooks: true,
+      enableLongPaths: process.platform === "win32",
       onSpawned: (child) => {
         operationRecorded = this.#recordGitOperation(child, {
           executionId,

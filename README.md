@@ -84,6 +84,97 @@ Required handoff: actionable findings with location, failure mode, impact, and a
 
 For larger or riskier work, a brief may include Outcome, Done when, Boundaries, Authoritative context, Non-goals, Known evidence, and Required handoff. Small Explore and Task requests do not need unnecessary ceremony.
 
+## Operational workflow: delegation, review, and integration
+
+Codex Lead acts as the orchestrator and final authority. Claude specialists never automatically commit, merge, rebase, push, or integrate changes.
+
+```text
+Codex Lead delegates mutating task
+          |
+delegate_agent (agent_type="general-purpose", cwd=repoRoot)
+          |
+Specialist executes in isolated detached worktree
+Outcome reports structuredContent.workspace.worktree.root (worktreeRoot)
+Source repository remains pristine and untouched
+          |
+Codex Lead inspects worktreeRoot and runs deterministic project gates
+          |
+Codex Lead delegates bound review:
+delegate_agent (agent_type="code-review", cwd=worktreeRoot)
+ReviewReceipt binds the exact uncommitted change set under review
+          |
+Codex Lead evaluates findings and decides whether to accept the result
+          |
+Codex Lead derives explicit Git patch or commit from worktreeRoot
+Integrates into target branch via patch or commit-ish (never git merge <worktreeRoot>)
+          |
+Codex Lead reruns target-branch validation gates in source repository
+```
+
+### 1. Delegating mutating work (`general-purpose`)
+Codex invokes `delegate_agent` with `agent_type="general-purpose"` and `cwd` set to the repository root:
+```json
+{
+  "name": "delegate_agent",
+  "arguments": {
+    "agent_type": "general-purpose",
+    "task": "Implement feature X and associated unit tests",
+    "cwd": "C:\\path\\to\\repository"
+  }
+}
+```
+The specialist executes inside an isolated detached Git worktree under `%LOCALAPPDATA%\claude-agents-mcp\state-v1\worktrees\...`. The source repository remains 100% clean and untouched. The response envelope returns `worktreeRoot` in `structuredContent.workspace.worktree.root` (and in human-readable `WorktreeRoot:`).
+
+### 2. Lead inspection and testing
+Codex Lead inspects the specialist's changes and executes deterministic tests directly inside the isolated worktree:
+```powershell
+git -C "<worktreeRoot>" status --short
+git -C "<worktreeRoot>" diff
+# Run test and verification gates directly inside worktreeRoot
+```
+
+### 3. Reviewing changes (`code-review` with `cwd = worktreeRoot`)
+To perform high-confidence review of the specialist's work, Codex Lead must delegate `code-review` (or `security-review`) with **`cwd` set to `worktreeRoot`**:
+```json
+{
+  "name": "delegate_agent",
+  "arguments": {
+    "agent_type": "code-review",
+    "task": "Review uncommitted changes for correctness regressions and invariant violations",
+    "cwd": "<worktreeRoot>"
+  }
+}
+```
+`cwd` must point to the specialist's `worktreeRoot`, not the clean source repository. The reviewer inspects the Git-visible `ChangeSet` of `cwd`. Setting `cwd` to `worktreeRoot` ensures the `ReviewReceipt` binds the exact uncommitted state containing the specialist's modifications. Reviewers remain strictly read-only and never alter repository state.
+
+### 4. Lead acceptance and integration
+A worktree directory path is not a Git commit-ish. Never run `git merge <worktreeRoot>` or `git merge --squash <worktreeRoot>`. Codex Lead alone owns integration using one of these explicit mechanisms:
+
+- **Patch derivation (Narrowest, cleanest):**
+  ```powershell
+  # 1. Export the validated diff from the specialist worktree
+  git -C "<worktreeRoot>" diff > changes.patch
+
+  # 2. Check and apply the patch in the target repository
+  git -C "<sourceRepo>" apply --check changes.patch
+  git -C "<sourceRepo>" apply changes.patch
+  Remove-Item changes.patch
+  ```
+
+- **Commit derivation (Preserving commit history):**
+  ```powershell
+  # 1. Create an explicit commit inside the isolated worktree
+  git -C "<worktreeRoot>" add -A
+  git -C "<worktreeRoot>" commit -m "feat: validated specialist changes"
+  $commitSha = (git -C "<worktreeRoot>" rev-parse HEAD).Trim()
+
+  # 2. Integrate that explicit commit-ish into the target repository
+  git -C "<sourceRepo>" cherry-pick $commitSha
+  ```
+
+### 5. Post-integration verification
+Codex Lead reruns relevant target-branch gates in `<sourceRepo>` to confirm end-to-end correctness before pushing. The isolated worktree remains intact on disk for auditability.
+
 ## Runtime behavior
 
 Role contracts in `agents/` define specialist behavior. The dynamic task defines one assignment and cannot override contract boundaries.

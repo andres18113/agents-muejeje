@@ -15,5 +15,5 @@ function createServer() {
   return server;
 }
 
-void serveStdio(createServer());
+void serveStdio(createServer);
 console.error(`[${SERVER_NAME}] MCP stdio server ready; tool=delegate_agent`);

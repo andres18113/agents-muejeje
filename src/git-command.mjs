@@ -136,15 +136,18 @@ export async function runGitCommand(
     maxOutputBytes = MAX_GIT_OUTPUT_BYTES,
     timeoutMs = GIT_COMMAND_TIMEOUT_MS,
     disableHooks = false,
+    enableLongPaths = false,
     encoding = "utf8",
     runProcess = runSupervisedProcess,
     onSpawned,
     ...supervision
   } = {}
 ) {
-  const gitArguments = disableHooks
-    ? [...gitHookIsolationArguments({ platform }), ...args]
-    : [...args];
+  const configArgs = [
+    ...(enableLongPaths && platform === "win32" ? ["-c", "core.longpaths=true"] : []),
+    ...(disableHooks ? gitHookIsolationArguments({ platform }) : [])
+  ];
+  const gitArguments = [...configArgs, ...args];
 
   const result = await runProcess("git", gitArguments, {
     cwd,

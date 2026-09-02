@@ -458,6 +458,22 @@ test("tracked routing policy and documentation name only the consolidated profil
   }
 });
 
+test("documentation enforces operational workflow: worktree review and commit-ish integration", async () => {
+  const [routingPolicy, readme] = await Promise.all([
+    readFile(routingPolicyPath, "utf8"),
+    readFile(path.join(projectRoot, "README.md"), "utf8")
+  ]);
+
+  assert.match(routingPolicy, /cwd.*worktreeRoot/i);
+  assert.match(readme, /cwd.*worktreeRoot/i);
+  assert.match(routingPolicy, /never run `?git merge.*worktreeRoot`?/i);
+  assert.match(readme, /never run `?git merge.*worktreeRoot`?/i);
+  assert.match(routingPolicy, /apply.*changes\.patch/);
+  assert.match(readme, /apply.*changes\.patch/);
+  assert.match(routingPolicy, /cherry-pick/);
+  assert.match(readme, /cherry-pick/);
+});
+
 test("package metadata and Windows CI provide clean deterministic validation", async () => {
   const [packageText, lockText, workflow] = await Promise.all([
     readFile(path.join(projectRoot, "package.json"), "utf8"),

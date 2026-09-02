@@ -65,6 +65,27 @@ Prior receipts are discovered through a bounded stable-scope index so a receipt 
 
 `delegate_agent` returns a versioned structured outcome (`claude-agents-mcp/delegate-outcome/v1`) alongside its text. It is evidence only: bounded reason codes, identities, custody/termination/recovery diagnostics, and receipt history. It never contains specialist result text, assignment bodies, contract text, environment values, or secrets, and Codex must continue reading the specialist's actual findings from the text content block. Its arrays and strings are capped and the document is size-bounded, so absence of a field is never proof that the underlying fact was absent - only the explicit statuses (`complete`/`partial`/`indeterminate`, `not-attempted`/`cancelled-before-authority`/`authoritative-pending`/`authoritative-settled`) carry that meaning. A `delegate_outcome_projection_failed` error code alongside a real execution status means the outcome could not be projected; the text block remains the record.
 
+## Operational lifecycle: general-purpose, bound review, and integration
+
+Codex Lead orchestrates and owns all lifecycle decisions. Specialists never automatically commit, merge, rebase, push, or integrate changes.
+
+1. **Mutating delegation (`general-purpose`)**:
+   Codex delegates with `agent_type="general-purpose"` and `cwd` set to the repository root. The specialist executes inside an isolated, detached worktree under `%LOCALAPPDATA%\claude-agents-mcp\state-v1\worktrees\...`. The source repository remains untouched. The returned structured outcome reports the isolated workspace in `workspace.worktree.root` (`worktreeRoot`).
+
+2. **Lead inspection and deterministic gates**:
+   Codex inspects the specialist's uncommitted changes directly in `worktreeRoot` (`git -C <worktreeRoot> status`, `git -C <worktreeRoot> diff`) and runs project verification gates there.
+
+3. **Bound review against that exact worktree (`code-review` / `security-review`)**:
+   Codex delegates `code-review` with **`cwd` set to `<worktreeRoot>`** (not the source repository). This ensures the Git-visible `ChangeSet` digests the specialist's changes and the resulting `ReviewReceipt` binds the exact uncommitted state being evaluated. Reviewers remain strictly read-only.
+
+4. **Codex Lead acceptance and explicit integration**:
+   A worktree directory path is not a Git commit-ish; Codex must never run `git merge <worktreeRoot>` or `git merge --squash <worktreeRoot>`. If Codex decides to accept the reviewed changes, Codex derives an explicit patch or commit from `worktreeRoot` and integrates it into the target branch:
+   - **Patch integration**: `git -C "<worktreeRoot>" diff > changes.patch`, then `git -C "<sourceRepo>" apply --check changes.patch && git -C "<sourceRepo>" apply changes.patch`.
+   - **Commit-ish integration**: `git -C "<worktreeRoot>" commit -am "..."` followed by `git -C "<sourceRepo>" cherry-pick <commitSha>`.
+
+5. **Post-integration verification**:
+   Codex reruns relevant target-branch gates in `<sourceRepo>` to confirm end-to-end correctness. The isolated worktree remains intact on disk for auditability.
+
 ## Briefs, review, and evidence
 
 Delegate only when independent context can materially improve correctness, confidence, or falsification. When useful, provide a bounded brief with Outcome, Done when, Boundaries, Authoritative context, Non-goals, Known evidence, and Required handoff. Do not require every heading for trivial exploration or a single command.
