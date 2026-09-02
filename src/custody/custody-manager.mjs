@@ -27,7 +27,9 @@ import {
   SAFE_UNSTARTED_STATES,
   TRANSITIONS,
   WriteCustodyError,
+  CUSTODY_KINDS,
   accessModeForState,
+  custodyKindOf,
   cloneRecord,
   durableProcessIdentity,
   processIdentityMatches,
@@ -40,6 +42,7 @@ import {
   validatePersistedGitOperation,
   validateDurableOwnershipRecord
 } from "./record-schema.mjs";
+import { validateFullyQualifiedRef } from "../git-ref-name.mjs";
 import {
   RECONCILIATION_ACTION,
   decideReconciliation,
@@ -119,11 +122,35 @@ export class DurableWriteCustodyManager {
     return worktreeDirectoryIn(this.repositoryStateDirectory(canonicalRootKey), executionId);
   }
 
-  async reserveWriteAccess({ executionId, agentType, canonicalRoot, canonicalRootKey }) {
+  /**
+   * Claims the one ownership slot for this repository.
+   *
+   * custodyKind names why the slot is being held. Both kinds contend on exactly
+   * the same rename, so a coherent review excludes managed writers by the same
+   * mechanism that makes writers exclude each other - there is no second lock
+   * and therefore no acquisition order to get wrong.
+   *
+   * A write reservation omits the field entirely rather than writing "write",
+   * so its on-disk record stays byte-identical to what Phase 5 produced.
+   */
+  async reserveWriteAccess({
+    executionId,
+    agentType,
+    canonicalRoot,
+    canonicalRootKey,
+    custodyKind = CUSTODY_KINDS.WRITE,
+    targetRef
+  }) {
     const validId = validExecutionId(executionId);
     const validAgentType = validIdentityString("agentType", agentType);
     const validRoot = validIdentityString("canonicalRoot", canonicalRoot);
     const validRootKey = validIdentityString("canonicalRootKey", canonicalRootKey);
+    if (custodyKind !== CUSTODY_KINDS.WRITE && custodyKind !== CUSTODY_KINDS.COHERENT_REVIEW) {
+      throw new WriteCustodyError("Durable custody kind is invalid.", {
+        code: "write_custody_kind_invalid"
+      });
+    }
+    if (targetRef !== undefined) validateFullyQualifiedRef(targetRef);
     if (pathIsAtOrWithin(validRoot, this.#stateRoot)) {
       throw new WriteCustodyError("Durable custody state must be outside the canonical working tree.", {
         code: "write_custody_state_root_invalid"
@@ -167,7 +194,9 @@ export class DurableWriteCustodyManager {
           reservedAt: at,
           updatedAt: at,
           coordinatorProcess,
-          transitions: [{ state: "RESERVED", at }]
+          transitions: [{ state: "RESERVED", at }],
+          ...(custodyKind === CUSTODY_KINDS.WRITE ? {} : { custodyKind }),
+          ...(targetRef === undefined ? {} : { targetRef })
         };
         const created = await createOwnershipReservation({
           repositoryState,
@@ -578,7 +607,7 @@ export class DurableWriteCustodyManager {
       ...additions,
       revision: record.revision + 1,
       state: nextState,
-      accessMode: accessModeForState(nextState),
+      accessMode: accessModeForState(nextState, custodyKindOf(record)),
       updatedAt: at,
       transitions: [...record.transitions, { state: nextState, at }]
     };

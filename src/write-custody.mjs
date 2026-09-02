@@ -12,12 +12,20 @@
  */
 
 export {
+  CUSTODY_KINDS,
   DURABLE_STATE_SCHEMA_VERSION,
+  STATES,
   WriteCustodyError,
+  custodyKindOf,
   repositoryIdForCanonicalRootKey,
   validateDurableOwnershipRecord
 } from "./custody/record-schema.mjs";
-export { defaultDurableStateRoot } from "./custody/durable-store.mjs";
+export {
+  defaultDurableStateRoot,
+  executionHistoryDirectoryIn,
+  repositoryStateDirectoryIn,
+  worktreeDirectoryIn
+} from "./custody/durable-store.mjs";
 export { DurableWriteCustodyManager } from "./custody/custody-manager.mjs";
 
 import { DurableWriteCustodyManager } from "./custody/custody-manager.mjs";

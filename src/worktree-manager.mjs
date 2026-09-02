@@ -1,7 +1,14 @@
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { PROCESS_IDENTITY_STATUS, inspectProcessIdentity } from "./process-identity.mjs";
-import { runSupervisedProcess } from "./supervised-process.mjs";
+import {
+  GIT_COMMAND_TIMEOUT_MS,
+  GIT_ENVIRONMENT_ALLOWLIST,
+  MAX_GIT_OUTPUT_BYTES,
+  buildGitEnvironment,
+  gitHookIsolationArguments,
+  runGitCommand
+} from "./git-command.mjs";
 import { canonicalRepositoryKey } from "./workspace-root.mjs";
 
 export class WorktreeManagerError extends Error {
@@ -30,143 +37,36 @@ async function pathExists(pathname) {
   }
 }
 
-const MAX_GIT_OUTPUT_BYTES = 64 * 1024;
-
 /**
- * Every Git process this module starts is bounded. Three minutes is
- * deliberately generous: `git worktree add` on a large repository, on a cold
- * page cache, or on a network-backed Windows volume can legitimately take a
- * long time, and a false timeout costs a repository its write custody. It is
- * still finite, so a wedged Git process can never hang a delegation forever.
+ * The Git primitives now live in git-command.mjs so a read-only caller can use
+ * them without importing this module's writer lifecycle. They are re-exported
+ * here because they are part of this module's established public surface.
  */
-export const GIT_COMMAND_TIMEOUT_MS = 3 * 60 * 1000;
+export {
+  GIT_COMMAND_TIMEOUT_MS,
+  GIT_ENVIRONMENT_ALLOWLIST,
+  buildGitEnvironment,
+  gitHookIsolationArguments
+};
 
 /**
- * Orchestration Git is an external execution boundary, exactly like the Claude
- * child. It gets an explicit compatibility allowlist rather than the parent
- * environment, so unrelated secret-bearing variables (tokens, cloud
- * credentials, CI secrets) are not handed to Git or to anything Git starts.
+ * Runs one orchestration Git command and maps every failure into this module's
+ * error vocabulary.
  *
- * Only what is needed to locate and run Git, operate on Windows, use a
- * temporary directory, and act on a local repository is preserved. Nothing
- * here selects a remote, an identity, or a credential helper.
- */
-export const GIT_ENVIRONMENT_ALLOWLIST = Object.freeze([
-  "PATH",
-  "PATHEXT",
-  "SystemRoot",
-  "WINDIR",
-  "COMSPEC",
-  "SystemDrive",
-  "ProgramData",
-  "ProgramFiles",
-  "ProgramFiles(x86)",
-  "TEMP",
-  "TMP",
-  "TMPDIR",
-  "OS",
-  "PROCESSOR_ARCHITECTURE"
-]);
-
-function findEnvironmentValue(env, name) {
-  if (!env || typeof env !== "object") return undefined;
-  const expected = name.toUpperCase();
-  for (const [candidate, value] of Object.entries(env)) {
-    if (candidate.toUpperCase() === expected && typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-/**
- * Builds the environment for one orchestration-owned Git invocation.
- *
- * Beyond the allowlist it pins deterministic Git behavior:
- *
- *   GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM
- *     ignore system and per-user configuration, so orchestration Git does not
- *     depend on whatever the host developer happens to have configured;
- *   GIT_TERMINAL_PROMPT / GIT_ASKPASS / GIT_OPTIONAL_LOCKS
- *     never block on an interactive prompt;
- *   GIT_ATTR_NOSYSTEM
- *     ignore system-wide attribute files.
- *
- * The empty config paths are the documented Git mechanism for "no config
- * file"; on Windows the null device is used, which is not machine-specific.
- */
-export function buildGitEnvironment(parentEnvironment = process.env, { platform = process.platform } = {}) {
-  const environment = {};
-  for (const name of GIT_ENVIRONMENT_ALLOWLIST) {
-    const value = findEnvironmentValue(parentEnvironment, name);
-    if (value !== undefined) environment[name] = value;
-  }
-
-  const nullDevice = platform === "win32" ? "NUL" : "/dev/null";
-  environment.GIT_CONFIG_NOSYSTEM = "1";
-  environment.GIT_CONFIG_GLOBAL = nullDevice;
-  environment.GIT_CONFIG_SYSTEM = nullDevice;
-  environment.GIT_ATTR_NOSYSTEM = "1";
-  environment.GIT_TERMINAL_PROMPT = "0";
-  environment.GIT_ASKPASS = "";
-  environment.GIT_OPTIONAL_LOCKS = "0";
-  return Object.freeze(environment);
-}
-
-/**
- * Arguments that disable ordinary repository hooks for one invocation.
- *
- * `git worktree add` performs a checkout, which runs post-checkout hooks from
- * the repository's configured hooks directory. Orchestration-owned worktree
- * creation must not execute repository-supplied scripts as a side effect of
- * preparing an isolated workspace, so core.hooksPath is pointed at the null
- * device: a deterministic, non-machine-specific location that contains no
- * executable hook.
- *
- * Honest scope: this stops hooks. It does NOT make checkout side-effect free.
- * Checkout still applies clean/smudge filters, .gitattributes rules and
- * config-driven behavior from the repository itself. Those remain inside the
- * local-repository trust boundary and are not neutralized here.
- */
-export function gitHookIsolationArguments({ platform = process.platform } = {}) {
-  return ["-c", "core.hooksPath=" + (platform === "win32" ? "NUL" : "/dev/null")];
-}
-
-/**
- * Runs exactly one orchestration Git command through the supervised external
- * process primitive: bounded execution, bounded output, exact-process
- * termination, bounded terminal wait, and fail-closed ambiguity. Git is never
- * terminated by process name and the returned Promise always settles.
+ * The returned shape is deliberately narrower than runGitCommand's: callers in
+ * the worktree lifecycle branch on WorktreeManagerError, never on an exit code,
+ * so exposing one here would invite a second way to decide the same thing.
  */
 export async function runGit(
   args,
   {
-    cwd,
-    env = process.env,
-    platform = process.platform,
     maxOutputBytes = MAX_GIT_OUTPUT_BYTES,
     timeoutMs = GIT_COMMAND_TIMEOUT_MS,
-    disableHooks = false,
-    runProcess = runSupervisedProcess,
-    onSpawned,
-    ...supervision
+    ...options
   } = {}
 ) {
-  const gitArguments = disableHooks
-    ? [...gitHookIsolationArguments({ platform }), ...args]
-    : [...args];
-
   try {
-    const result = await runProcess("git", gitArguments, {
-      cwd,
-      env: buildGitEnvironment(env, { platform }),
-      platform,
-      maxOutputBytes,
-      timeoutMs,
-      describeCommand: () => "git " + args.join(" "),
-      onSpawned,
-      ...supervision
-    });
+    const result = await runGitCommand(args, { ...options, maxOutputBytes, timeoutMs });
     return Object.freeze({ stdout: result.stdout, stderr: result.stderr });
   } catch (error) {
     throw asWorktreeManagerError(error);

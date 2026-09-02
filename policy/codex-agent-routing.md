@@ -28,7 +28,7 @@ There is no verification profile or compatibility alias. Codex performs narrow f
 - Use `rubber-duck` for adversarial but constructive critique of plans, architecture, assumptions, tests, implementation reasoning, or causal conclusions.
 - Use `security-review` for security-sensitive changed-code review with high-confidence exploitability criteria.
 
-## Phase 5 capability and custody boundaries
+## Capability, custody, and review-integrity boundaries
 
 Every delegation starts in fresh context. Runtime capability selection is profile-specific:
 
@@ -43,8 +43,20 @@ When `delegate_agent` starts a mutation-capable `task` or `general-purpose` exec
 
 The current enforcement boundary is Claude-runtime cooperative control plus same-user durable filesystem coordination: tool exposure, isolated settings/MCP configuration, shell guarding, sanitized child environment, atomic ownership records, Windows process identity, worktree isolation, and fail-closed reconciliation. It is not an OS sandbox and cannot prevent unrelated software from ignoring the ownership record. Windows forced termination requires a fresh PID-plus-start-time match before `taskkill /PID /T /F` and still requires exact-child terminal proof; no native Job Object dependency or crash-time process-tree cleanup is claimed, and `taskkill` cannot atomically bind its PID to the checked start time. Cross-platform process identity, nested delegation, parallel writers, persistent parents, automatic integration, and dirty-worktree snapshotting are not implemented.
 
+For `code-review` and `security-review`, the orchestrator attempts coherent review admission in the same single repository ownership slot writers use. Denial never suppresses the review: it makes the result advisory and unbound. Before the reviewer runs, a `REVIEW SUBJECT` may truthfully state that admission is currently held and will be verified later; it must never claim in advance that the completed interval was coherent. Only a valid bound `ReviewReceipt`, written after a matching AFTER collection and before release, may make that claim. Reviewers still receive no Bash.
+
+Codex interprets Phase 6 results conservatively:
+
+- `FRESH` means the immutable receipt's repository subject matches a current exact collection.
+- `STALE` means the subject changed. It requires a fresh review unless Codex explicitly accepts the old advice in its own reasoning; that decision is not carry-forward evidence.
+- `INDETERMINATE` means freshness was not proven. It must never be treated as fresh.
+- `unbound` means no verified review subject exists, even if the advisory review text is useful.
+- `unavailable` means binding evidence could not be produced; it does not change the specialist execution status.
+
+Prior receipts are discovered through a bounded stable-scope index so a receipt for state A remains findable at state B. The index is not evidence. Codex trusts only a fully validated self-verifying receipt and the orchestrator's computed freshness result. Codex never rewrites, deletes, re-labels, or reinterprets a stored receipt, and never treats a contract/model/assignment basis difference as repository-state staleness. A material correction after review changes the `ChangeSet` and requires a fresh review when independent review is still warranted.
+
 ## Briefs, review, and evidence
 
 Delegate only when independent context can materially improve correctness, confidence, or falsification. When useful, provide a bounded brief with Outcome, Done when, Boundaries, Authoritative context, Non-goals, Known evidence, and Required handoff. Do not require every heading for trivial exploration or a single command.
 
-For code review, provide the coherent change-set scope, intended behavior, important invariants, risk areas, deterministic evidence, and any accepted findings already fixed. A clean specialist result is advisory, not proof. Codex validates each substantive finding, reruns applicable deterministic gates after accepted corrections, and requests a fresh independent code review when a material correction makes the reviewed change set stale.
+For code review, provide the coherent change-set scope, intended behavior, important invariants, risk areas, deterministic evidence, and any accepted findings already fixed. Supply `target_ref` only as a fully-qualified `refs/heads/...` or `refs/remotes/...` ref; never invent an upstream. A clean specialist result is advisory, not proof. Codex validates each substantive finding, reruns applicable deterministic gates after accepted corrections, and requests a fresh independent code review when a material correction makes the reviewed change set stale.

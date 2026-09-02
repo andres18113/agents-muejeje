@@ -260,6 +260,7 @@ export function runSupervisedProcess(
     cancelSchedule = clearTimeout,
     now = Date.now,
     describeCommand = () => command + " " + args.join(" "),
+    encoding = "utf8",
     onSpawned
   } = {}
 ) {
@@ -279,6 +280,14 @@ export function runSupervisedProcess(
     if (!Number.isSafeInteger(terminationTimeoutMs) || terminationTimeoutMs <= 0) {
       reject(new SupervisedProcessError("Supervised process termination timeout is invalid.", {
         code: "supervised_process_timeout_invalid"
+      }));
+      return;
+    }
+    // Validated before the child exists, so an unsupported encoding can never
+    // leave a started process behind.
+    if (encoding !== "utf8" && encoding !== "buffer") {
+      reject(new SupervisedProcessError("Supervised process output encoding is invalid.", {
+        code: "supervised_process_encoding_invalid"
       }));
       return;
     }
@@ -324,6 +333,11 @@ export function runSupervisedProcess(
       taskkillHelper: undefined
     };
 
+    // Two distinct views of the same captured bytes. `output` is what callers
+    // receive and must preserve exact bytes under "buffer"; `text` is only ever
+    // interpolated into human-readable error messages and is always a string.
+    const output = (chunks) =>
+      encoding === "buffer" ? Buffer.concat(chunks) : Buffer.concat(chunks).toString("utf8").trim();
     const text = (chunks) => Buffer.concat(chunks).toString("utf8").trim();
     const hasLifecycleEnded = () => exitObserved || closeObserved;
 
@@ -351,8 +365,8 @@ export function runSupervisedProcess(
         {
           code: interruption.code,
           reason: interruption.reason,
-          stdout: text(stdout),
-          stderr: text(stderr),
+          stdout: output(stdout),
+          stderr: output(stderr),
           // Interrupting a command never proves it had no effect.
           sideEffectsUnproven: true,
           terminationProven,
@@ -451,8 +465,8 @@ export function runSupervisedProcess(
       settle(new SupervisedProcessError("Failed to run " + describeCommand() + ".", {
         code: "supervised_process_spawn_failed",
         cause: error,
-        stdout: text(stdout),
-        stderr: text(stderr)
+        stdout: output(stdout),
+        stderr: output(stderr)
       }));
     });
     child.once?.("close", (exitCode, signal) => {
@@ -472,15 +486,15 @@ export function runSupervisedProcess(
           {
             code: "supervised_process_failed",
             reason: "nonzero-exit",
-            stdout: text(stdout),
-            stderr: text(stderr),
+            stdout: output(stdout),
+            stderr: output(stderr),
             exitCode,
             signal
           }
         ));
         return;
       }
-      settle(undefined, Object.freeze({ stdout: text(stdout), stderr: text(stderr), exitCode }));
+      settle(undefined, Object.freeze({ stdout: output(stdout), stderr: output(stderr), exitCode }));
     });
     child.stdout?.on?.("data", (chunk) => capture(stdout, chunk));
     child.stderr?.on?.("data", (chunk) => capture(stderr, chunk));

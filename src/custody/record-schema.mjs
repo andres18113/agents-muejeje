@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { PROCESS_IDENTITY_MATCH, validateDurableProcessIdentity } from "../process-identity.mjs";
+import { isFullyQualifiedRef } from "../git-ref-name.mjs";
 
 /**
  * The durable ownership record: its vocabulary, its legal shapes, and the
@@ -31,6 +32,36 @@ export const STATES = new Set([
 ]);
 
 const WRITE_STATES = new Set(["ACTIVE", "TERMINATING", "ORPHANED"]);
+
+/**
+ * Why the single ownership slot is held.
+ *
+ * There is exactly one admission boundary per repository - the rename onto
+ * ownership/ - and Phase 6 reuses it rather than adding a second lock. A
+ * coherent review occupies the same slot a writer would, so the rename that
+ * excludes a second writer is the rename that excludes a writer during review.
+ *
+ * The field is optional and absent means "write". Records written for write
+ * executions are therefore byte-identical to the ones Phase 5 wrote, and a
+ * record from before Phase 6 needs no migration.
+ */
+export const CUSTODY_KINDS = Object.freeze({
+  WRITE: "write",
+  COHERENT_REVIEW: "coherent-review"
+});
+
+const CUSTODY_KIND_VALUES = new Set(Object.values(CUSTODY_KINDS));
+
+export function custodyKindOf(record) {
+  return record?.custodyKind === undefined ? CUSTODY_KINDS.WRITE : record.custodyKind;
+}
+
+/**
+ * Fields that only a write execution can legitimately carry. A reviewer never
+ * prepares a worktree and never supervises a mutating Git child, so a
+ * coherent-review record holding any of them is malformed, not merely unusual.
+ */
+const WRITE_ONLY_RECORD_FIELDS = Object.freeze(["gitOperation", "worktreeRoot", "baseCommit"]);
 export const SAFE_UNSTARTED_STATES = new Set(["RESERVED", "PREPARING_WORKTREE", "SPAWNING"]);
 
 /**
@@ -91,7 +122,13 @@ export function validTimestamp(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-export function accessModeForState(state) {
+/**
+ * A coherent review never has write authority in any state. It blocks other
+ * executions because the slot is occupied, not because it claims the right to
+ * mutate, and the record must say so honestly.
+ */
+export function accessModeForState(state, custodyKind = CUSTODY_KINDS.WRITE) {
+  if (custodyKind === CUSTODY_KINDS.COHERENT_REVIEW) return "none";
   return WRITE_STATES.has(state) ? "write" : "none";
 }
 
@@ -163,7 +200,9 @@ function expectedRecordKeys(record) {
     "worktreeRoot",
     "baseCommit",
     "orphanReason",
-    "terminalProof"
+    "terminalProof",
+    "custodyKind",
+    "targetRef"
   ]) {
     if (Object.hasOwn(record, optional)) keys.push(optional);
   }
@@ -245,7 +284,17 @@ export function validateDurableOwnershipRecord(record) {
     ) {
       return undefined;
     }
-    if (!STATES.has(record.state) || record.accessMode !== accessModeForState(record.state)) return undefined;
+    if (Object.hasOwn(record, "custodyKind") && !CUSTODY_KIND_VALUES.has(record.custodyKind)) return undefined;
+    const custodyKind = custodyKindOf(record);
+    if (!STATES.has(record.state)) return undefined;
+    if (record.accessMode !== accessModeForState(record.state, custodyKind)) return undefined;
+    if (custodyKind === CUSTODY_KINDS.COHERENT_REVIEW) {
+      if (record.state === "PREPARING_WORKTREE") return undefined;
+      if (WRITE_ONLY_RECORD_FIELDS.some((field) => Object.hasOwn(record, field))) return undefined;
+      if (!Array.isArray(record.transitions)) return undefined;
+      if (record.transitions.some((entry) => entry?.state === "PREPARING_WORKTREE")) return undefined;
+    }
+    if (Object.hasOwn(record, "targetRef") && !isFullyQualifiedRef(record.targetRef)) return undefined;
     if (
       !validTimestamp(record.createdAt) ||
       !validTimestamp(record.reservedAt) ||

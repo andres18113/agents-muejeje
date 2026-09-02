@@ -95,6 +95,59 @@ Every invocation uses a fresh Claude process. The full role contract and assignm
 | `rubber-duck` | read | Read, Grep, Glob | none |
 | `security-review` | read | Read, Grep, Glob | none; Lead supplies VCS/change-set evidence when needed |
 
+### Review integrity
+
+`code-review` and `security-review` participate in Phase 6 review binding because their existing profile capabilities declare `inspect-change-set`. They still receive only Read, Grep, and Glob: reviewers do not receive Bash and do not run Git. Before either reviewer starts, the orchestrator attempts to occupy the same durable ownership slot used by writers, collects a binary-safe Git-visible `ChangeSet`, and adds a `REVIEW SUBJECT` evidence block to the prompt. That block says only that admission is held at that moment and will be checked after the review; it never claims in advance that coherence covered the completed interval. If admission is denied, the reviewer still runs, but its result is advisory and unbound.
+
+The exact bound-review guarantee is:
+
+> The orchestrator excluded its own managed writers during the review interval and observed the same exact Git-visible ChangeSet and target context immediately before and after the review.
+
+Only a successfully persisted `ReviewReceipt` makes that completed-interval claim. A receipt is written only for a completed execution when coherent admission is still verifiably held and the independently collected BEFORE and AFTER identities match. Collection, admission, persistence, or binding failure does not change the specialist's execution status or discard its text; it produces `ReviewBinding: unavailable` or `ReviewBinding: unbound` with reason codes instead.
+
+The `ChangeSet` identity covers eight independently digested sections: `head`, declared review `target`, collection `policy`, staged `index`, unstaged `worktree`, `unmerged`, `untracked`, and `submodules`. Worktree and untracked content is hashed from exact bytes with file/symlink domain separation. Repository-relative path bytes, modes, object IDs, unmerged stages, and target resolution are identity-bearing. Branch name, merge-base, and counts are summary metadata and are not hashed. Ignored files are excluded. A sparse checkout, dirty submodule, opaque untracked directory, unstable read, custody ambiguity, size/deadline breach, or unsupported state yields an indeterminate collection instead of a guessed identity.
+
+An optional `target_ref` may be supplied to `delegate_agent` for `general-purpose`, `code-review`, or `security-review`. It must be fully qualified under `refs/heads/` or `refs/remotes/`. A review resolves the target independently during both collections; movement or deletion therefore changes the subject. No upstream, `origin/HEAD`, `origin/main`, or status-header target is inferred. A `general-purpose` worktree records its declared target so a later review inside that retained worktree can inherit it with explicit `worktree-metadata` provenance.
+
+Receipts are immutable, self-verifying canonical-JSON records. Validation recomputes both `reviewId` and the `changeSetId` derivation from the stored object format and all eight section digests. Their basis contains the exact UTF-8 SHA-256 of the contract, canonical-JSON SHA-256 of the resolved capability policy, exact UTF-8 assignment SHA-256 plus JavaScript character count, exact UTF-8 result SHA-256 plus byte count, requested model selector and its source, profile model strategy, and requested reasoning effort. The model selector is not represented as an observed effective model: this runtime cannot prove which concrete served model fulfilled the selector. Receipts contain no assignment body, review text, contract text, environment values, secrets, absolute paths, or repository-relative path names. They are integrity-protected but unsigned, so they do not authenticate an author or producer.
+
+Durable evidence and non-evidentiary discovery are separate:
+
+```text
+%LOCALAPPDATA%\claude-agents-mcp\state-v1\repositories\<repository-sha256>\
+  ownership\record.json
+  reviews\
+    cs\<change-set-prefix>\<review-prefix>\receipt.json
+    sc\<stable-scope-prefix>\<timestamp>-<review-prefix>.json
+```
+
+The `cs` tree is authoritative immutable evidence. The bounded `sc` tree contains only lookup pointers keyed by stable review scope (reviewer profile plus declared target ref), not by the current `changeSetId`. This is why receipt A remains discoverable after the repository becomes B and can be validated and evaluated as `STALE`. A pointer is never trusted as evidence: its identifiers are strictly validated, its referenced receipt must validate, the receipt's full scope must match the lookup, and both content-addressed IDs are recomputed. At most 16 prior receipts are returned per discovery, the newest 32 pointers per scope are retained, and at most 64 immutable receipts are admitted per change set. Pointer pruning never deletes a receipt; failure to update the non-evidentiary index never downgrades or removes an already durable receipt. The system has no receipt retention or automatic cleanup.
+
+Freshness is computed and never stored. `FRESH` means the current exact identity matches the receipt. `STALE` means it differs and reports the changed sections. `INDETERMINATE` means the current state, receipt, or schema comparison cannot prove either answer. Contract, capability-policy, assignment, requested model, model strategy, and effort differences are reported as basis differences but never alter repository-state freshness. Prior receipts are reported; they never skip a new review or mutate/carry forward old evidence.
+
+Review binding can be disabled with `CLAUDE_AGENTS_REVIEW_BINDING=off`, which restores the Phase 5 review path: no review admission, collection, receipt, or binding output. `target_ref` is still validated at the public boundary.
+
+The honest limits are:
+
+1. There is no filesystem snapshot isolation. Double Git-status and per-file double-stat brackets detect churn conservatively but cannot detect every change-and-revert within one timestamp tick.
+2. Paths Git reports clean use Git's index/object evidence rather than re-hashing every tracked file, so collection inherits Git's racily-clean semantics.
+3. Only cooperating managed writers are excluded. A user, IDE, or unrelated process may ignore custody; BEFORE/AFTER comparison detects many such mutations, not all possible transient ones.
+4. Receipts are unsigned. A local actor able to write the state directory can forge a self-consistent receipt.
+5. `changeSetId` is machine- and worktree-local. Raw checkout bytes, including line endings, intentionally make it unsuitable as a portable logical-patch identity.
+6. Ignored files are outside the subject even though a reviewer with Read may be able to open one by name.
+7. Dirty submodules and sparse checkouts are indeterminate; recursive exact representation is deferred.
+8. Target commit is identity-bearing. A fetched branch advance conservatively makes prior receipts stale even when worktree bytes did not change.
+9. A crashed coherent review can block writers under the same fail-closed reconciliation rules as a crashed writer, and reviews of one repository serialize.
+10. A review attempted while a writer owns the slot degrades to an advisory unbound review.
+11. A repository or target that changes during the review produces no receipt; runtime output reports both identities when available.
+12. Receipts have no automatic retention or pruning. The per-change-set cap bounds one namespace, but manual external cleanup is the operator's responsibility.
+13. Twenty-hex path prefixes can theoretically collide. Collisions are detected and refused, never merged silently.
+14. `changeSetId` does not include repository identity. Receipts are nevertheless stored beneath the repository's own SHA-256 coordination identity.
+15. Non-UTF-8 paths are identity-bearing as hex but displayed as `<non-utf8 path: ...>`, so the reviewer may not be able to address them by native name.
+16. Collection costs two status snapshots plus content hashing. Entry, byte, output, and 180-second collection limits yield indeterminate rather than hanging; final review binding has a separate outer deadline so it cannot retain custody forever.
+17. There is no carry-forward mechanism. Accepting a stale review is a Lead decision outside the receipt and never changes it.
+18. Process-identity reconciliation remains Windows-specific. On other platforms a foreign crashed owner remains fail-closed and may require manual intervention.
+
 `task` and `general-purpose` acquire durable write admission before Claude starts. The authoritative record lives outside the checkout at `%LOCALAPPDATA%\claude-agents-mcp\state-v1\repositories\<repository-sha256>\ownership\record.json`. It contains only versioned lifecycle metadata: execution/profile identity, canonical repository identity, timestamps, coordinator and Claude PID-plus-start-time identities, the identity of a supervised mutating Git operation while one is in flight, worktree metadata when applicable, and a monotonic record revision. It never contains the assignment, role contract, secrets, or environment values. Valid Phase 5.2 schema-1 records remain readable and upgrade to the revisioned schema on their next guarded mutation; unknown record shapes fail closed.
 
 Admission uses an atomically renamed ownership directory, so separate MCP processes contend for the same Git common-directory identity. Within one live coordinator, every authoritative ownership read, validation, revision-checked publication, archive, and admission is serialized per repository. Each mutation validates its execution and record revision again immediately before publication, so a stale callback cannot overwrite a later state, released archive, or newly admitted owner. The lifecycle is `RESERVED` (`accessMode:none`), optional `PREPARING_WORKTREE`, `SPAWNING`, `ACTIVE`, optional `TERMINATING`/`ORPHANED`, `TERMINAL_PROVEN`, `HANDOFF_READY`, and `RELEASED`. A terminal record is archived under `executions/<executionId>`; its disappearance is never inferred from time or lease expiry. Before admitting a new writer, reconciliation checks both coordinator and Claude identities. The same live process blocks; a definitely dead or PID-reused process can be reconciled; unavailable identity remains blocked. A dead coordinator with live Claude is retained as `ORPHANED`. A `SPAWNING`/preparation record without sufficient child identity also fails closed. A record whose coordinator had already begun forced termination (`TERMINATING`, or an existing `ORPHANED`) never releases automatically after that coordinator dies, even when the recorded Claude process is itself proven dead: beginning termination is what may have launched a destructive `taskkill` helper, and that helper's lifecycle was known only in the crashed coordinator's memory, so no later coordinator can observe whether it finished. A dead target proves the target died, not that the repository is quiet, so such records stay `ORPHANED` and keep blocking. Only states whose terminal proof is already durable (`TERMINAL_PROVEN`, `HANDOFF_READY`) may complete a release after coordinator death.
@@ -119,6 +172,7 @@ On Windows, process identity is `{pid, process StartTime UTC ticks}` obtained th
 - `CLAUDE_AGENTS_CLAUDE_BIN` — Claude executable; defaults to `claude`.
 - `CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS` — explicit delegated-call timeout override; otherwise the selected profile timeout applies.
 - `CLAUDE_AGENTS_MAX_CAPTURE_BYTES` — stdout/stderr capture limit; defaults to 2 MiB.
+- `CLAUDE_AGENTS_REVIEW_BINDING` — `on` (default) enables coherent review binding; `off` restores the Phase 5 review path.
 
 ## Codex MCP timeout
 

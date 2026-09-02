@@ -1,0 +1,361 @@
+import { AGENT_REGISTRY } from "../agent-registry.mjs";
+import { COLLECTOR_VERSION } from "../changeset/collector.mjs";
+import { NO_REVIEW_TARGET } from "../changeset/target.mjs";
+import { repositoryIdForCanonicalRootKey } from "../write-custody.mjs";
+import { COHERENCE } from "./coherent-admission.mjs";
+import { assignmentBasis, resultBasis, reviewerBasis } from "./receipt-basis.mjs";
+import { buildReviewReceipt, COHERENT_ADMISSION_KIND } from "./receipt-schema.mjs";
+import { evaluateFreshness } from "./freshness.mjs";
+import { formatReviewSubjectBlock } from "./review-subject.mjs";
+
+/**
+ * The BEFORE / reviewer / AFTER lifecycle.
+ *
+ * The whole point of this module is a single question: may this review's output
+ * be bound to an exact repository state? It answers it by collecting the
+ * subject before the reviewer runs, collecting it again afterwards, confirming
+ * the exclusive admission survived in between, and writing a receipt only if
+ * all three agree.
+ *
+ * Neither method throws, ever. A review that produced useful findings must
+ * still return them when the evidence machinery fails; the failure is reported
+ * as a binding status, never as a failed delegation. That asymmetry is
+ * deliberate - Phase 6 adds evidence, and it is not allowed to subtract
+ * reviews.
+ *
+ * An unbound review persists nothing at all. The only durable object here is a
+ * receipt whose subject is provable, and a review whose subject moved has no
+ * provable subject; storing a record of that would create an object whose
+ * entire content is a negative claim.
+ */
+
+export const REVIEW_BINDING_CAPABILITY = "inspect-change-set";
+
+export function profileParticipatesInReviewBinding(profile) {
+  return Boolean(profile?.declaredCapabilities?.includes(REVIEW_BINDING_CAPABILITY));
+}
+
+export function reviewBindingProfileIds() {
+  return Object.values(AGENT_REGISTRY)
+    .filter(profileParticipatesInReviewBinding)
+    .map((profile) => profile.id);
+}
+
+function reasons(...codes) {
+  return Object.freeze(codes.flat().filter(Boolean).map((code) =>
+    typeof code === "string" ? Object.freeze({ code }) : Object.freeze(code)));
+}
+
+function unavailable(coherence, reasonList, extra = {}) {
+  return Object.freeze({
+    status: "unavailable",
+    coherence,
+    reasons: Object.freeze(reasonList),
+    priorReviews: Object.freeze([]),
+    ...extra
+  });
+}
+
+export function createReviewBinder({
+  collectChangeSet,
+  coherentAdmission,
+  receiptStore,
+  evaluateFreshnessFn = evaluateFreshness,
+  now = Date.now,
+  producerVersion = "claude-agents-mcp/0.2.0"
+} = {}) {
+
+  /**
+   * Discovers prior receipts for this review scope and evaluates each against
+   * the state just collected.
+   *
+   * Discovery is by scope rather than by current change set precisely so a
+   * receipt taken against an older state is still found. Looking up by the
+   * current change set can only ever surface receipts that are already fresh,
+   * which makes STALE unreachable in practice.
+   *
+   * Every discovered receipt is fully validated by evaluateFreshness before its
+   * verdict is used; the discovery index is a hint about where to look and is
+   * never treated as evidence in its own right.
+   */
+  async function discoverPriorReviews({ canonicalRootKey, agentType, targetSpec, current, basis }) {
+    if (!receiptStore || typeof receiptStore.discoverForScope !== "function") return [];
+    let discovered;
+    try {
+      discovered = await receiptStore.discoverForScope({
+        canonicalRootKey,
+        agentType,
+        targetSpec
+      });
+    } catch {
+      return [];
+    }
+    const priorReviews = discovered.receipts.map((receipt) => {
+      const verdict = evaluateFreshnessFn({ receipt, current, basis, now });
+      return Object.freeze({
+        reviewId: receipt.reviewId,
+        agentType: receipt.reviewer.agentType,
+        changeSetId: receipt.binding.changeSetId,
+        recordedAt: receipt.provenance.recordedAt,
+        verdict: verdict.verdict,
+        changedSections: verdict.changedSections
+      });
+    });
+    for (const skipped of discovered.skipped ?? []) {
+      if (typeof skipped.reviewId !== "string" || typeof skipped.changeSetId !== "string") continue;
+      priorReviews.push(Object.freeze({
+        reviewId: skipped.reviewId,
+        agentType,
+        changeSetId: skipped.changeSetId,
+        recordedAt: Number.isSafeInteger(skipped.recordedAt) ? skipped.recordedAt : null,
+        verdict: "INDETERMINATE",
+        changedSections: Object.freeze([])
+      }));
+    }
+    return priorReviews;
+  }
+
+  async function before({
+    profile,
+    runtime,
+    contract,
+    capabilityPolicy,
+    task,
+    workspace,
+    coherence,
+    custodyExecutionId,
+    targetSpec = NO_REVIEW_TARGET
+  }) {
+    try {
+      if (!profileParticipatesInReviewBinding(profile)) {
+        return unavailable(COHERENCE.NOT_ATTEMPTED, reasons("profile_not_review_bound"));
+      }
+
+      const reviewer = reviewerBasis({
+        agentType: profile.id,
+        contract,
+        capabilityPolicy,
+        runtime
+      });
+      const assignment = assignmentBasis(task);
+      const basis = {
+        agentType: profile.id,
+        contractSha256: reviewer.contractSha256,
+        capabilityPolicySha256: reviewer.capabilityPolicySha256,
+        modelSelector: reviewer.modelSelector,
+        reasoningEffort: reviewer.reasoningEffort,
+        assignmentSha256: assignment.sha256
+      };
+
+      // Under held admission the collector must confirm the slot is still ours;
+      // otherwise it can only observe, and any live foreign record makes the
+      // reading indeterminate rather than exact.
+      const custodyExpectation = coherence === COHERENCE.HELD
+        ? { mode: "exclusive-held", executionId: custodyExecutionId }
+        : { mode: "observational" };
+
+      const current = await collectChangeSet({
+        effectiveCwd: workspace.effectiveCwd,
+        rootSource: workspace.rootSource,
+        canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+        targetSpec,
+        custodyExpectation
+      });
+      const collectedAt = now();
+
+      const priorReviews = await discoverPriorReviews({
+        canonicalRootKey: workspace.canonicalRepositoryKey,
+        agentType: profile.id,
+        targetSpec,
+        current,
+        basis
+      });
+
+      const reviewSubject = formatReviewSubjectBlock({
+        status: current.status,
+        coherence,
+        changeSetId: current.changeSetId,
+        descriptor: current.descriptor,
+        reasons: current.reasons
+      });
+
+      return Object.freeze({
+        status: current.status === "exact" ? "collected" : "indeterminate",
+        coherence,
+        custodyExecutionId,
+        targetSpec,
+        reviewer,
+        assignment,
+        basis,
+        collectedAt,
+        current,
+        reviewSubject,
+        priorReviews: Object.freeze(priorReviews),
+        reasons: Object.freeze(current.status === "exact" ? [] : [...current.reasons])
+      });
+    } catch (error) {
+      return unavailable(coherence ?? COHERENCE.NOT_ATTEMPTED,
+        reasons({ code: "review_binding_internal_error", detail: error?.code || error?.name }));
+    }
+  }
+
+  async function after({ beforeState, workspace, outcome, executionId, startedAt, completedAt }) {
+    try {
+      if (!beforeState || beforeState.status === "unavailable") {
+        return unavailable(beforeState?.coherence ?? COHERENCE.NOT_ATTEMPTED,
+          reasons(beforeState?.reasons ?? [], "review_binding_unavailable"));
+      }
+
+      const priorReviews = beforeState.priorReviews ?? Object.freeze([]);
+
+      if (outcome?.status !== "completed") {
+        return unavailable(beforeState.coherence,
+          reasons("execution_not_completed"), { priorReviews });
+      }
+      if (beforeState.coherence !== COHERENCE.HELD) {
+        return unavailable(beforeState.coherence,
+          reasons("coherent_admission_denied"), { priorReviews });
+      }
+      if (beforeState.status !== "collected") {
+        return unavailable(beforeState.coherence,
+          reasons(beforeState.reasons, "before_collection_indeterminate"), { priorReviews });
+      }
+
+      // The slot could have been reconciled away if this coordinator was ever
+      // wrongly judged dead. If that happened the interval was not actually
+      // held, and no receipt may claim it was.
+      const stillHeld = await coherentAdmission.verifyStillHeld({
+        executionId: beforeState.custodyExecutionId,
+        canonicalRootKey: workspace.canonicalRepositoryKey
+      });
+      if (!stillHeld.held) {
+        return Object.freeze({
+          status: "unbound",
+          coherence: COHERENCE.LOST,
+          reasons: Object.freeze([...stillHeld.reasons]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          priorReviews
+        });
+      }
+
+      const afterState = await collectChangeSet({
+        effectiveCwd: workspace.effectiveCwd,
+        rootSource: workspace.rootSource,
+        canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+        targetSpec: beforeState.targetSpec,
+        custodyExpectation: { mode: "exclusive-held", executionId: beforeState.custodyExecutionId }
+      });
+      const afterAt = now();
+
+      if (afterState.status !== "exact") {
+        return Object.freeze({
+          status: "unbound",
+          coherence: beforeState.coherence,
+          reasons: Object.freeze([...afterState.reasons, { code: "after_collection_indeterminate" }]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          priorReviews
+        });
+      }
+
+      if (afterState.changeSetId !== beforeState.current.changeSetId) {
+        return Object.freeze({
+          status: "unbound",
+          coherence: beforeState.coherence,
+          reasons: Object.freeze([{ code: "workspace_mutated_during_review" }]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          afterChangeSetId: afterState.changeSetId,
+          priorReviews
+        });
+      }
+
+      // Collection verifies ownership at its start. Verify once more after the
+      // exact snapshot has been assembled so the receipt covers the complete
+      // claimed interval through AFTER, not merely the instant before it.
+      const heldThroughAfter = await coherentAdmission.verifyStillHeld({
+        executionId: beforeState.custodyExecutionId,
+        canonicalRootKey: workspace.canonicalRepositoryKey
+      });
+      if (!heldThroughAfter.held) {
+        return Object.freeze({
+          status: "unbound",
+          coherence: COHERENCE.LOST,
+          reasons: Object.freeze([...heldThroughAfter.reasons]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          afterChangeSetId: afterState.changeSetId,
+          priorReviews
+        });
+      }
+
+      const descriptor = afterState.descriptor;
+      const recordedAt = now();
+      const receipt = buildReviewReceipt({
+        binding: {
+          changeSetId: afterState.changeSetId,
+          objectFormat: descriptor.objectFormat,
+          sections: { ...afterState.sections },
+          target: {
+            spec: { ...descriptor.target.spec },
+            resolution: descriptor.target.resolution,
+            commit: descriptor.target.commit
+          },
+          summary: {
+            headCommit: descriptor.head.commit,
+            branch: descriptor.summary.branch,
+            detached: descriptor.summary.detached,
+            mergeBase: descriptor.summary.mergeBase,
+            counts: { ...descriptor.summary.counts }
+          }
+        },
+        coherence: {
+          admission: COHERENT_ADMISSION_KIND,
+          custodyExecutionId: beforeState.custodyExecutionId,
+          beforeAt: beforeState.collectedAt,
+          afterAt
+        },
+        reviewer: { ...beforeState.reviewer },
+        assignment: { ...beforeState.assignment },
+        execution: {
+          executionId,
+          status: "completed",
+          startedAt,
+          completedAt,
+          durationMs: Math.max(0, completedAt - startedAt)
+        },
+        result: resultBasis(outcome.result),
+        provenance: {
+          repositoryId: repositoryIdForCanonicalRootKey(workspace.canonicalRepositoryKey),
+          producer: producerVersion,
+          collector: COLLECTOR_VERSION,
+          recordedAt
+        }
+      });
+
+      try {
+        await receiptStore.put({
+          canonicalRootKey: workspace.canonicalRepositoryKey,
+          receipt
+        });
+      } catch (error) {
+        return unavailable(beforeState.coherence,
+          reasons({ code: "review_receipt_persist_failed", detail: error?.code || error?.name }),
+          { beforeChangeSetId: beforeState.current.changeSetId, priorReviews });
+      }
+
+      return Object.freeze({
+        status: "bound",
+        coherence: COHERENCE.HELD,
+        reasons: Object.freeze([]),
+        changeSetId: afterState.changeSetId,
+        beforeChangeSetId: beforeState.current.changeSetId,
+        afterChangeSetId: afterState.changeSetId,
+        reviewId: receipt.reviewId,
+        priorReviews
+      });
+    } catch (error) {
+      return unavailable(beforeState?.coherence ?? COHERENCE.NOT_ATTEMPTED,
+        reasons({ code: "review_binding_internal_error", detail: error?.code || error?.name }));
+    }
+  }
+
+  return Object.freeze({ before, after });
+}

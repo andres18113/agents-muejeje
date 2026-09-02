@@ -364,14 +364,21 @@ test("child-process launch responsibilities remain explicit and no legacy runtim
   assert.match(sourceByFile["process-identity.mjs"], /StartTime\.ToUniversalTime\(\)\.Ticks/);
   assert.match(sourceByFile["process-identity.mjs"], /InvariantCulture/);
   assert.doesNotMatch(sourceByFile["process-identity.mjs"], /Format-Table|ConvertFrom-String|Out-String/);
-  assert.match(sourceByFile["worktree-manager.mjs"], /runSupervisedProcess/);
+  // Orchestration Git still reaches exactly one supervised primitive; the
+  // read-only half of that path was extracted so change-set collection can
+  // run Git without importing the writer lifecycle. Both links are pinned.
+  assert.match(sourceByFile["git-command.mjs"], /runSupervisedProcess/);
+  assert.match(sourceByFile["worktree-manager.mjs"], /from "\.\/git-command\.mjs"/);
+  assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /spawn\(/);
   assert.doesNotMatch(sourceByFile["process-identity.mjs"], /claudeBin/);
   assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /claudeBin/);
 
   // Git is an external execution boundary: it receives a built environment,
-  // never the inherited parent environment.
-  assert.match(sourceByFile["worktree-manager.mjs"], /env: buildGitEnvironment\(/);
-  assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /env:\s*process\.env/);
+  // never the inherited parent environment. That now holds at the one place
+  // every Git invocation passes through, for writers and readers alike.
+  assert.match(sourceByFile["git-command.mjs"], /env: buildGitEnvironment\(/);
+  assert.doesNotMatch(sourceByFile["git-command.mjs"], /env:\s*process\.env,/);
+  assert.doesNotMatch(sourceByFile["worktree-manager.mjs"], /env:\s*process\.env,/);
   // No process is ever terminated by name, anywhere in the tree.
   for (const name of sourceFiles) {
     assert.doesNotMatch(sourceByFile[name], /\/IM/, name + " must not kill by image name");
@@ -415,11 +422,16 @@ test("tracked routing policy and documentation name only the consolidated profil
   assert.match(routingPolicy, /Runtime capability selection is profile-specific/);
   assert.match(routingPolicy, /Codex must not concurrently edit that repository/);
   assert.match(routingPolicy, /not an OS sandbox/);
+  assert.match(routingPolicy, /`STALE` means the subject changed/);
+  assert.match(routingPolicy, /`INDETERMINATE` means freshness was not proven/);
+  assert.match(routingPolicy, /`unbound` means no verified review subject exists/);
   assert.doesNotMatch(routingPolicy, /delegate_agent\(agent_type="verify"\)/);
   assert.doesNotMatch(readme, /agents\/verify\.md/);
   assert.match(readme, /npm ci/);
   assert.match(readme, /npm run ci/);
   assert.match(readme, /policy\/codex-agent-routing\.md/);
+  assert.match(readme, /The orchestrator excluded its own managed writers during the review interval/);
+  assert.match(readme, /CLAUDE_AGENTS_REVIEW_BINDING/);
   assert.match(installer, /Run: npm ci/);
   assert.doesNotMatch(installer, /AGENTS\.md/);
 
@@ -450,24 +462,17 @@ test("package metadata and Windows CI provide clean deterministic validation", a
   assert.equal(packageLock.packages[""].name, packageJson.name);
   assert.deepEqual(packageLock.packages[""].dependencies, packageJson.dependencies);
   assert.match(packageJson.scripts.test, /node --test/);
-  for (const sourceFile of [
-    "src/index.mjs",
-    "src/agent-registry.mjs",
-    "src/agent-contracts.mjs",
-    "src/capability-policy.mjs",
-    "src/claude-environment.mjs",
-    "src/claude-runtime-settings.mjs",
-    "src/shell-policy.mjs",
-    "src/workspace-root.mjs",
-    "src/process-identity.mjs",
-    "src/write-custody.mjs",
-    "src/worktree-manager.mjs",
-    "src/delegate-agent.mjs",
-    "src/prompt-composer.mjs",
-    "src/claude-runner.mjs",
-    "hooks/claude-pretool-policy.mjs"
-  ]) {
+  const sourceModules = (await readdir(path.join(projectRoot, "src"), { recursive: true }))
+    .filter((name) => name.endsWith(".mjs"))
+    .map((name) => "src/" + name.replaceAll("\\", "/"));
+  for (const sourceFile of [...sourceModules, "hooks/claude-pretool-policy.mjs"]) {
     assert.match(packageJson.scripts.check, new RegExp(sourceFile.replace(/[./]/g, "\\$&")));
+  }
+  const testModules = (await readdir(path.join(projectRoot, "tests")))
+    .filter((name) => name.endsWith(".test.mjs"))
+    .map((name) => "tests/" + name);
+  for (const testFile of testModules) {
+    assert.match(packageJson.scripts.test, new RegExp(testFile.replace(/[./]/g, "\\$&")));
   }
   assert.match(packageJson.scripts.ci, /npm run check/);
   assert.match(packageJson.scripts.ci, /npm test/);
@@ -484,9 +489,9 @@ test("repository source and tests contain no hard-coded personal path or global 
   const files = (
     await Promise.all(
       directories.map(async (directory) =>
-        (await readdir(directory, { withFileTypes: true }))
-          .filter((entry) => entry.isFile() && entry.name.endsWith(".mjs"))
-          .map((entry) => path.join(directory, entry.name))
+        (await readdir(directory, { recursive: true }))
+          .filter((name) => name.endsWith(".mjs"))
+          .map((name) => path.join(directory, name))
       )
     )
   ).flat();
