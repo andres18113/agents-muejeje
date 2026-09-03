@@ -18,6 +18,7 @@ import { buildClaudeEnvironment } from "./claude-environment.mjs";
 import {
   MAX_CLAUDE_TIMEOUT_MS,
   ClaudeTimeoutError,
+  ClaudeRunnerError,
   runClaudeAgent
 } from "./claude-runner.mjs";
 import { composeAgentPrompt } from "./prompt-composer.mjs";
@@ -744,6 +745,12 @@ export async function delegateAgent(input, dependencies = {}) {
   const task = input?.task;
   const cwd = input?.cwd;
   const requestedTargetRef = input?.targetRef;
+  const abortSignal = input?.abortSignal ?? dependencies.abortSignal ?? dependencies.clientAbortSignal;
+  const reconcileOnly = Boolean(
+    input?.reconcileOnly === true ||
+    input?.reconcile_only === true ||
+    task?.trim()?.toLowerCase() === "reconcile"
+  );
   const getProfile = dependencies.getProfile || getAgentProfile;
   const loadContract = dependencies.loadContract || loadAgentContract;
   const resolveCwd =
@@ -764,6 +771,20 @@ export async function delegateAgent(input, dependencies = {}) {
   validateDelegationTask(task);
   const executionId = requireExecutionId(createExecutionId);
   const profile = getProfile(agentType);
+
+  if (reconcileOnly && profile.id !== "code-review" && profile.id !== "security-review") {
+    throw new DelegateAgentInputError(
+      "reconcile_only is only supported for review profiles (code-review, security-review)."
+    );
+  }
+
+  if (abortSignal?.aborted) {
+    throw new ClaudeRunnerError("Client cancelled delegation before execution started.", {
+      code: "claude_cancelled",
+      processStarted: false
+    });
+  }
+
   const runtime = resolveRuntime(profile, { env });
   const targetRef = validateDelegationTargetRef(profile, requestedTargetRef);
   const requestedCwd = await resolveCwd(cwd);
@@ -949,149 +970,216 @@ export async function delegateAgent(input, dependencies = {}) {
           }
         };
       }
-    }
 
-    if (custodyPlan === "write") {
-      reservation = await writeCustody.reserveWriteAccess({
-        executionId,
-        agentType: profile.id,
-        canonicalRoot: workspace.repositoryRoot,
-        canonicalRootKey: workspace.canonicalRepositoryKey,
-        ...(targetRef === undefined ? {} : { targetRef })
-      });
-      custodyState = reservation.state.toLowerCase();
-      processProvenNotStarted = true;
+      if (reconcileOnly) {
+        const history = reviewBeforeState?.receiptHistory ?? {
+          status: "indeterminate",
+          receipts: reviewBeforeState?.priorReviews ?? [],
+          diagnostics: [{ code: "review_history_unavailable" }]
+        };
+        const freshReceipt = history.receipts?.find((r) => r.verdict === "FRESH");
+        const staleReceipt = history.receipts?.find((r) => r.verdict === "STALE");
+        const currentChangeSetId = reviewBeforeState?.current?.changeSetId;
 
-      if (profile.id === "general-purpose") {
-        const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
-        executionWorkspace = await isolatedWorktrees.prepare({
-          executionId,
-          canonicalRepositoryKey: workspace.canonicalRepositoryKey,
-          repositoryRoot: workspace.repositoryRoot,
-          effectiveCwd: workspace.effectiveCwd
-        });
-      } else {
-        reservation = await writeCustody.markSpawning({
-          executionId,
-          canonicalRootKey: workspace.canonicalRepositoryKey
-        });
-        custodyState = reservation.state.toLowerCase();
+        reviewBinding = {
+          status: freshReceipt ? "bound" : (history.receipts?.length > 0 ? "stale" : "unavailable"),
+          coherence: reviewCoherence,
+          reasons: freshReceipt ? [] : (staleReceipt ? staleReceipt.reasons : [{ code: "no_receipts_found" }]),
+          changeSetId: currentChangeSetId,
+          beforeChangeSetId: currentChangeSetId,
+          afterChangeSetId: currentChangeSetId,
+          reviewId: freshReceipt?.reviewId ?? staleReceipt?.reviewId ?? null,
+          priorReviews: history.receipts ?? [],
+          receiptHistory: history,
+          publication: {
+            status: "not-attempted",
+            authorityStarted: false,
+            settled: false
+          }
+        };
+
+        let resultMessage;
+        if (freshReceipt) {
+          resultMessage =
+            `Reconciled authoritative review receipt ${freshReceipt.reviewId} (FRESH for changeSet ${currentChangeSetId}).\n` +
+            `Agent: ${profile.id}\n` +
+            `Target: ${targetSpec?.spec?.ref || "uncommitted HEAD"}\n` +
+            `No Claude specialist was spawned; 0 model quota consumed.`;
+        } else if (staleReceipt) {
+          resultMessage =
+            `Discovered prior review receipt ${staleReceipt.reviewId} is STALE for current changeSet ${currentChangeSetId}.\n` +
+            `Changed sections: ${(staleReceipt.changedSections || []).join(", ") || "none"}\n` +
+            `Reasons: ${(staleReceipt.reasons || []).map((r) => r.code).join(", ")}\n` +
+            `A fresh ${profile.id} delegation is required.`;
+        } else {
+          resultMessage =
+            `No prior review receipts discovered for scope ${profile.id} in this repository.\n` +
+            `Current ChangeSetId: ${currentChangeSetId || "unavailable"}`;
+        }
+
+        outcome = {
+          ...baseOutcome({
+            profile,
+            runtime,
+            workspace: executionWorkspace,
+            executionId,
+            startedAt,
+            now,
+            custodyState
+          }),
+          status: "completed",
+          accessMode: "read",
+          durationMs: Math.max(0, now() - startedAt),
+          result: resultMessage,
+          stderrSummary: ""
+        };
       }
     }
 
-    // The root Claude actually operates in: the isolated worktree for
-    // general-purpose, the coordinated repository root for everyone else.
-    const workspaceRoot = executionWorkspace.workspaceRoot || executionWorkspace.repositoryRoot;
-    const prompt = composePrompt({
-      profile,
-      contract,
-      task,
-      effectiveCwd: executionWorkspace.effectiveCwd,
-      workspaceRoot,
-      repositoryRoot: executionWorkspace.repositoryRoot,
-      executionId,
-      runtime,
-      reviewSubject: reviewBeforeState?.reviewSubject
-    });
-    const lifecycleCustody = reservation &&
-      (custodyPlan === "write" || reviewCoherence === COHERENCE.HELD);
-    if (lifecycleCustody) processProvenNotStarted = false;
+    if (!reconcileOnly) {
+      if (custodyPlan === "write") {
+        reservation = await writeCustody.reserveWriteAccess({
+          executionId,
+          agentType: profile.id,
+          canonicalRoot: workspace.repositoryRoot,
+          canonicalRootKey: workspace.canonicalRepositoryKey,
+          ...(targetRef === undefined ? {} : { targetRef })
+        });
+        custodyState = reservation.state.toLowerCase();
+        processProvenNotStarted = true;
 
-    runnerInvoked = true;
-    const execution = await runAgent({
-      profile,
-      agentType: profile.id,
-      prompt,
-      cwd: executionWorkspace.effectiveCwd,
-      // Process identity binds to the repository that granted custody, which
-      // is the same root the prompt reports as the repository root.
-      repositoryRoot: executionWorkspace.repositoryRoot,
-      executionId,
-      runtime,
-      onChildStarted: lifecycleCustody
-        ? async (processIdentity, { mutationSignal } = {}) => {
-            writerProcessStarted = true;
-            writerProcessIdentity = processIdentity;
-            try {
-              reservation = await writeCustody.activateWriteAccess({
-                executionId,
-                canonicalRootKey: workspace.canonicalRepositoryKey,
-                processIdentity,
-                mutationSignal
-              });
-              custodyState = reservation.state.toLowerCase();
-            } catch (error) {
-              if (custodyPlan === "write") throw error;
-              reviewCoherence = COHERENCE.LOST;
-              reviewBindingReasons.push({
-                code: "coherent_admission_lifecycle_failed",
-                detail: error?.code || error?.name
-              });
-            }
-          }
-        : undefined,
-      onTerminationStarted: lifecycleCustody
-        ? async (processIdentity, { mutationSignal } = {}) => {
-            writerProcessStarted = true;
-            writerProcessIdentity = processIdentity;
-            try {
-              reservation = await writeCustody.beginTermination({
-                executionId,
-                canonicalRootKey: workspace.canonicalRepositoryKey,
-                processIdentity,
-                mutationSignal
-              });
-              custodyState = reservation.state.toLowerCase();
-            } catch (error) {
-              if (custodyPlan === "write") throw error;
-              reviewCoherence = COHERENCE.LOST;
-              reviewBindingReasons.push({
-                code: "coherent_admission_lifecycle_failed",
-                detail: error?.code || error?.name
-              });
-            }
-          }
-        : undefined,
-      onLateTerminalProof: lifecycleCustody
-        ? async (lateTerminalProof) => {
-            // runClaudeAgent invokes this only after a termination-unproven
-            // outcome. Wait until this invocation has durably retained the
-            // orphan first, then let the same coordinator's exact close proof
-            // take the explicit ORPHANED -> RELEASED recovery path. The
-            // already-constructed delegation outcome remains its synchronous
-            // custodyState snapshot; the durable record is authoritative.
-            await custodyFinalization;
-            if (typeof writeCustody.releaseOrphanedWriteAccessAfterTerminal !== "function") return;
-            await writeCustody.releaseOrphanedWriteAccessAfterTerminal({
-              executionId,
-              canonicalRootKey: workspace.canonicalRepositoryKey,
-              terminalProof: lateTerminalProof
-            });
-          }
-        : undefined
-    });
-    writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
-    lifecycleEvidence = execution;
-    writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
-    terminalProof = execution?.terminalProof;
+        if (profile.id === "general-purpose") {
+          const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
+          executionWorkspace = await isolatedWorktrees.prepare({
+            executionId,
+            canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+            repositoryRoot: workspace.repositoryRoot,
+            effectiveCwd: workspace.effectiveCwd
+          });
+        } else {
+          reservation = await writeCustody.markSpawning({
+            executionId,
+            canonicalRootKey: workspace.canonicalRepositoryKey
+          });
+          custodyState = reservation.state.toLowerCase();
+        }
+      }
 
-    outcome = {
-      ...baseOutcome({
+      // The root Claude actually operates in: the isolated worktree for
+      // general-purpose, the coordinated repository root for everyone else.
+      const workspaceRoot = executionWorkspace.workspaceRoot || executionWorkspace.repositoryRoot;
+      const prompt = composePrompt({
         profile,
-        runtime,
-        workspace: executionWorkspace,
+        contract,
+        task,
+        effectiveCwd: executionWorkspace.effectiveCwd,
+        workspaceRoot,
+        repositoryRoot: executionWorkspace.repositoryRoot,
         executionId,
-        startedAt,
-        now,
-        custodyState
-      }),
-      status: "completed",
-      durationMs:
-        Number.isFinite(execution.durationMs) ? execution.durationMs : Math.max(0, now() - startedAt),
-      result: execution.result,
-      stderrSummary: execution.stderrSummary || "",
-      ...(Number.isSafeInteger(execution.pid) ? { pid: execution.pid } : {})
-    };
+        runtime,
+        reviewSubject: reviewBeforeState?.reviewSubject
+      });
+      const lifecycleCustody = reservation &&
+        (custodyPlan === "write" || reviewCoherence === COHERENCE.HELD);
+      if (lifecycleCustody) processProvenNotStarted = false;
+
+      runnerInvoked = true;
+      const execution = await runAgent({
+        profile,
+        agentType: profile.id,
+        prompt,
+        cwd: executionWorkspace.effectiveCwd,
+        // Process identity binds to the repository that granted custody, which
+        // is the same root the prompt reports as the repository root.
+        repositoryRoot: executionWorkspace.repositoryRoot,
+        executionId,
+        runtime,
+        abortSignal,
+        onChildStarted: lifecycleCustody
+          ? async (processIdentity, { mutationSignal } = {}) => {
+              writerProcessStarted = true;
+              writerProcessIdentity = processIdentity;
+              try {
+                reservation = await writeCustody.activateWriteAccess({
+                  executionId,
+                  canonicalRootKey: workspace.canonicalRepositoryKey,
+                  processIdentity,
+                  mutationSignal
+                });
+                custodyState = reservation.state.toLowerCase();
+              } catch (error) {
+                if (custodyPlan === "write") throw error;
+                reviewCoherence = COHERENCE.LOST;
+                reviewBindingReasons.push({
+                  code: "coherent_admission_lifecycle_failed",
+                  detail: error?.code || error?.name
+                });
+              }
+            }
+          : undefined,
+        onTerminationStarted: lifecycleCustody
+          ? async (processIdentity, { mutationSignal } = {}) => {
+              writerProcessStarted = true;
+              writerProcessIdentity = processIdentity;
+              try {
+                reservation = await writeCustody.beginTermination({
+                  executionId,
+                  canonicalRootKey: workspace.canonicalRepositoryKey,
+                  processIdentity,
+                  mutationSignal
+                });
+                custodyState = reservation.state.toLowerCase();
+              } catch (error) {
+                if (custodyPlan === "write") throw error;
+                reviewCoherence = COHERENCE.LOST;
+                reviewBindingReasons.push({
+                  code: "coherent_admission_lifecycle_failed",
+                  detail: error?.code || error?.name
+                });
+              }
+            }
+          : undefined,
+        onLateTerminalProof: lifecycleCustody
+          ? async (lateTerminalProof) => {
+              // runClaudeAgent invokes this only after a termination-unproven
+              // outcome. Wait until this invocation has durably retained the
+              // orphan first, then let the same coordinator's exact close proof
+              // take the explicit ORPHANED -> RELEASED recovery path. The
+              // already-constructed delegation outcome remains its synchronous
+              // custodyState snapshot; the durable record is authoritative.
+              await custodyFinalization;
+              if (typeof writeCustody.releaseOrphanedWriteAccessAfterTerminal !== "function") return;
+              await writeCustody.releaseOrphanedWriteAccessAfterTerminal({
+                executionId,
+                canonicalRootKey: workspace.canonicalRepositoryKey,
+                terminalProof: lateTerminalProof
+              });
+            }
+          : undefined
+      });
+      writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
+      lifecycleEvidence = execution;
+      writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
+      terminalProof = execution?.terminalProof;
+
+      outcome = {
+        ...baseOutcome({
+          profile,
+          runtime,
+          workspace: executionWorkspace,
+          executionId,
+          startedAt,
+          now,
+          custodyState
+        }),
+        status: "completed",
+        durationMs:
+          Number.isFinite(execution.durationMs) ? execution.durationMs : Math.max(0, now() - startedAt),
+        result: execution.result,
+        stderrSummary: execution.stderrSummary || "",
+        ...(Number.isSafeInteger(execution.pid) ? { pid: execution.pid } : {})
+      };
+    }
   } catch (error) {
     lifecycleEvidence = error;
     lateTerminalRecoveryAllowed = error?.lateRecoveryAllowed === true;
@@ -1125,7 +1213,7 @@ export async function delegateAgent(input, dependencies = {}) {
     // admission guards, so they run before anything releases the slot. Both are
     // fully contained: a failure here reports an unbound review and must never
     // delay or prevent the release below.
-    if (custodyPlan === "coherent-review" && reviewBinder) {
+    if (custodyPlan === "coherent-review" && reviewBinder && !reconcileOnly) {
       if (reviewBeforeState?.status === "unavailable") {
         reviewBinding = {
           status: "unavailable",
@@ -1599,6 +1687,14 @@ export const delegateAgentInputSchema = z.object({
       "Fully-qualified ref this work or review is aimed at, for example refs/remotes/origin/main. " +
         "Accepted only for general-purpose, code-review and security-review. Never inferred: omit it " +
         "and the change set records that no target was declared."
+    ),
+  reconcile_only: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, inspects existing durable review receipts and returns dynamic freshness for the " +
+        "repository state without running Claude Code or consuming model quota. Only valid for " +
+        "review profiles (code-review, security-review)."
     )
 });
 
@@ -1619,14 +1715,17 @@ export function registerDelegateAgentTool(server, { delegate = delegateAgent } =
       inputSchema: delegateAgentInputSchema,
       outputSchema: delegateAgentOutputSchema
     },
-    async ({ agent_type: agentType, task, cwd, target_ref: targetRef }) => {
+    async ({ agent_type: agentType, task, cwd, target_ref: targetRef, reconcile_only: reconcileOnly }, ctx) => {
+      const clientAbortSignal = ctx?.signal ?? ctx?.mcpReq?.signal;
       try {
         const outcome = await delegate({
           agentType,
           task,
           cwd,
-          targetRef
-        });
+          targetRef,
+          reconcileOnly,
+          abortSignal: clientAbortSignal
+        }, { clientAbortSignal });
         return mcpText(
           formatDelegateAgentOutcome(outcome),
           projectDelegateAgentOutcomeForTransport(outcome),

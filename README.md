@@ -303,13 +303,80 @@ An `ORPHANED` or retained outcome is meant to be acted on without reading the du
 - `CLAUDE_AGENTS_MAX_CAPTURE_BYTES` — stdout/stderr capture limit; defaults to 2 MiB.
 - `CLAUDE_AGENTS_REVIEW_BINDING` — `on` (default) enables coherent review binding; `off` restores the Phase 5 review path.
 
-## Codex MCP timeout
+## Operational timeout hierarchy and late-receipt recovery
 
-Codex's per-tool timeout may need to exceed a specialist profile timeout. In `%USERPROFILE%\.codex\config.toml`, add these keys inside the existing `claude-agents` server block when appropriate:
+A reliable MCP delegation architecture requires an unbroken timeout hierarchy across all layers:
 
-```toml
-tool_timeout_sec = 1200
-startup_timeout_sec = 20
+```text
+Layer 1: Outer Codex MCP Client Tool Timeout (tool_timeout_sec = 3600)
+    ↓
+Layer 2: Maximum Bounded MCP Call Lifetime (Useful-Work + Settlement Budget = 2415s)
+    ↓
+Layer 3: Specialist Useful-Work Execution Deadline (max profile timeout = 1800s)
 ```
 
-Do not duplicate the table header if it already exists.
+### The three timeout layers
+
+1. **Outer Codex client tool-call deadline (`tool_timeout_sec = 3600`)**:
+   Codex's outer timeout envelope controls how long Codex will wait for a `tools/call` response before abandoning the call. By default, Codex terminates tool calls after 300 seconds (5 minutes). Because complex code and security reviews on realistic repositories can run for 10–30 minutes, `install-codex.ps1` explicitly configures `tool_timeout_sec = 3600` (60 minutes) under `[mcp_servers.claude-agents]` in `~/.codex/config.toml`.
+
+2. **Maximum bounded MCP call lifetime (`2415s` = 40.25 minutes)**:
+   The total synchronous duration of an MCP tool call comprises Claude's useful-work execution plus a strictly bounded **synchronous settlement budget** of `615s` (10.25 minutes). This settlement budget accounts for every possible post-execution or pre-execution lifecycle phase:
+   - Git repository state and common directory inspection (180s)
+   - Process identity confirmation (20s)
+   - ChangeSet BEFORE collection deadline (180s)
+   - Process tree forced termination (5s)
+   - Process query termination (5s)
+   - Runtime settings housekeeping cleanup (5s)
+   - Review binding AFTER collection and hash settlement (190s)
+   - Authoritative ReviewReceipt disk publication quiescence (30s)
+
+3. **Specialist useful-work execution deadline (`1800s` = 30 minutes)**:
+   The maximum wall-clock time Claude Code is permitted to run for its assigned task. In `src/agent-registry.mjs`, registered profile execution timeouts are:
+   - `explore`: 10 minutes (`600_000` ms)
+   - `rubber-duck`: 15 minutes (`900_000` ms)
+   - `task`: 20 minutes (`1_200_000` ms)
+   - `general-purpose`: 30 minutes (`1_800_000` ms)
+   - `code-review`: 30 minutes (`1_800_000` ms)
+   - `research`: 30 minutes (`1_800_000` ms)
+   - `security-review`: 30 minutes (`1_800_000` ms)
+
+### Why the outer client timeout must exceed MCP lifetime
+
+If the outer client deadline is shorter than the MCP execution and settlement lifetime (for instance, the default 300s Codex timeout vs a 536s review):
+- The client abandons the tool call and reports an unhandled timeout.
+- The specialist may continue running and eventually succeed, durably publishing a valid `ReviewReceipt`.
+- The client falsely assumes no receipt exists and may waste quota re-running the review.
+- Or if the client disconnects, cancellation signals must be propagated to terminate the child, cleanly release write custody, and cancel the publication fence so that no unquiesced or unauthorized mutation is produced.
+
+To guarantee that client abandonment never occurs during normal execution, `src/timeout-policy.mjs` provides a machine-checked invariant:
+
+$$\text{Outer Client Timeout} \ge \text{Max Profile Timeout} + \text{Settlement Budget}$$
+$$3600\text{s} \ge 1800\text{s} + 615\text{s} = 2415\text{s}$$
+
+### Late-receipt discovery and reconciliation (zero model quota)
+
+If Codex ever disconnects, crashes, restarts, or was run under an older 300-second client timeout during a long review, **the durable `ReviewReceipt` is never lost**. Once the specialist process completes, the receipt is atomically committed to the durable state store.
+
+Codex Lead can discover, verify, and reconcile that review receipt immediately without spawning a fresh Claude specialist and without consuming model tokens:
+
+```json
+{
+  "name": "delegate_agent",
+  "arguments": {
+    "agent_type": "code-review",
+    "task": "reconcile",
+    "reconcile_only": true,
+    "cwd": "<worktreeRoot>"
+  }
+}
+```
+
+`reconcile_only: true` (or `task: "reconcile"` on review profiles):
+1. Collects the live `ChangeSet` from the repository (in read-only observational mode).
+2. Sweeps the durable review receipt store for the matching repository scope.
+3. Dynamically evaluates freshness (`evaluateFreshness`) against the live state.
+4. Returns the verified `ReviewReceipt` identity, status (`bound`), and evidence.
+5. Consumes **0 model inference tokens** and spawns **0 child processes**.
+
+If the worktree was modified in the interim, `reconcile_only` dynamically reports `status: "stale"` with the exact modified sections, proving freshness is never assumed.

@@ -225,6 +225,7 @@ export async function runClaudeAgent({
   executionId = randomUUID(),
   agentType = "unclassified",
   runtime,
+  abortSignal,
   onChildStarted,
   onTerminationStarted,
   onLateTerminalProof,
@@ -240,6 +241,13 @@ export async function runClaudeAgent({
   cancelSchedule = clearTimeout
 }) {
   const invocationStartedAt = now();
+  if (abortSignal?.aborted) {
+    throw new ClaudeRunnerError("Client cancelled delegation before execution started.", {
+      code: "claude_cancelled",
+      processStarted: false,
+      durationMs: 0
+    });
+  }
   if (typeof prompt !== "string" || prompt.length === 0) {
     throw new ClaudeRunnerError("Claude prompt must be a non-empty string.", {
       code: "invalid_prompt"
@@ -710,10 +718,14 @@ export async function runClaudeAgent({
       stderrSummary: summarizeBuffer(Buffer.concat(stderrChunks), "stderr")
     });
 
+    let abortListener;
     const settle = (error, value) => {
       if (settled) return;
       settled = true;
       cancelSchedule(timer);
+      if (abortListener && abortSignal) {
+        abortSignal.removeEventListener("abort", abortListener);
+      }
       if (error && error.durationMs === undefined) {
         error.durationMs = durationMs();
       }
@@ -875,6 +887,22 @@ export async function runClaudeAgent({
     timer = schedule(() => {
       finishAfterForcedTermination(new ClaudeTimeoutError(runtime.timeoutMs, diagnostics()));
     }, remainingMs(executionDeadlineAt, now));
+
+    if (abortSignal) {
+      abortListener = () => {
+        finishAfterForcedTermination(
+          new ClaudeRunnerError("Client cancelled delegation.", {
+            code: "claude_cancelled",
+            ...diagnostics()
+          })
+        );
+      };
+      if (abortSignal.aborted) {
+        abortListener();
+      } else {
+        abortSignal.addEventListener("abort", abortListener, { once: true });
+      }
+    }
 
     if (preflightStdoutError) {
       finishAfterForcedTermination(

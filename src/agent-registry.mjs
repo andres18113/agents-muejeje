@@ -29,7 +29,7 @@ const profiles = [
     contractPath: "agents/explore.md",
     modelStrategy: "configurable",
     reasoningEffort: "low",
-    timeoutMs: 5 * 60 * 1000,
+    timeoutMs: 10 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "read-only",
@@ -51,7 +51,7 @@ const profiles = [
     contractPath: "agents/task.md",
     modelStrategy: "configurable",
     reasoningEffort: "low",
-    timeoutMs: 15 * 60 * 1000,
+    timeoutMs: 20 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "mutation-capable",
@@ -73,7 +73,7 @@ const profiles = [
     contractPath: "agents/general-purpose.md",
     modelStrategy: "inherit",
     reasoningEffort: "high",
-    timeoutMs: 15 * 60 * 1000,
+    timeoutMs: 30 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "mutation-capable",
@@ -95,7 +95,7 @@ const profiles = [
     contractPath: "agents/code-review.md",
     modelStrategy: "configurable",
     reasoningEffort: "high",
-    timeoutMs: 15 * 60 * 1000,
+    timeoutMs: 30 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "read-only",
@@ -117,7 +117,7 @@ const profiles = [
     contractPath: "agents/research.md",
     modelStrategy: "configurable",
     reasoningEffort: "high",
-    timeoutMs: 15 * 60 * 1000,
+    timeoutMs: 30 * 60 * 1000,
     autoInvoke: false,
     manualOnly: true,
     mutationPosture: "read-only",
@@ -139,7 +139,7 @@ const profiles = [
     contractPath: "agents/rubber-duck.md",
     modelStrategy: "complementary",
     reasoningEffort: "high",
-    timeoutMs: 10 * 60 * 1000,
+    timeoutMs: 15 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "read-only",
@@ -161,7 +161,7 @@ const profiles = [
     contractPath: "agents/security-review.md",
     modelStrategy: "configurable",
     reasoningEffort: "high",
-    timeoutMs: 15 * 60 * 1000,
+    timeoutMs: 30 * 60 * 1000,
     autoInvoke: false,
     manualOnly: false,
     mutationPosture: "read-only",
@@ -178,6 +178,10 @@ const profiles = [
 
 export const AGENT_REGISTRY = deepFreeze(
   Object.fromEntries(profiles.map((profile) => [profile.id, profile]))
+);
+
+export const MAX_PROFILE_TIMEOUT_MS = Object.freeze(
+  Math.max(...profiles.map((profile) => profile.timeoutMs))
 );
 
 export function getAgentProfile(id) {

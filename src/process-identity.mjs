@@ -16,14 +16,14 @@ import path from "node:path";
  * never a correctness one: exceeding it still yields AMBIGUOUS and is never
  * converted into ALIVE or DEAD.
  */
-const PROCESS_QUERY_TIMEOUT_MS = 20_000;
+export const PROCESS_QUERY_TIMEOUT_MS = 20_000;
 
 /**
  * Bounded wait for the exact query child to close after we ask it to stop.
  * The query is read-only, so the observation stays AMBIGUOUS either way; this
  * exists so a timed-out query is not simply forgotten while still running.
  */
-const PROCESS_QUERY_TERMINATION_TIMEOUT_MS = 5_000;
+export const PROCESS_QUERY_TERMINATION_TIMEOUT_MS = 5_000;
 
 const MAX_PROCESS_QUERY_OUTPUT_BYTES = 4_096;
 const WINDOWS_IDENTITY_SOURCE = "windows-get-process-starttime-utc-ticks";

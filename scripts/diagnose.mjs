@@ -1,4 +1,14 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { AGENT_REGISTRY } from "../src/agent-registry.mjs";
+import {
+  RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
+  REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS,
+  deriveMaxProfileTimeout,
+  checkTimeoutHierarchySafety
+} from "../src/timeout-policy.mjs";
 
 const MINIMUM_NODE_MAJOR = 20;
 
@@ -21,6 +31,25 @@ function commandVersion(commands, args = ["--version"]) {
       : { status: "error", detail: "exit-" + String(result.status) };
   }
   return { status: "missing" };
+}
+
+function readCodexConfiguredTimeout() {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+  if (!existsSync(configPath)) return null;
+  try {
+    const content = readFileSync(configPath, "utf8");
+    const headerMatch = content.match(/\[mcp_servers\.(?:claude-agents|"claude-agents"|'claude-agents')\]/);
+    if (!headerMatch) return null;
+    const after = content.slice(headerMatch.index);
+    const nextSection = after.slice(1).search(/\r?\n\[/);
+    const section = nextSection !== -1 ? after.slice(0, nextSection + 1) : after;
+    const timeoutMatch = section.match(/tool_timeout_sec\s*=\s*(\d+)/);
+    if (timeoutMatch) return Number(timeoutMatch[1]);
+    return 300; // Codex default when not specified
+  } catch {
+    return null;
+  }
 }
 
 const nodeMajor = Number(process.versions.node.split(".")[0]);
@@ -49,13 +78,40 @@ for (const [name, diagnostic] of Object.entries(tools)) {
   console.log(name.padEnd(7), diagnostic.status.padEnd(11), details || diagnostic.detail || "");
 }
 
+const maxProfileTimeoutMs = deriveMaxProfileTimeout(AGENT_REGISTRY);
+const configuredCodexTimeoutSec = readCodexConfiguredTimeout();
+const timeoutSafety = checkTimeoutHierarchySafety({
+  codexTimeoutSec: configuredCodexTimeoutSec,
+  maxProfileTimeoutMs
+});
+
+console.log("profile-max-useful-work", (maxProfileTimeoutMs / 1000) + "s", `(${maxProfileTimeoutMs / 60000}m)`);
+console.log("settlement-budget", (REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS / 1000) + "s", `(${REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS / 60000}m)`);
+console.log("min-safe-client-timeout", timeoutSafety.minSafeTimeoutSec + "s");
+console.log("recommended-codex-timeout", RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC + "s");
+console.log(
+  "configured-codex-timeout",
+  configuredCodexTimeoutSec !== null
+    ? configuredCodexTimeoutSec + "s"
+    : "not configured (default 300s)"
+);
+console.log("timeout-hierarchy", timeoutSafety.safe ? "safe" : "unsafe", timeoutSafety.message);
+
 const repositoryReady = tools.node.status === "available" &&
   tools.npm.status === "available" && tools.git.status === "available";
 const registrationReady = repositoryReady &&
   tools.codex.status === "available" && tools.claude.status === "available";
 
 console.log("repository-validation", repositoryReady ? "ready" : "blocked");
-console.log("mcp-registration", registrationReady ? "prerequisites-present" : "prerequisites-missing");
+
+if (!registrationReady) {
+  console.log("mcp-registration", "prerequisites-missing");
+} else if (!timeoutSafety.safe) {
+  console.log("mcp-registration", "unsafe-timeout-configuration");
+} else {
+  console.log("mcp-registration", "prerequisites-present");
+}
+
 console.log("Authentication is intentionally not inspected by this credential-free diagnostic.");
 
 if (!repositoryReady) process.exitCode = 1;
