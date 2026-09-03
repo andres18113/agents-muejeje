@@ -87,6 +87,44 @@ function deferred() {
   return { promise, resolve };
 }
 
+function manualClock(initialTime = 1_000) {
+  let time = initialTime;
+  let nextId = 1;
+  const timers = new Map();
+  let onSchedule = null;
+  return {
+    now: () => time,
+    setOnSchedule(fn) {
+      onSchedule = fn;
+    },
+    schedule(callback, delay) {
+      const id = nextId++;
+      const timer = { callback, at: time + Math.max(0, delay) };
+      timers.set(id, timer);
+      if (onSchedule) onSchedule(id, timer);
+      return id;
+    },
+    cancelSchedule(id) {
+      timers.delete(id);
+    },
+    advanceTo(target) {
+      time = target;
+      let fired;
+      do {
+        fired = false;
+        for (const [id, timer] of [...timers.entries()]) {
+          if (timer.at <= time) {
+            timers.delete(id);
+            timer.callback();
+            fired = true;
+          }
+        }
+      } while (fired && [...timers.values()].some((t) => t.at <= time));
+    },
+    pendingTimers: () => timers.size
+  };
+}
+
 async function withStateRoot(callback) {
   const stateRoot = await mkdtemp(path.join(os.tmpdir(), "claude-agents-ordering-"));
   try {
@@ -414,13 +452,25 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
       await custody.markSpawning({ executionId, canonicalRootKey });
       const recordPath = recordPathFor(custody);
 
+      const clock = manualClock(1_000);
       const child = stalledChild();
+      child.kill = () => {
+        child.killCalls += 1;
+        setImmediate(() => child.emit("close", null, "SIGTERM"));
+        return true;
+      };
+
       const launches = [];
       const helper = new EventEmitter();
       helper.kill = () => true;
 
+      let activationDone;
+      const activationDonePromise = new Promise((resolve) => {
+        activationDone = resolve;
+      });
+
       let terminationResult;
-      await assert.rejects(runClaudeAgent({
+      const runnerPromise = runClaudeAgent({
         prompt: "assignment body",
         cwd: canonicalRoot,
         repositoryRoot: canonicalRoot,
@@ -430,7 +480,7 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
           claudeBin: "claude",
           model: "opus",
           reasoningEffort: "medium",
-          timeoutMs: 40,
+          timeoutMs: 1_000,
           maxCaptureBytes: 1024 * 1024,
           permissionMode: "plan",
           accessMode: "write",
@@ -439,20 +489,31 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
           shellPolicy: "task",
           childEnvironment: { PATH: "test-path", SystemRoot: "C:\\Windows" }
         },
+        now: clock.now,
+        schedule: clock.schedule,
+        cancelSchedule: clock.cancelSchedule,
         createSettings: async () => ({
           settingsPath: "C:\\temp\\claude-runtime-settings.json",
           cleanup: async () => {}
         }),
         spawnProcess: () => child,
         inspectProcess: inspectAlive,
-        terminationTimeoutMs: 200,
-        onChildStarted: (processIdentity, { mutationSignal } = {}) =>
-          custody.activateWriteAccess({
-            executionId,
-            canonicalRootKey,
-            processIdentity,
-            mutationSignal
-          }),
+        terminationTimeoutMs: 5_000,
+        onChildStarted: async (processIdentity, { mutationSignal } = {}) => {
+          try {
+            const res = await custody.activateWriteAccess({
+              executionId,
+              canonicalRootKey,
+              processIdentity,
+              mutationSignal
+            });
+            activationDone(res);
+            return res;
+          } catch (err) {
+            activationDone(err);
+            throw err;
+          }
+        },
         onTerminationStarted: (processIdentity, { mutationSignal } = {}) => {
           if (!transitionPermitted) {
             return Promise.reject(new WriteCustodyError("publication refused", {
@@ -472,10 +533,30 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
           inspectProcess: inspectAlive,
           spawnTerminator: () => {
             launches.push(JSON.parse(readFileSync(recordPath, "utf8")).state);
+            setImmediate(() => {
+              helper.emit("close", 0, null);
+              child.emit("close", null, "SIGKILL");
+            });
             return helper;
           }
         })
-      }), (error) => {
+      });
+
+      // 1. Await successful activation on disk
+      await activationDonePromise;
+
+      // 2. Authoritative record MUST be explicitly ACTIVE before triggering timeout
+      const persistedActive = JSON.parse(await readFile(recordPath, "utf8"));
+      assert.equal(persistedActive.state, "ACTIVE", label + ": must reach ACTIVE before timeout");
+
+      // 3. Give runner microtask loop time to enter stream listening and schedule timeout timer
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // 4. Advance deterministic clock to execution deadline to trigger forced termination
+      clock.advanceTo(clock.now() + 1_000);
+
+      // 5. Runner rejects with timeout error
+      await assert.rejects(runnerPromise, (error) => {
         assert.equal(error.processStarted, true, label);
         terminationResult = error.terminationResult;
         return true;
@@ -548,4 +629,113 @@ test("the durable ordering invariant holds end to end through runClaudeAgent", a
       }
     });
   }
+});
+
+test("execution deadline during SPAWNING to ACTIVE publication cancels activation and fails closed without fabricated ACTIVE", async () => {
+  await withStateRoot(async (stateRoot) => {
+    const custody = custodyManager(stateRoot);
+    const executionId = "execution-timeout-during-activation";
+    await custody.reserveWriteAccess({
+      executionId,
+      agentType: "task",
+      canonicalRoot,
+      canonicalRootKey
+    });
+    await custody.markSpawning({ executionId, canonicalRootKey });
+    const recordPath = recordPathFor(custody);
+
+    const clock = manualClock(1_000);
+    const child = stalledChild();
+    child.kill = () => {
+      child.killCalls += 1;
+      setImmediate(() => child.emit("close", null, "SIGTERM"));
+      return true;
+    };
+
+    let activationStarted;
+    const activationStartedPromise = new Promise((resolve) => {
+      activationStarted = resolve;
+    });
+    const activationDeferred = deferred();
+
+    let terminationResult;
+    const runnerPromise = runClaudeAgent({
+      prompt: "assignment body",
+      cwd: canonicalRoot,
+      repositoryRoot: canonicalRoot,
+      executionId,
+      agentType: "task",
+      runtime: {
+        claudeBin: "claude",
+        model: "opus",
+        reasoningEffort: "medium",
+        timeoutMs: 1_000,
+        maxCaptureBytes: 1024 * 1024,
+        permissionMode: "plan",
+        accessMode: "write",
+        toolNames: ["Bash"],
+        disallowedTools: ["Agent", "Task", "mcp__*"],
+        shellPolicy: "task",
+        childEnvironment: { PATH: "test-path", SystemRoot: "C:\\Windows" }
+      },
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancelSchedule,
+      createSettings: async () => ({
+        settingsPath: "C:\\temp\\claude-runtime-settings.json",
+        cleanup: async () => {}
+      }),
+      spawnProcess: () => child,
+      inspectProcess: inspectAlive,
+      terminationTimeoutMs: 5_000,
+      onChildStarted: async (processIdentity, { mutationSignal } = {}) => {
+        activationStarted();
+        await activationDeferred.promise;
+        return custody.activateWriteAccess({
+          executionId,
+          canonicalRootKey,
+          processIdentity,
+          mutationSignal
+        });
+      },
+      onTerminationStarted: (processIdentity, { mutationSignal } = {}) =>
+        custody.beginTermination({
+          executionId,
+          canonicalRootKey,
+          processIdentity,
+          mutationSignal
+        }),
+      terminateChild: (target, options) => terminateClaudeChild(target, {
+        ...options,
+        platform: "win32",
+        inspectProcess: inspectAlive
+      })
+    });
+
+    // 1. Wait for activation callback to be invoked
+    await activationStartedPromise;
+
+    // 2. Advance clock to execution deadline WHILE activation is still in flight
+    clock.advanceTo(clock.now() + 1_000);
+
+    // 3. Release the deferred activation
+    activationDeferred.resolve();
+
+    // 4. Runner rejects with timeout error
+    await assert.rejects(runnerPromise, (error) => {
+      assert.equal(error.processStarted, true);
+      terminationResult = error.terminationResult;
+      return true;
+    });
+
+    // 5. Verify the record never fabricated ACTIVE: it remained SPAWNING
+    const persisted = JSON.parse(await readFile(recordPath, "utf8"));
+    assert.equal(
+      persisted.state,
+      "SPAWNING",
+      "state must remain SPAWNING and never fabricate ACTIVE"
+    );
+    assert.equal(terminationResult.destructiveHelperAuthorized, false);
+    assert.ok(child.killCalls >= 1);
+  });
 });
