@@ -60,6 +60,7 @@ const RECEIPT_FILE_NAME = "receipt.json";
 const RECEIPTS_DIRECTORY = "cs";
 const SCOPES_DIRECTORY = "sc";
 const REVIEWS_DIRECTORY = "reviews";
+export const ARTIFACTS_DIRECTORY = "artifacts";
 const TIMESTAMP_DIGITS = 13;
 const CHANGE_SET_ID = /^cs1:[0-9a-f]{64}$/u;
 const REVIEW_ID = /^rr1:[0-9a-f]{64}$/u;
@@ -160,6 +161,14 @@ export class ReviewReceiptStore {
     return path.join(this.reviewsDirectory(canonicalRootKey), SCOPES_DIRECTORY, scopePrefix(scopeKey));
   }
 
+  artifactsDirectory(canonicalRootKey) {
+    return path.join(this.reviewsDirectory(canonicalRootKey), ARTIFACTS_DIRECTORY);
+  }
+
+  artifactPath(canonicalRootKey, resultSha256) {
+    return path.join(this.artifactsDirectory(canonicalRootKey), resultSha256 + ".txt");
+  }
+
   /**
    * Persists one receipt, then records a pointer to it.
    *
@@ -168,7 +177,7 @@ export class ReviewReceiptStore {
    * nothing. An unindexed receipt is merely harder to discover; a dangling
    * pointer would be a lie that discovery has to defend against on every read.
    */
-  async put({ canonicalRootKey, receipt, publication, awaitIndex = true }) {
+  async put({ canonicalRootKey, receipt, publication, resultText, awaitIndex = true }) {
     const validated = validateReviewReceipt(receipt);
     if (!validated) {
       throw new ReviewReceiptError("Refusing to store an invalid review receipt.", {
@@ -226,6 +235,33 @@ export class ReviewReceiptStore {
         throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
           code: "review_receipt_publication_cancelled"
         });
+      }
+
+      if (typeof resultText === "string") {
+        const actualSha256 = sha256Hex(Buffer.from(resultText, "utf8"));
+        const actualBytes = Buffer.byteLength(resultText, "utf8");
+        if (actualSha256 !== validated.result.sha256 || actualBytes !== validated.result.bytes) {
+          throw new ReviewReceiptError("Result text does not match receipt result basis.", {
+            code: "review_result_basis_mismatch"
+          });
+        }
+
+        const artifactsDir = this.artifactsDirectory(canonicalRootKey);
+        await mkdir(artifactsDir, { recursive: true });
+        const targetArtifactPath = this.artifactPath(canonicalRootKey, validated.result.sha256);
+        const artifactStaging = path.join(artifactsDir, ".artifact-" + this.#createNonce() + ".tmp");
+        try {
+          await writeFileDurably(artifactStaging, resultText);
+          try {
+            await this.#rename(artifactStaging, targetArtifactPath);
+          } catch (renameErr) {
+            if (!conflictError(renameErr)) throw renameErr;
+            await rm(artifactStaging, { force: true }).catch(() => {});
+          }
+        } catch (artifactErr) {
+          await rm(artifactStaging, { force: true }).catch(() => {});
+          throw artifactErr;
+        }
       }
 
       let renameIssued;
@@ -301,6 +337,66 @@ export class ReviewReceiptStore {
     void indexing.catch(() => {});
     if (awaitIndex) await indexing;
     return Object.freeze({ stored, path: finalPath, indexing });
+  }
+
+  async loadResultArtifact({ canonicalRootKey, receipt }) {
+    const sha256 = receipt?.result?.sha256;
+    const expectedBytes = receipt?.result?.bytes;
+    if (
+      typeof sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(sha256) ||
+      !Number.isSafeInteger(expectedBytes) ||
+      expectedBytes < 0
+    ) {
+      return Object.freeze({
+        status: "invalid",
+        error: "receipt_result_basis_invalid"
+      });
+    }
+
+    const targetPath = this.artifactPath(canonicalRootKey, sha256);
+    let content;
+    try {
+      content = await readFile(targetPath, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return Object.freeze({
+          status: "missing",
+          error: "artifact_not_found"
+        });
+      }
+      return Object.freeze({
+        status: "unreadable",
+        error: error?.code || error?.name || "artifact_read_failed"
+      });
+    }
+
+    const actualBytes = Buffer.byteLength(content, "utf8");
+    if (actualBytes !== expectedBytes) {
+      return Object.freeze({
+        status: "corrupt",
+        error: "byte_length_mismatch",
+        expectedBytes,
+        actualBytes
+      });
+    }
+
+    const actualSha256 = sha256Hex(Buffer.from(content, "utf8"));
+    if (actualSha256 !== sha256) {
+      return Object.freeze({
+        status: "corrupt",
+        error: "sha256_mismatch",
+        expectedSha256: sha256,
+        actualSha256
+      });
+    }
+
+    return Object.freeze({
+      status: "verified",
+      text: content,
+      bytes: actualBytes,
+      sha256: actualSha256
+    });
   }
 
   async #listReceiptDirectories(changeSetDirectory) {

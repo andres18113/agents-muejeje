@@ -15,11 +15,18 @@ import {
  *     >
  *   maximum bounded MCP call lifetime
  *     >
- *   Claude useful-work execution deadline (profile timeout)
+ *   Claude useful-work execution envelope (profile timeout / runtime.timeoutMs)
  *
  * Where:
  *   maximum bounded MCP call lifetime =
  *     max(profile timeout) + REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS
+ *
+ * Semantic definition:
+ *   `runtime.timeoutMs` represents the total useful-work execution envelope
+ *   allocated to runClaudeAgent (from entry through pre-spawn validation, prompt
+ *   delivery, and child process execution until normal exit). It does NOT
+ *   represent pure model inference alone, which an un-instrumented CLI child does
+ *   not expose.
  *
  * And REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS is derived strictly from
  * the actual bounded synchronous lifecycle phases that can keep tools/call pending.

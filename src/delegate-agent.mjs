@@ -748,8 +748,7 @@ export async function delegateAgent(input, dependencies = {}) {
   const abortSignal = input?.abortSignal ?? dependencies.abortSignal ?? dependencies.clientAbortSignal;
   const reconcileOnly = Boolean(
     input?.reconcileOnly === true ||
-    input?.reconcile_only === true ||
-    task?.trim()?.toLowerCase() === "reconcile"
+    input?.reconcile_only === true
   );
   const getProfile = dependencies.getProfile || getAgentProfile;
   const loadContract = dependencies.loadContract || loadAgentContract;
@@ -977,18 +976,56 @@ export async function delegateAgent(input, dependencies = {}) {
           receipts: reviewBeforeState?.priorReviews ?? [],
           diagnostics: [{ code: "review_history_unavailable" }]
         };
-        const freshReceipt = history.receipts?.find((r) => r.verdict === "FRESH");
-        const staleReceipt = history.receipts?.find((r) => r.verdict === "STALE");
+        const freshEntry = history.receipts?.find((r) => r.verdict === "FRESH");
+        const staleEntry = history.receipts?.find((r) => r.verdict === "STALE");
+        const indeterminateEntry = history.receipts?.find((r) => r.verdict === "INDETERMINATE");
+        const selectedEntry = freshEntry ?? staleEntry ?? indeterminateEntry ?? history.receipts?.[0];
         const currentChangeSetId = reviewBeforeState?.current?.changeSetId;
 
+        // Semantic result artifact recovery and cryptographic verification
+        let artifactOutcome = { status: "not_attempted" };
+        if (selectedEntry?.receipt && reviewBinder?.loadResultArtifact) {
+          try {
+            artifactOutcome = await reviewBinder.loadResultArtifact({
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              receipt: selectedEntry.receipt
+            });
+          } catch (artifactError) {
+            artifactOutcome = {
+              status: "unreadable",
+              error: artifactError?.code || artifactError?.name || "artifact_read_failed"
+            };
+          }
+        }
+
+        const bindingStatus = (!selectedEntry || selectedEntry.verdict === "INDETERMINATE")
+          ? "unavailable"
+          : "bound";
+        const reviewReasons = [];
+
+        if (!selectedEntry) {
+          reviewReasons.push({ code: "no_receipts_found" });
+        } else if (selectedEntry.verdict === "STALE") {
+          reviewReasons.push(...(selectedEntry.reasons ?? [{ code: "review_receipt_stale" }]));
+        } else if (selectedEntry.verdict === "INDETERMINATE") {
+          reviewReasons.push(...(selectedEntry.reasons ?? [{ code: "review_history_indeterminate" }]));
+        }
+
+        if (selectedEntry && artifactOutcome.status !== "verified" && artifactOutcome.status !== "not_attempted") {
+          reviewReasons.push({
+            code: "review_result_artifact_" + artifactOutcome.status,
+            ...(artifactOutcome.error ? { detail: String(artifactOutcome.error).slice(0, 64) } : {})
+          });
+        }
+
         reviewBinding = {
-          status: freshReceipt ? "bound" : (history.receipts?.length > 0 ? "stale" : "unavailable"),
+          status: bindingStatus,
           coherence: reviewCoherence,
-          reasons: freshReceipt ? [] : (staleReceipt ? staleReceipt.reasons : [{ code: "no_receipts_found" }]),
-          changeSetId: currentChangeSetId,
+          reasons: Object.freeze(reviewReasons),
+          changeSetId: selectedEntry?.receipt?.binding?.changeSetId ?? currentChangeSetId,
           beforeChangeSetId: currentChangeSetId,
           afterChangeSetId: currentChangeSetId,
-          reviewId: freshReceipt?.reviewId ?? staleReceipt?.reviewId ?? null,
+          reviewId: selectedEntry?.reviewId ?? null,
           priorReviews: history.receipts ?? [],
           receiptHistory: history,
           publication: {
@@ -999,22 +1036,44 @@ export async function delegateAgent(input, dependencies = {}) {
         };
 
         let resultMessage;
-        if (freshReceipt) {
+        if (freshEntry) {
+          if (artifactOutcome.status === "verified") {
+            resultMessage =
+              `Reconciled authoritative review receipt ${freshEntry.reviewId} (FRESH for changeSet ${currentChangeSetId}).\n` +
+              `Agent: ${profile.id}\n` +
+              `Target: ${targetSpec?.spec?.ref || "uncommitted HEAD"}\n` +
+              `Freshness: FRESH (receipt ChangeSet matches current repository state)\n` +
+              `Result Artifact: VERIFIED (SHA-256: ${freshEntry.receipt.result.sha256}, ${artifactOutcome.bytes} bytes)\n\n` +
+              `[Recovered Specialist Review Findings]\n` +
+              `${artifactOutcome.text}\n\n` +
+              `Notice: A FRESH receipt proves the review was conducted on this exact ChangeSet; review findings above determine whether the verdict was clean or defects were identified.\n` +
+              `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+          } else {
+            resultMessage =
+              `Discovered review receipt ${freshEntry.reviewId} is FRESH for current changeSet ${currentChangeSetId}, but semantic reviewer output is ${artifactOutcome.status} (${artifactOutcome.error || "unavailable"}).\n` +
+              `Result artifact verification failed: cannot verify reviewer findings or determine if the review was clean.\n` +
+              `A fresh ${profile.id} delegation is required.\n` +
+              `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+          }
+        } else if (staleEntry) {
           resultMessage =
-            `Reconciled authoritative review receipt ${freshReceipt.reviewId} (FRESH for changeSet ${currentChangeSetId}).\n` +
-            `Agent: ${profile.id}\n` +
-            `Target: ${targetSpec?.spec?.ref || "uncommitted HEAD"}\n` +
-            `No Claude specialist was spawned; 0 model quota consumed.`;
-        } else if (staleReceipt) {
+            `Discovered prior review receipt ${staleEntry.reviewId} is STALE for current changeSet ${currentChangeSetId}.\n` +
+            `Historical ChangeSet: ${staleEntry.receipt?.binding?.changeSetId || "unknown"}\n` +
+            `Changed sections: ${(staleEntry.changedSections || []).join(", ") || "none"}\n` +
+            `Reasons: ${(staleEntry.reasons || []).map((r) => r.code).join(", ")}\n` +
+            `A fresh ${profile.id} delegation is required for the updated ChangeSet.\n` +
+            `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+        } else if (indeterminateEntry) {
           resultMessage =
-            `Discovered prior review receipt ${staleReceipt.reviewId} is STALE for current changeSet ${currentChangeSetId}.\n` +
-            `Changed sections: ${(staleReceipt.changedSections || []).join(", ") || "none"}\n` +
-            `Reasons: ${(staleReceipt.reasons || []).map((r) => r.code).join(", ")}\n` +
-            `A fresh ${profile.id} delegation is required.`;
+            `Discovered prior review receipt ${indeterminateEntry.reviewId} has INDETERMINATE freshness for current repository state.\n` +
+            `Reasons: ${(indeterminateEntry.reasons || []).map((r) => r.code).join(", ")}\n` +
+            `A fresh ${profile.id} delegation is required.\n` +
+            `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
         } else {
           resultMessage =
             `No prior review receipts discovered for scope ${profile.id} in this repository.\n` +
-            `Current ChangeSetId: ${currentChangeSetId || "unavailable"}`;
+            `Current ChangeSetId: ${currentChangeSetId || "unavailable"}\n` +
+            `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
         }
 
         outcome = {

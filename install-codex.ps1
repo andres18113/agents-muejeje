@@ -43,9 +43,10 @@ function Update-CodexMcpTimeout {
         [int]$TimeoutSec = 3600
     )
     if (-not (Test-Path $ConfigPath)) { return }
-    $content = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8)
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $content = [System.IO.File]::ReadAllText($ConfigPath, $utf8NoBom)
     $escapedName = [regex]::Escape($ServerName)
-    $headerPattern = '(?m)^\[mcp_servers\.(?:' + $escapedName + '|"' + $escapedName + '"|''' + $escapedName + ''')\]\s*$'
+    $headerPattern = '(?m)^\[mcp_servers\.(?:' + $escapedName + '|"' + $escapedName + '"|''' + $escapedName + ''')\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)'
     $headerMatch = [regex]::Match($content, $headerPattern)
     if (-not $headerMatch.Success) {
         Write-Warning "Section for mcp_servers.$ServerName not found in $ConfigPath"
@@ -67,16 +68,20 @@ function Update-CodexMcpTimeout {
         ""
     }
 
-    $timeoutPattern = '(?m)^tool_timeout_sec\s*=\s*.*$'
+    $timeoutPattern = '(?m)^tool_timeout_sec[ \t]*=[ \t]*[^\r\n]*'
+    $nl = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
     if ([regex]::IsMatch($sectionBody, $timeoutPattern)) {
         $newSectionBody = [regex]::Replace($sectionBody, $timeoutPattern, "tool_timeout_sec = $TimeoutSec")
     } else {
-        $nl = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
-        $newSectionBody = $nl + "tool_timeout_sec = $TimeoutSec" + $sectionBody
+        $newSectionBody = "tool_timeout_sec = $TimeoutSec" + $nl + $sectionBody
     }
 
     $newContent = $content.Substring(0, $headerIndex + $headerLength) + $newSectionBody + $remainder
-    [System.IO.File]::WriteAllText($ConfigPath, $newContent, [System.Text.Encoding]::UTF8)
+    if ($newContent -eq $content) {
+        Write-Host "Configured mcp_servers.$ServerName.tool_timeout_sec = $TimeoutSec in $ConfigPath (already configured)"
+        return
+    }
+    [System.IO.File]::WriteAllText($ConfigPath, $newContent, $utf8NoBom)
     Write-Host "Configured mcp_servers.$ServerName.tool_timeout_sec = $TimeoutSec in $ConfigPath"
 }
 

@@ -136,7 +136,8 @@ export function createReviewBinder({
         verdict: verdict.verdict,
         changedSections: verdict.changedSections,
         basisDifferences: verdict.basisDifferences,
-        reasons: Object.freeze(verdict.reasons.map((reason) => Object.freeze({ code: reason.code })))
+        reasons: Object.freeze(verdict.reasons.map((reason) => Object.freeze({ code: reason.code }))),
+        receipt
       });
     });
     for (const skipped of discovered.skipped ?? []) {
@@ -416,6 +417,7 @@ export function createReviewBinder({
         await receiptStore.put({
           canonicalRootKey: workspace.canonicalRepositoryKey,
           receipt,
+          resultText: typeof outcome?.result === "string" ? outcome.result : "",
           publication,
           awaitIndex: false
         });
@@ -448,5 +450,12 @@ export function createReviewBinder({
     }
   }
 
-  return Object.freeze({ before, after });
+  async function loadResultArtifact({ canonicalRootKey, receipt }) {
+    if (!receiptStore || typeof receiptStore.loadResultArtifact !== "function") {
+      return Object.freeze({ status: "unavailable", error: "receipt_store_unavailable" });
+    }
+    return await receiptStore.loadResultArtifact({ canonicalRootKey, receipt });
+  }
+
+  return Object.freeze({ before, after, loadResultArtifact });
 }

@@ -354,29 +354,51 @@ To guarantee that client abandonment never occurs during normal execution, `src/
 $$\text{Outer Client Timeout} \ge \text{Max Profile Timeout} + \text{Settlement Budget}$$
 $$3600\text{s} \ge 1800\text{s} + 615\text{s} = 2415\text{s}$$
 
-### Late-receipt discovery and reconciliation (zero model quota)
+### Late-receipt discovery and reconciliation (zero Claude delegated quota)
 
-If Codex ever disconnects, crashes, restarts, or was run under an older 300-second client timeout during a long review, **the durable `ReviewReceipt` is never lost**. Once the specialist process completes, the receipt is atomically committed to the durable state store.
+If Codex ever disconnects, restarts, or timed out under an older client timeout during a long review, **the durable `ReviewReceipt` is never lost**. Once the specialist process completes, the receipt and its content-addressed result artifact (`reviews/artifacts/<sha256>.txt`) are atomically committed to durable storage.
 
-Codex Lead can discover, verify, and reconcile that review receipt immediately without spawning a fresh Claude specialist and without consuming model tokens:
+Codex Lead can discover, verify, and reconcile that review receipt immediately without spawning a fresh Claude specialist and without consuming Claude delegated quota:
 
 ```json
 {
   "name": "delegate_agent",
   "arguments": {
     "agent_type": "code-review",
-    "task": "reconcile",
+    "task": "Reconcile prior code review receipt",
     "reconcile_only": true,
     "cwd": "<worktreeRoot>"
   }
 }
 ```
 
-`reconcile_only: true` (or `task: "reconcile"` on review profiles):
-1. Collects the live `ChangeSet` from the repository (in read-only observational mode).
-2. Sweeps the durable review receipt store for the matching repository scope.
-3. Dynamically evaluates freshness (`evaluateFreshness`) against the live state.
-4. Returns the verified `ReviewReceipt` identity, status (`bound`), and evidence.
-5. Consumes **0 model inference tokens** and spawns **0 child processes**.
+> [!NOTE]
+> `reconcile_only: true` is the sole explicit signal that activates reconciliation mode. `task` remains ordinary descriptive assignment/context text and never silently selects an execution mode. Non-review profiles reject `reconcile_only`.
 
-If the worktree was modified in the interim, `reconcile_only` dynamically reports `status: "stale"` with the exact modified sections, proving freshness is never assumed.
+#### What `reconcile_only` does and does not do:
+
+1. **Observational read-only check**: Collects the live `ChangeSet` from the repository without acquiring write custody.
+2. **Authoritative receipt lookup**: Sweeps the durable review receipt store for the matching repository, target ref, and review profile scope.
+3. **Independent binding vs. freshness**:
+   - `reviewBinding.status` reflects historical binding: `"bound"` if a receipt is found for the historical scope, `"unavailable"` if no receipt is found or history is indeterminate. (Binding status is never `"stale"`).
+   - Freshness is independently evaluated against current live state: `"FRESH"`, `"STALE"`, or `"INDETERMINATE"`.
+4. **Content-addressed artifact recovery & verification**:
+   - Recovers the original semantic reviewer output from `reviews/artifacts/<sha256>.txt`.
+   - Strictly validates both byte length and SHA-256 digest against `receipt.result.bytes` and `receipt.result.sha256`.
+   - If the artifact is missing, unreadable, or corrupted, reconciliation **fails closed**: reviewer output is withheld and the result warns that findings cannot be verified.
+5. **Zero Claude delegated quota**:
+   - Spawns **0 child processes** and consumes **0 Claude delegated-model quota**.
+   - Note: Total token consumption depends on the orchestrator; Codex itself may consume model tokens while orchestrating or processing the MCP tool call.
+
+#### Critical Semantic Rule: FRESH != CLEAN
+
+> [!IMPORTANT]
+> **`FRESH != CLEAN`**
+> - **`FRESH`** means strictly: *"this receipt still applies to the observed current ChangeSet."* A fresh review receipt might contain severe blocking vulnerabilities or critical architectural findings.
+> - **`CLEAN`** / passing verdicts come solely from the recovered, verified reviewer output itself. Receipt discovery alone never implies approval.
+
+#### Operator Action on Freshness Verdicts:
+
+- **`FRESH`**: The recovered reviewer findings apply to the current repository state. Review findings are displayed for Lead inspection.
+- **`STALE`**: The worktree or repository moved since the review was conducted. The historical receipt remains bound to its historical ChangeSet, but cannot authorize the current worktree. **Operator Action:** A fresh `code-review` delegation is required.
+- **`INDETERMINATE`**: Collector uncertainty or history gaps prevent proving freshness. Fails closed (`status: "unavailable"`). **Operator Action:** Manual verification of git state or a fresh `code-review` delegation is required.
