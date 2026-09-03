@@ -417,7 +417,7 @@ function crashReceipt(workspace) {
     result: { sha256: digest, bytes: 10 },
     provenance: {
       repositoryId: repositoryIdForCanonicalRootKey(workspace.canonicalRepositoryKey),
-      producer: "claude-agents-mcp/0.2.0",
+      producer: "claude-agents-mcp/0.2.1",
       collector: "change-set-collector/v1",
       recordedAt: 3_000
     }

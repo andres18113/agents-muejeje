@@ -29,6 +29,12 @@ export const RECEIPT_PUBLICATION_DISPOSITIONS = Object.freeze([
   "conflict",
   "failed"
 ]);
+export const REVIEW_BINDING_STATUSES = Object.freeze([
+  "bound",
+  "unbound",
+  "unavailable",
+  "ambiguous"
+]);
 export const CUSTODY_RECOVERY_MODES = Object.freeze([
   "not-needed",
   "same-coordinator-terminal-proof",
@@ -88,7 +94,7 @@ const publicationSchema = z.object({
 }).strict();
 
 const reviewSchema = z.object({
-  status: z.enum(["bound", "unbound", "unavailable"]),
+  status: z.enum(REVIEW_BINDING_STATUSES),
   coherence: z.enum(["held", "denied", "lost", "not-attempted"]),
   changeSetId: z.string().regex(CHANGE_SET_ID).optional(),
   beforeChangeSetId: z.string().regex(CHANGE_SET_ID).optional(),
@@ -247,6 +253,9 @@ function projectReceiptHistory(binding) {
   const sourceReceipts = Array.isArray(source?.receipts)
     ? source.receipts
     : (Array.isArray(binding?.priorReviews) ? binding.priorReviews : []);
+  const totalCount = Number.isSafeInteger(source?.totalCount) && source.totalCount >= sourceReceipts.length
+    ? source.totalCount
+    : sourceReceipts.length;
   const receipts = sourceReceipts.slice(0, MAX_PUBLIC_HISTORY_RECEIPTS).flatMap((receipt) => {
     const reviewId = validId(receipt?.reviewId, REVIEW_ID);
     const changeSetId = validId(receipt?.changeSetId, CHANGE_SET_ID);
@@ -280,16 +289,17 @@ function projectReceiptHistory(binding) {
   // `count` is how many receipts the discovery actually held, not how many
   // survived the public bound, so a capped list can never read as the whole
   // history. Anything dropped here says so by code.
-  if (receipts.length < sourceReceipts.length && diagnostics.length < MAX_PUBLIC_HISTORY_DIAGNOSTICS) {
+  if ((receipts.length < sourceReceipts.length || totalCount > sourceReceipts.length) &&
+      diagnostics.length < MAX_PUBLIC_HISTORY_DIAGNOSTICS) {
     diagnostics.push({
-      code: sourceReceipts.length > MAX_PUBLIC_HISTORY_RECEIPTS
+      code: totalCount > sourceReceipts.length || sourceReceipts.length > MAX_PUBLIC_HISTORY_RECEIPTS
         ? "public_receipt_history_truncated"
         : "public_receipt_history_unprojectable"
     });
   }
   return {
     status: sourceStatus,
-    count: sourceReceipts.length,
+    count: totalCount,
     receipts,
     diagnostics
   };
@@ -387,7 +397,7 @@ export function projectDelegateAgentOutcome(outcome) {
     },
     ...(outcome.reviewBinding ? {
       review: {
-        status: ["bound", "unbound", "unavailable"].includes(outcome.reviewBinding.status)
+        status: REVIEW_BINDING_STATUSES.includes(outcome.reviewBinding.status)
           ? outcome.reviewBinding.status
           : "unavailable",
         coherence: ["held", "denied", "lost", "not-attempted"].includes(outcome.reviewBinding.coherence)

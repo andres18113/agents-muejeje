@@ -295,32 +295,62 @@ function needsWorktreeContent(entry) {
 }
 
 export async function collectChangeSet(input = {}, dependencies = {}) {
-  const { deadlineMs = COLLECTION_DEADLINE_MS } = dependencies;
+  const {
+    deadlineMs = COLLECTION_DEADLINE_MS,
+    deadlineAt: suppliedDeadlineAt,
+    requestContext,
+    abortSignal,
+    schedule = setTimeout,
+    cancelSchedule = clearTimeout
+  } = dependencies;
+  const now = dependencies.now ?? requestContext?.now ?? (() => performance.now());
   // The deadline race observes the collection; it does not stop it. This
   // controller is what actually stops it, so no Git child and no filesystem
   // read can begin after the caller has already been told the deadline expired.
   const cancellation = new AbortController();
+  const localDeadlineAt = now() + deadlineMs;
+  const deadlineAt = Number.isFinite(suppliedDeadlineAt)
+    ? Math.min(localDeadlineAt, suppliedDeadlineAt)
+    : localDeadlineAt;
+  const externalAbortSignal = abortSignal ?? requestContext?.abortSignal;
+  let resolveCancellation;
+  const cancellationResult = new Promise((resolve) => {
+    resolveCancellation = resolve;
+  });
+  const onAbort = () => {
+    cancellation.abort();
+    resolveCancellation(Object.freeze({
+      status: "indeterminate",
+      reasons: Object.freeze([{ code: "collection_deadline_exceeded" }])
+    }));
+  };
+  if (externalAbortSignal?.aborted) onAbort();
+  else externalAbortSignal?.addEventListener?.("abort", onAbort, { once: true });
   let deadlineTimer;
   const deadlineResult = new Promise((resolve) => {
-    deadlineTimer = setTimeout(() => {
+    deadlineTimer = schedule(() => {
       cancellation.abort();
       resolve(Object.freeze({
         status: "indeterminate",
         reasons: Object.freeze([{ code: "collection_deadline_exceeded" }])
       }));
-    }, deadlineMs);
+    }, Math.max(0, deadlineAt - now()));
   });
 
   try {
     return await Promise.race([
       collectChangeSetWithinDeadline(input, {
         ...dependencies,
+        now,
+        deadlineAt,
         cancellationSignal: cancellation.signal
       }),
-      deadlineResult
+      deadlineResult,
+      cancellationResult
     ]);
   } finally {
-    clearTimeout(deadlineTimer);
+    cancelSchedule(deadlineTimer);
+    externalAbortSignal?.removeEventListener?.("abort", onAbort);
     // Whatever ended this collection, nothing further may be observed on its
     // behalf. Cancelling here is what makes that true for the success path too.
     cancellation.abort();
@@ -341,13 +371,16 @@ async function collectChangeSetWithinDeadline({
     realpathFn = realpath,
     platform = process.platform,
     deadlineMs = COLLECTION_DEADLINE_MS,
+    deadlineAt: suppliedDeadlineAt,
     cancellationSignal,
     lstatFn,
     openFn,
     readlinkFn
   } = dependencies;
 
-  const deadlineAt = now() + deadlineMs;
+  const deadlineAt = Number.isFinite(suppliedDeadlineAt)
+    ? suppliedDeadlineAt
+    : now() + deadlineMs;
   const cancelled = () => cancellationSignal?.aborted === true;
   const checkDeadline = () => {
     if (cancelled()) indeterminate("collection_deadline_exceeded", "collection was cancelled");
@@ -362,6 +395,7 @@ async function collectChangeSetWithinDeadline({
     }
     return runGit(args, {
       ...options,
+      abortSignal: cancellationSignal,
       timeoutMs: Math.max(1, Math.min(
         options.timeoutMs ?? GIT_COMMAND_TIMEOUT_MS,
         Math.ceil(remaining)
@@ -370,6 +404,7 @@ async function collectChangeSetWithinDeadline({
   };
 
   try {
+    checkDeadline();
     if (rootSource !== "git-boundary") indeterminate("not_a_git_worktree", String(rootSource));
     await verifyCustodyExpectation(readOwnership, canonicalRepositoryKey, custodyExpectation);
 

@@ -261,10 +261,18 @@ export function runSupervisedProcess(
     now = Date.now,
     describeCommand = () => command + " " + args.join(" "),
     encoding = "utf8",
-    onSpawned
+    onSpawned,
+    abortSignal
   } = {}
 ) {
   return new Promise((resolve, reject) => {
+    if (abortSignal?.aborted) {
+      reject(new SupervisedProcessError("Supervised process was cancelled before spawn.", {
+        code: "supervised_process_cancelled",
+        reason: "cancelled"
+      }));
+      return;
+    }
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       reject(new SupervisedProcessError("Supervised process timeout is invalid.", {
         code: "supervised_process_timeout_invalid"
@@ -318,6 +326,7 @@ export function runSupervisedProcess(
     let interruption;
     let executionTimer;
     let terminalTimer;
+    let abortListener;
     let cancelTermination = () => {};
     let terminationController;
     let exitObserved = false;
@@ -347,6 +356,7 @@ export function runSupervisedProcess(
       settled = true;
       cancelSchedule(executionTimer);
       cancelSchedule(terminalTimer);
+      if (abortListener) abortSignal?.removeEventListener?.("abort", abortListener);
       terminationController?.abort();
       cancelTermination();
       identityState.cancelObservation();
@@ -522,6 +532,16 @@ export function runSupervisedProcess(
         "Did not finish within " + Math.round(timeoutMs / 1000) + " seconds"
       );
     }, remainingMs(executionDeadlineAt, now));
+
+    abortListener = () => {
+      interrupt(
+        "supervised_process_cancelled",
+        "cancelled",
+        "Supervised process was cancelled"
+      );
+    };
+    if (abortSignal?.aborted) abortListener();
+    else abortSignal?.addEventListener?.("abort", abortListener, { once: true });
 
     // Handed the exact spawned child so a caller can capture its durable
     // identity. Invoked after the listeners and deadline are armed, and never

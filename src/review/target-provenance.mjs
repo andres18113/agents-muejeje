@@ -45,11 +45,15 @@ export function managedWorktreeExecutionId({ effectiveCwd, repositoryStateDirect
   return segments && segments.length > 0 ? segments[0] : undefined;
 }
 
-async function readRecordTargetRef(recordPath) {
+async function readRecordTargetRef(recordPath, requestContext) {
   try {
+    requestContext?.assertActive?.("review-target-record-read");
     const record = validateDurableOwnershipRecord(JSON.parse(await readFile(recordPath, "utf8")));
     return record?.targetRef;
-  } catch {
+  } catch (error) {
+    if (error?.code === "claude_cancelled" || error?.code === "delegate_request_deadline_exceeded") {
+      throw error;
+    }
     return undefined;
   }
 }
@@ -64,7 +68,8 @@ async function readRecordTargetRef(recordPath) {
 export async function resolveReviewTargetSpec({
   requestedTargetRef,
   effectiveCwd,
-  repositoryStateDirectory
+  repositoryStateDirectory,
+  requestContext
 }) {
   if (requestedTargetRef !== undefined && requestedTargetRef !== null) {
     return reviewTargetSpec({ ref: requestedTargetRef, source: "request" });
@@ -79,7 +84,7 @@ export async function resolveReviewTargetSpec({
     executionHistoryDirectoryIn(repositoryStateDirectory, executionId),
     RECORD_FILE_NAME
   );
-  const targetRef = await readRecordTargetRef(archived);
+  const targetRef = await readRecordTargetRef(archived, requestContext);
   if (targetRef === undefined) return NO_REVIEW_TARGET;
 
   try {

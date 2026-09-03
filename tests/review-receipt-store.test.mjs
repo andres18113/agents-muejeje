@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { canonicalJson } from "../src/canonical-json.mjs";
+import { canonicalJson, sha256Hex } from "../src/canonical-json.mjs";
 import { SECTION_NAMES, changeSetIdFromSectionDigests } from "../src/changeset/descriptor.mjs";
 import { reviewTargetSpec, NO_REVIEW_TARGET } from "../src/changeset/target.mjs";
 import {
@@ -56,7 +56,8 @@ function receiptFor({
   agentType = "code-review",
   targetSpec = TARGET,
   recordedAt = 3_000,
-  assignment = "review"
+  assignment = "review",
+  resultText
 } = {}) {
   const sections = sectionsFor(changeSetSeed);
   const changeSetId = changeSetIdFromSectionDigests({ objectFormat: "sha1", sections });
@@ -109,10 +110,12 @@ function receiptFor({
       completedAt: 2_000,
       durationMs: 1_000
     },
-    result: { sha256: DIGEST, bytes: 10 },
+    result: typeof resultText === "string"
+      ? { sha256: sha256Hex(Buffer.from(resultText, "utf8")), bytes: Buffer.byteLength(resultText, "utf8") }
+      : { sha256: DIGEST, bytes: 10 },
     provenance: {
       repositoryId: repositoryIdForCanonicalRootKey(ROOT_KEY),
-      producer: "claude-agents-mcp/0.2.0",
+      producer: "claude-agents-mcp/0.2.1",
       collector: "change-set-collector/v1",
       recordedAt
     }
@@ -121,6 +124,16 @@ function receiptFor({
 
 function store(stateRoot) {
   return new ReviewReceiptStore({ stateRoot });
+}
+
+async function writeTextDurably(pathname, text) {
+  const handle = await open(pathname, "wx", 0o600);
+  try {
+    await handle.writeFile(text, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 test("a receipt is written atomically and leaves no staging directory behind", async () => {
@@ -228,7 +241,8 @@ test("corrupt entries are reported and left exactly where they are", async () =>
 test("the per-change-set cap refuses rather than evicting", async () => {
   await withState(async (stateRoot) => {
     const receipts = store(stateRoot);
-    const receipt = receiptFor({ changeSetSeed: 1 });
+    const resultText = "capacity precondition";
+    const receipt = receiptFor({ changeSetSeed: 1, resultText });
     const changeSetDirectory = path.join(
       receipts.reviewsDirectory(ROOT_KEY), "cs", receipt.binding.changeSetId.slice(4, 24)
     );
@@ -237,14 +251,18 @@ test("the per-change-set cap refuses rather than evicting", async () => {
       await mkdir(path.join(changeSetDirectory, index.toString(16).padStart(20, "0")));
     }
 
+    const fence = createReceiptPublicationFence();
     await assert.rejects(
-      receipts.put({ canonicalRootKey: ROOT_KEY, receipt }),
+      receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication }),
       (error) => {
         assert.equal(error.code, "review_receipt_store_full");
         return true;
       }
     );
     assert.equal((await readdir(changeSetDirectory)).length, MAX_RECEIPTS_PER_CHANGE_SET);
+    assert.equal(fence.publicationStarted(), false);
+    assert.equal(fence.publicationSettled(), false);
+    assert.equal((await fence.authoritativeSettlement()).status, "not-started");
   });
 });
 
@@ -310,10 +328,12 @@ test("the authoritative fence is adjacent to the receipt rename and excludes sco
     const renameIssued = deferred();
     const allowRename = deferred();
     const indexReached = deferred();
-    const receipt = receiptFor();
+    const resultText = "authoritative artifact";
+    const receipt = receiptFor({ resultText });
     const receipts = new ReviewReceiptStore({
       stateRoot,
       renameFn: async (...args) => {
+        if (String(args[1]).endsWith(".txt")) return await rename(...args);
         renameIssued.resolve();
         await allowRename.promise;
         return await rename(...args);
@@ -327,6 +347,7 @@ test("the authoritative fence is adjacent to the receipt rename and excludes sco
     const pending = receipts.put({
       canonicalRootKey: ROOT_KEY,
       receipt,
+      resultText,
       publication: fence.publication,
       awaitIndex: false
     });
@@ -356,7 +377,8 @@ test("cancellation before the store rename boundary can never publish a late rec
   await withState(async (stateRoot) => {
     const boundaryReached = deferred();
     const allowBoundary = deferred();
-    const receipt = receiptFor();
+    const resultText = "cancel before receipt fence";
+    const receipt = receiptFor({ resultText });
     const receipts = new ReviewReceiptStore({
       stateRoot,
       beforeAuthoritativeRename: async () => {
@@ -368,6 +390,7 @@ test("cancellation before the store rename boundary can never publish a late rec
     const pending = receipts.put({
       canonicalRootKey: ROOT_KEY,
       receipt,
+      resultText,
       publication: fence.publication,
       awaitIndex: false
     });
@@ -385,6 +408,175 @@ test("cancellation before the store rename boundary can never publish a late rec
       changeSetId: receipt.binding.changeSetId
     });
     assert.deepEqual(listed.receipts, []);
+  });
+});
+
+test("artifact write failures remain before the authoritative receipt fence", async () => {
+  for (const code of ["ENOSPC", "EIO", "EACCES"]) {
+    await withState(async (stateRoot) => {
+      const resultText = "artifact write failure " + code;
+      const receipt = receiptFor({ resultText });
+      let writes = 0;
+      const receipts = new ReviewReceiptStore({
+        stateRoot,
+        writeFileDurablyFn: async (pathname, text) => {
+          writes += 1;
+          if (writes === 2) throw Object.assign(new Error(code), { code });
+          await writeTextDurably(pathname, text);
+        }
+      });
+      const fence = createReceiptPublicationFence();
+
+      await assert.rejects(
+        receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication }),
+        (error) => error?.code === code
+      );
+      assert.equal(fence.publicationStarted(), false, code);
+      assert.equal(fence.publicationSettled(), false, code);
+      assert.equal((await fence.authoritativeSettlement()).status, "not-started", code);
+      const listed = await receipts.listForChangeSet({
+        canonicalRootKey: ROOT_KEY,
+        changeSetId: receipt.binding.changeSetId
+      });
+      assert.deepEqual(listed.receipts, [], code);
+    });
+  }
+});
+
+test("artifact rename permission failure without a verified target refuses receipt publication", async () => {
+  await withState(async (stateRoot) => {
+    const resultText = "permission denied artifact";
+    const receipt = receiptFor({ resultText });
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      renameFn: async (source, destination) => {
+        if (String(destination).endsWith(".txt")) {
+          throw Object.assign(new Error("denied"), { code: "EACCES" });
+        }
+        return await rename(source, destination);
+      }
+    });
+    const fence = createReceiptPublicationFence();
+
+    await assert.rejects(
+      receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication }),
+      (error) => error?.code === "review_result_artifact_conflict"
+    );
+    assert.equal(fence.publicationStarted(), false);
+    assert.equal((await fence.authoritativeSettlement()).status, "not-started");
+  });
+});
+
+test("an already valid content-addressed artifact is idempotent before receipt publication", async () => {
+  await withState(async (stateRoot) => {
+    const resultText = "existing valid artifact";
+    const receipt = receiptFor({ resultText });
+    let artifactRenameAttempts = 0;
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      renameFn: async (source, destination) => {
+        if (String(destination).endsWith(".txt")) {
+          artifactRenameAttempts += 1;
+          throw Object.assign(new Error("already there"), { code: "EEXIST" });
+        }
+        return await rename(source, destination);
+      }
+    });
+    const artifact = receipts.artifactPath(ROOT_KEY, receipt.result.sha256);
+    await mkdir(path.dirname(artifact), { recursive: true });
+    await writeFile(artifact, resultText, "utf8");
+    const fence = createReceiptPublicationFence();
+
+    const stored = await receipts.put({
+      canonicalRootKey: ROOT_KEY,
+      receipt,
+      resultText,
+      publication: fence.publication
+    });
+    assert.equal(stored.stored, "created");
+    assert.equal(artifactRenameAttempts, 0);
+    assert.equal(fence.publicationStarted(), true);
+    assert.equal((await fence.authoritativeSettlement()).disposition, "published");
+    assert.equal((await receipts.loadResultArtifact({ canonicalRootKey: ROOT_KEY, receipt })).status, "verified");
+  });
+});
+
+test("a corrupt existing artifact refuses receipt publication", async () => {
+  await withState(async (stateRoot) => {
+    const resultText = "expected artifact";
+    const receipt = receiptFor({ resultText });
+    let artifactRenameAttempts = 0;
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      renameFn: async (source, destination) => {
+        if (String(destination).endsWith(".txt")) {
+          artifactRenameAttempts += 1;
+          throw Object.assign(new Error("already there"), { code: "ENOTEMPTY" });
+        }
+        return await rename(source, destination);
+      }
+    });
+    const artifact = receipts.artifactPath(ROOT_KEY, receipt.result.sha256);
+    await mkdir(path.dirname(artifact), { recursive: true });
+    await writeFile(artifact, "corrupt", "utf8");
+    const fence = createReceiptPublicationFence();
+
+    await assert.rejects(
+      receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication }),
+      (error) => error?.code === "review_result_artifact_conflict"
+    );
+    assert.equal(artifactRenameAttempts, 0);
+    assert.equal(fence.publicationStarted(), false);
+    assert.equal((await fence.authoritativeSettlement()).status, "not-started");
+  });
+});
+
+test("artifact verification uses raw bytes rather than a UTF-8 replacement decode", async () => {
+  await withState(async (stateRoot) => {
+    const resultText = "\uFFFD";
+    const receipt = receiptFor({ resultText });
+    const receipts = store(stateRoot);
+    const artifact = receipts.artifactPath(ROOT_KEY, receipt.result.sha256);
+    await mkdir(path.dirname(artifact), { recursive: true });
+    await writeFile(artifact, Buffer.from([0x80]));
+    const fence = createReceiptPublicationFence();
+
+    await assert.rejects(
+      receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication }),
+      (error) => error?.code === "review_result_artifact_conflict"
+    );
+    assert.equal(fence.publicationStarted(), false);
+    assert.equal((await fence.authoritativeSettlement()).status, "not-started");
+  });
+});
+
+test("a stalled artifact cancelled before the fence cannot leave late receipt publication armed", async () => {
+  await withState(async (stateRoot) => {
+    const resultText = "stalled artifact";
+    const receipt = receiptFor({ resultText });
+    const artifactWriteStarted = deferred();
+    const allowArtifactWrite = deferred();
+    let writes = 0;
+    const receipts = new ReviewReceiptStore({
+      stateRoot,
+      writeFileDurablyFn: async (pathname, text) => {
+        writes += 1;
+        if (writes === 2) {
+          artifactWriteStarted.resolve();
+          await allowArtifactWrite.promise;
+        }
+        await writeTextDurably(pathname, text);
+      }
+    });
+    const fence = createReceiptPublicationFence();
+    const pending = receipts.put({ canonicalRootKey: ROOT_KEY, receipt, resultText, publication: fence.publication });
+
+    await artifactWriteStarted.promise;
+    fence.requestCancellation();
+    allowArtifactWrite.resolve();
+    await assert.rejects(pending, (error) => error?.code === "review_receipt_publication_cancelled");
+    assert.equal(fence.publicationStarted(), false);
+    assert.equal((await fence.authoritativeSettlement()).status, "not-started");
   });
 });
 
@@ -567,7 +759,7 @@ test("a discovered receipt is fully validated, and a dangling or lying pointer i
       agentType: "code-review",
       targetSpec: TARGET
     });
-    assert.equal(found.status, "partial");
+    assert.equal(found.status, "complete");
     assert.deepEqual(found.receipts.map((r) => r.reviewId), [receipt.reviewId]);
     assert.equal(found.skipped.length, 4);
     assert.ok(found.skipped.some((entry) => entry.code === "review_pointer_invalid"));
@@ -669,7 +861,7 @@ test("index loss cannot make durable evidence read as a proven empty history", a
       "durable evidence must never be reported as a proven absence"
     );
     assert.deepEqual(found.receipts.map((entry) => entry.reviewId), [receipt.reviewId]);
-    assert.equal(found.status, "partial");
+    assert.equal(found.status, "complete");
     assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovered_from_receipts"));
   });
 });
@@ -946,7 +1138,7 @@ test("a stalled scope index neither blocks publication nor unmakes the receipt",
       targetSpec: TARGET
     });
     assert.deepEqual(found.receipts.map((entry) => entry.reviewId), [receipt.reviewId]);
-    assert.notEqual(found.status, "complete", "an unindexed receipt is reported, not assumed away");
+    assert.equal(found.status, "complete", "the authoritative sweep proves the recovered history");
   });
 });
 
@@ -992,5 +1184,42 @@ test("a merged history never exceeds the bound or drops a receipt silently", asy
       indexed.reviewId,
       "the newest receipt still leads, whichever tree it came from"
     );
+  });
+});
+
+test("a full non-evidentiary index cannot hide a newer authoritative receipt behind the output bound", async () => {
+  await withState(async (stateRoot) => {
+    const indexed = store(stateRoot);
+    for (let seed = 1; seed <= 16; seed += 1) {
+      await indexed.put({
+        canonicalRootKey: ROOT_KEY,
+        receipt: receiptFor({ changeSetSeed: seed, recordedAt: 10_000 + seed })
+      });
+    }
+
+    const newer = receiptFor({ changeSetSeed: 17, recordedAt: 99_999 });
+    const unindexed = new ReviewReceiptStore({
+      stateRoot,
+      beforeScopeIndex: () => {
+        throw Object.assign(new Error("index intentionally missing"), { code: "EIO" });
+      }
+    });
+    await unindexed.put({ canonicalRootKey: ROOT_KEY, receipt: newer });
+
+    const found = await store(stateRoot).discoverForScope({
+      canonicalRootKey: ROOT_KEY,
+      agentType: "code-review",
+      targetSpec: TARGET,
+      limit: 16
+    });
+    assert.equal(found.status, "partial", "a capped output cannot imply exhaustive history");
+    assert.equal(found.totalCount, 17);
+    assert.equal(found.receipts.length, 16);
+    assert.equal(found.allReceipts.length, 17);
+    assert.equal(found.authoritativeExhaustive, true);
+    assert.equal(found.outputTruncated, true);
+    assert.equal(found.receipts[0].reviewId, newer.reviewId, "authoritative newest receipt is visible");
+    assert.ok(found.allReceipts.some((receipt) => receipt.reviewId === newer.reviewId));
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_truncated"));
   });
 });

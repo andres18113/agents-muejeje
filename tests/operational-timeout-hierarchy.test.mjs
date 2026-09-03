@@ -10,6 +10,12 @@ import { ClaudeRunnerError, ClaudeTimeoutError } from "../src/claude-errors.mjs"
 import { runClaudeAgent } from "../src/claude-runner.mjs";
 import { delegateAgent, resolveAgentRuntime } from "../src/delegate-agent.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import { repositoryIdForCanonicalRootKey } from "../src/write-custody.mjs";
+import { sha256Hex } from "../src/canonical-json.mjs";
+import { SECTION_NAMES, changeSetIdFromSectionDigests } from "../src/changeset/descriptor.mjs";
+import { NO_REVIEW_TARGET } from "../src/changeset/target.mjs";
+import { ReviewReceiptStore } from "../src/review/receipt-store.mjs";
+import { COHERENT_ADMISSION_KIND, buildReviewReceipt } from "../src/review/receipt-schema.mjs";
 import {
   RECOMMENDED_CODEX_TOOL_TIMEOUT_MS,
   RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
@@ -61,6 +67,95 @@ async function withDisposableRepo(callback) {
   }
 }
 
+function manualClockForCausalTimeline(initialTime = 0) {
+  let time = initialTime;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => time,
+    schedule(callback, delay) {
+      const id = nextId++;
+      timers.set(id, { at: time + Math.max(0, delay), callback });
+      return id;
+    },
+    cancel(id) {
+      timers.delete(id);
+    },
+    advanceTo(target) {
+      time = target;
+      for (const [id, timer] of [...timers.entries()]) {
+        if (timer.at <= time) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    }
+  };
+}
+
+function causalReceipt({ canonicalRootKey, resultText }) {
+  const sections = Object.fromEntries(SECTION_NAMES.map((name, index) => [
+    name,
+    String(index + 1).padStart(64, "0")
+  ]));
+  const changeSetId = changeSetIdFromSectionDigests({ objectFormat: "sha1", sections });
+  return buildReviewReceipt({
+    binding: {
+      changeSetId,
+      objectFormat: "sha1",
+      sections,
+      target: { spec: NO_REVIEW_TARGET, resolution: "none", commit: null },
+      beforeSummary: {
+        headCommit: "1".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: null,
+        counts: { index: 0, worktree: 0, unmerged: 0, untracked: 0, submodules: 0 }
+      },
+      afterSummary: {
+        headCommit: "1".repeat(40),
+        branch: "main",
+        detached: false,
+        mergeBase: null,
+        counts: { index: 0, worktree: 0, unmerged: 0, untracked: 0, submodules: 0 }
+      }
+    },
+    coherence: {
+      admission: COHERENT_ADMISSION_KIND,
+      custodyExecutionId: "causal-manual-clock",
+      beforeAt: 0,
+      afterAt: 536
+    },
+    reviewer: {
+      agentType: "code-review",
+      contractSha256: "a".repeat(64),
+      capabilityPolicySha256: "b".repeat(64),
+      modelSelector: "opus",
+      modelSelectorSource: "default",
+      modelStrategy: "configurable",
+      reasoningEffort: "high"
+    },
+    assignment: { sha256: "c".repeat(64), chars: 24 },
+    execution: {
+      executionId: "causal-manual-clock",
+      status: "completed",
+      startedAt: 0,
+      completedAt: 536,
+      durationMs: 536
+    },
+    result: {
+      sha256: sha256Hex(Buffer.from(resultText, "utf8")),
+      bytes: Buffer.byteLength(resultText, "utf8")
+    },
+    provenance: {
+      repositoryId: repositoryIdForCanonicalRootKey(canonicalRootKey),
+      producer: "claude-agents-mcp/0.2.1",
+      collector: "change-set-collector/v1",
+      recordedAt: 536
+    }
+  });
+}
+
 // 1. Machine-checked hierarchy assertions
 test("machine-checked timeout hierarchy enforces client > MCP lifetime > profile timeout", () => {
   const verified = assertTimeoutHierarchy({
@@ -95,6 +190,16 @@ test("machine-checked timeout hierarchy enforces client > MCP lifetime > profile
     (err) => err instanceof TimeoutHierarchyViolationError && err.code === "insufficient_settlement_headroom"
   );
 
+  assert.throws(
+    () =>
+      assertTimeoutHierarchy({
+        outerTimeoutMs: 2415_000,
+        maxProfileTimeoutMs: 1800_000,
+        settlementBudgetMs: 615_000
+      }),
+    (err) => err instanceof TimeoutHierarchyViolationError && err.code === "insufficient_settlement_headroom"
+  );
+
   // Calculation of max bounded MCP lifetime
   assert.equal(calculateMaxMcpLifetime(1800_000), 2415_000);
 
@@ -108,22 +213,28 @@ test("machine-checked timeout hierarchy enforces client > MCP lifetime > profile
   assert.ok(maintainerCheck.headroomMs >= 0);
 });
 
-// 2. Credential-free diagnostic safety evaluation
 test("credential-free checkTimeoutHierarchySafety identifies safe and unsafe configurations", () => {
   const safe = checkTimeoutHierarchySafety({
     codexTimeoutSec: 3600,
     maxProfileTimeoutMs: 1800_000
   });
   assert.equal(safe.safe, true);
-  assert.equal(safe.minSafeTimeoutSec, 2415);
+  assert.equal(safe.minSafeTimeoutSec, 2416);
   assert.ok(safe.message.includes("satisfies timeout hierarchy safety"));
+
+  const equalBound = checkTimeoutHierarchySafety({
+    codexTimeoutSec: 2415,
+    maxProfileTimeoutMs: 1800_000
+  });
+  assert.equal(equalBound.safe, false);
+  assert.equal(equalBound.status, "unsafe");
 
   const unsafeDefault = checkTimeoutHierarchySafety({
     codexTimeoutSec: 300,
     maxProfileTimeoutMs: 1800_000
   });
   assert.equal(unsafeDefault.safe, false);
-  assert.equal(unsafeDefault.minSafeTimeoutSec, 2415);
+  assert.equal(unsafeDefault.minSafeTimeoutSec, 2416);
   assert.ok(unsafeDefault.message.includes("dangerously below"));
 
   const unconfigured = checkTimeoutHierarchySafety({
@@ -133,121 +244,78 @@ test("credential-free checkTimeoutHierarchySafety identifies safe and unsafe con
   assert.equal(unconfigured.safe, false);
 });
 
-// 3. Deterministic regression of the 536s Incident with fake Claude & late receipt reconciliation
-test("536-second code review completes and binds ReviewReceipt under 3600s outer timeout", async () => {
-  await withDisposableRepo(async ({ repoDir, writeCustody }) => {
-    let runAgentCalled = 0;
+test("manual-clock 300/536 causal ordering abandons old delivery, completes supported delivery, and recovers durable evidence", async () => {
+  await withDisposableRepo(async ({ repoDir, stateRoot }) => {
+    const clock = manualClockForCausalTimeline();
+    class FakeStdin extends EventEmitter {
+      write() { return false; }
+      end() {}
+      destroy() {}
+    }
+    const child = new EventEmitter();
+    child.pid = 53_600;
+    child.stdin = new FakeStdin();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => true;
+    const runtime = { ...resolveAgentRuntime(getAgentProfile("code-review")), timeoutMs: 600 };
+    const runner = runClaudeAgent({
+      prompt: "manual-clock causal review",
+      cwd: repoDir,
+      repositoryRoot: repoDir,
+      runtime,
+      spawnProcess: () => child,
+      inspectProcess: async () => ({
+        status: "alive",
+        identity: { pid: child.pid, startTime: "53600", source: "causal-timeline" }
+      }),
+      createSettings: async () => ({ settingsPath: "causal-settings", cleanup: async () => {} }),
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancel
+    });
+    await new Promise((resolve) => setImmediate(resolve));
 
-    const fakeRunAgent = async ({ executionId, agentType, repositoryRoot, onChildStarted }) => {
-      runAgentCalled += 1;
-      const pid = 88_888;
-      const processIdentity = {
-        executionId,
-        agentType,
-        repositoryRoot,
-        pid,
-        child: { pid },
-        startedAt: Date.now(),
-        startTime: "8888800",
-        source: "test-identity"
-      };
+    const deliveryEnvelope = (deadlineAt) => new Promise((resolve) => {
+      const deadline = clock.schedule(() => resolve({ status: "abandoned", at: clock.now() }), deadlineAt - clock.now());
+      runner.then((outcome) => {
+        clock.cancel(deadline);
+        resolve({ status: "completed", at: clock.now(), outcome });
+      });
+    });
+    const historicalClient = deliveryEnvelope(300);
+    const supportedClient = deliveryEnvelope(600);
+    clock.schedule(() => {
+      child.stdout.emit("data", "durable reviewer findings\n");
+      child.emit("close", 0, null);
+    }, 536);
 
-      if (onChildStarted) {
-        await onChildStarted(processIdentity);
-      }
+    clock.advanceTo(300);
+    assert.deepEqual(await historicalClient, { status: "abandoned", at: 300 });
 
-      // Simulate 536,143 ms of review work (the exact incident duration)
-      const reviewDurationMs = 536_143;
+    clock.advanceTo(536);
+    const completed = await supportedClient;
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.at, 536);
+    assert.ok(completed.outcome.result.includes("durable reviewer findings"));
 
-      return {
-        status: "completed",
-        durationMs: reviewDurationMs,
-        result: "REVIEW OUTCOME: Architecture verified, 0 critical issues.",
-        stderrSummary: "",
-        pid,
-        processIdentity,
-        terminalProof: {
-          kind: "child-event",
-          event: "close",
-          observedAt: Date.now(),
-          processIdentity
-        }
-      };
-    };
-
-    const outcome = await delegateAgent(
-      {
-        agentType: "code-review",
-        task: "Perform full architecture and security review",
-        cwd: repoDir
-      },
-      {
-        runAgent: fakeRunAgent,
-        writeCustody
-      }
+    const canonicalRootKey = "causal-manual-clock-root";
+    const resultText = completed.outcome.result;
+    const receipt = causalReceipt({ canonicalRootKey, resultText });
+    const store = new ReviewReceiptStore({ stateRoot });
+    await store.put({ canonicalRootKey, receipt, resultText });
+    const recovered = await store.discoverForScope({
+      canonicalRootKey,
+      agentType: "code-review",
+      targetSpec: NO_REVIEW_TARGET
+    });
+    assert.equal(recovered.status, "complete");
+    assert.equal(recovered.receipts.length, 1);
+    assert.equal(recovered.receipts[0].reviewId, receipt.reviewId);
+    assert.equal(
+      (await store.loadResultArtifact({ canonicalRootKey, receipt })).status,
+      "verified"
     );
-
-    assert.equal(runAgentCalled, 1);
-    assert.equal(outcome.status, "completed");
-    assert.equal(outcome.durationMs, 536_143);
-    assert.equal(outcome.reviewBinding.status, "bound");
-    assert.equal(outcome.reviewBinding.coherence, "held");
-    assert.ok(outcome.reviewBinding.reviewId?.startsWith("rr1:"));
-    assert.equal(outcome.custodyState, "released");
-    assert.equal(outcome.reviewBinding.publication.status, "authoritative-settled");
-
-    // 4. Test No-Model Late Receipt Discovery and Reconciliation
-    // Immediately after, Codex calls delegate_agent with reconcile_only: true
-    let secondRunAgentCalled = 0;
-    const reconcileRunAgent = async () => {
-      secondRunAgentCalled += 1;
-      throw new Error("reconcile_only must never invoke Claude runner!");
-    };
-
-    const reconciledOutcome = await delegateAgent(
-      {
-        agentType: "code-review",
-        task: "reconcile",
-        reconcileOnly: true,
-        cwd: repoDir
-      },
-      {
-        runAgent: reconcileRunAgent,
-        writeCustody
-      }
-    );
-
-    assert.equal(secondRunAgentCalled, 0, "No Claude runner process should be spawned during reconciliation");
-    assert.equal(reconciledOutcome.status, "completed");
-    assert.equal(reconciledOutcome.reviewBinding.status, "bound");
-    assert.equal(reconciledOutcome.reviewBinding.reviewId, outcome.reviewBinding.reviewId);
-    assert.ok(reconciledOutcome.result.includes("Reconciled authoritative review receipt"));
-    assert.ok(reconciledOutcome.result.includes("0 Claude delegated-model quota consumed"));
-    assert.equal(reconciledOutcome.custodyState, "released");
-
-    // Dynamic freshness: modify repository worktree and verify reconcile_only dynamically reports STALE
-    await writeFile(path.join(repoDir, "mutation.txt"), "unauthorized change\n", "utf8");
-
-    const staleOutcome = await delegateAgent(
-      {
-        agentType: "code-review",
-        task: "Check freshness of review",
-        reconcileOnly: true,
-        cwd: repoDir
-      },
-      {
-        runAgent: reconcileRunAgent,
-        writeCustody
-      }
-    );
-
-    assert.equal(secondRunAgentCalled, 0);
-    assert.equal(staleOutcome.status, "completed");
-    assert.equal(staleOutcome.reviewBinding.status, "bound");
-    assert.equal(staleOutcome.reviewBinding.receiptHistory.receipts[0].verdict, "STALE");
-    assert.ok(staleOutcome.result.includes("is STALE for current changeSet"));
-    assert.ok(staleOutcome.result.includes("A fresh code-review delegation is required"));
-    assert.equal(staleOutcome.custodyState, "released");
   });
 });
 

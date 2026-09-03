@@ -163,13 +163,14 @@ function reviewHarness({
 
 test("the MCP input schema has exactly the Phase 6 and v0.2.1 public fields", () => {
   assert.deepEqual(Object.keys(delegateAgentInputSchema.shape).sort(), [
-    "agent_type", "cwd", "reconcile_only", "target_ref", "task"
+    "agent_type", "cwd", "reconcile_only", "review_id", "target_ref", "task"
   ]);
   assert.equal(delegateAgentInputSchema.safeParse({
     agent_type: "code-review",
     task: "review",
     target_ref: "refs/remotes/origin/main",
-    reconcile_only: true
+    reconcile_only: true,
+    review_id: "rr1:" + "a".repeat(64)
   }).success, true);
   assert.equal(delegateAgentInputSchema.safeParse({
     agent_type: "code-review",

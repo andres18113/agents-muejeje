@@ -57,7 +57,8 @@ export async function resolveCanonicalWorkspaceRoot(
     accessMode = "read",
     realpathFn = realpath,
     lstatFn = lstat,
-    platform = process.platform
+    platform = process.platform,
+    requestContext
   } = {}
 ) {
   if (typeof cwd !== "string" || cwd.trim().length === 0) {
@@ -71,8 +72,12 @@ export async function resolveCanonicalWorkspaceRoot(
 
   let effectiveCwd;
   try {
+    requestContext?.assertActive?.("workspace-realpath");
     effectiveCwd = await realpathFn(cwd);
   } catch (error) {
+    if (error?.code === "claude_cancelled" || error?.code === "delegate_request_deadline_exceeded") {
+      throw error;
+    }
     if (accessMode === "write") {
       throw new WorkspaceRootError(
         "Cannot establish a canonical repository root for write access: " + cwd,
@@ -92,6 +97,7 @@ export async function resolveCanonicalWorkspaceRoot(
   let candidate = effectiveCwd;
   try {
     while (true) {
+      requestContext?.assertActive?.("workspace-git-boundary");
       if (await gitBoundaryExists(candidate, { lstatFn })) {
         return Object.freeze({
           effectiveCwd,
@@ -108,6 +114,9 @@ export async function resolveCanonicalWorkspaceRoot(
       candidate = parent;
     }
   } catch (error) {
+    if (error?.code === "claude_cancelled" || error?.code === "delegate_request_deadline_exceeded") {
+      throw error;
+    }
     if (accessMode === "write") {
       throw new WorkspaceRootError(
         "Cannot establish a canonical repository root for write access: " + effectiveCwd,

@@ -458,7 +458,7 @@ test("tracked routing policy and documentation name only the consolidated profil
   }
 });
 
-test("documentation enforces operational workflow: committed worktree review and cherry-pick integration", async () => {
+test("documentation enforces operational workflow: committed worktree review and identity-preserving integration", async () => {
   const [routingPolicy, readme] = await Promise.all([
     readFile(routingPolicyPath, "utf8"),
     readFile(path.join(projectRoot, "README.md"), "utf8")
@@ -470,8 +470,12 @@ test("documentation enforces operational workflow: committed worktree review and
   assert.match(readme, /never run `?git merge.*worktreeRoot`?/i);
   assert.match(routingPolicy, /advisory.*pre-commit/i);
   assert.match(readme, /advisory.*pre-commit/i);
-  assert.match(routingPolicy, /cherry-pick \$reviewedCommitSha/);
-  assert.match(readme, /cherry-pick \$reviewedCommitSha/);
+  assert.match(routingPolicy, /merge --ff-only \$reviewedCommitSha/);
+  assert.match(readme, /merge --ff-only \$reviewedCommitSha/);
+  assert.doesNotMatch(routingPolicy, /cherry-pick \$reviewedCommitSha/);
+  assert.doesNotMatch(readme, /cherry-pick \$reviewedCommitSha/);
+  assert.match(routingPolicy, /Conflict resolution cannot inherit old FRESH authorization/);
+  assert.match(readme, /conflict resolution always creates a new review subject/i);
   assert.match(routingPolicy, /Do not use `?git diff > changes\.patch`? as the canonical workflow/);
   assert.match(readme, /Do not use `?git diff > changes\.patch`? as the canonical workflow/);
 });
@@ -485,9 +489,9 @@ test("package metadata and Windows CI provide clean deterministic validation", a
   const packageJson = JSON.parse(packageText);
   const packageLock = JSON.parse(lockText);
 
-  assert.equal(packageJson.version, "0.2.0");
-  assert.equal(packageLock.version, "0.2.0");
-  assert.equal(packageLock.packages[""].version, "0.2.0");
+  assert.equal(packageJson.version, "0.2.1");
+  assert.equal(packageLock.version, "0.2.1");
+  assert.equal(packageLock.packages[""].version, "0.2.1");
   assert.equal(packageLock.packages[""].name, packageJson.name);
   assert.deepEqual(packageLock.packages[""].dependencies, packageJson.dependencies);
   assert.match(packageJson.scripts.test, /node --test/);

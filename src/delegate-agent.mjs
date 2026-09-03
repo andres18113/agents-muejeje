@@ -16,11 +16,15 @@ import {
 } from "./capability-policy.mjs";
 import { buildClaudeEnvironment } from "./claude-environment.mjs";
 import {
-  MAX_CLAUDE_TIMEOUT_MS,
   ClaudeTimeoutError,
-  ClaudeRunnerError,
   runClaudeAgent
 } from "./claude-runner.mjs";
+import {
+  effectiveDelegateTimeoutFromEnvironment,
+  MAX_SUPPORTED_DELEGATE_TIMEOUT_MS,
+  REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS
+} from "./timeout-policy.mjs";
+import { createRequestDeadlineContext, RequestDeadlineError } from "./request-context.mjs";
 import { composeAgentPrompt } from "./prompt-composer.mjs";
 import { PROCESS_WRITE_CUSTODY } from "./write-custody.mjs";
 import { isSupportedReasoningEffort } from "./reasoning-effort.mjs";
@@ -48,7 +52,6 @@ export const DELEGATE_AGENT_TYPES = Object.freeze(Object.keys(AGENT_REGISTRY));
 export const MAX_DELEGATE_TASK_CHARS = 100_000;
 
 const DEFAULT_MODEL = "opus";
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_CAPTURE_BYTES = 2 * 1024 * 1024;
 
 export class DelegateAgentConfigurationError extends Error {
@@ -108,13 +111,13 @@ function requirePositiveProfileTimeout(profile) {
   if (
     !Number.isSafeInteger(profile.timeoutMs) ||
     profile.timeoutMs <= 0 ||
-    profile.timeoutMs > MAX_CLAUDE_TIMEOUT_MS
+    profile.timeoutMs > MAX_SUPPORTED_DELEGATE_TIMEOUT_MS
   ) {
     throw new DelegateAgentConfigurationError(
       "Agent profile '" +
         profile.id +
         "' has an invalid timeoutMs; it must be a positive integer no greater than " +
-        MAX_CLAUDE_TIMEOUT_MS +
+        MAX_SUPPORTED_DELEGATE_TIMEOUT_MS +
         " milliseconds."
     );
   }
@@ -139,6 +142,7 @@ function requirePositiveProfileTimeout(profile) {
  * accepting it silently would imply a behaviour that does not exist.
  */
 const TARGET_REF_PROFILES = Object.freeze(["general-purpose", "code-review", "security-review"]);
+const REVIEW_ID_PATTERN = /^rr1:[0-9a-f]{64}$/u;
 
 // AFTER includes one full collection plus final custody verification and an
 // atomic local receipt write. Its outer bound ensures evidence machinery can
@@ -172,22 +176,45 @@ async function finalizeReviewWithinDeadline(operation, {
   timeoutMs = REVIEW_BINDING_FINALIZATION_TIMEOUT_MS,
   quiescenceTimeoutMs = RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
   schedule = setTimeout,
-  cancel = clearTimeout
+  cancel = clearTimeout,
+  requestContext
 } = {}) {
   const fence = createReceiptPublicationFence();
   const settled = Promise.resolve()
     .then(() => operation(fence.publication))
     .then((value) => ({ value }), (error) => ({ error }));
 
+  const boundedTimeoutMs = requestContext
+    ? Math.max(0, Math.min(timeoutMs, requestContext.remainingMs()))
+    : timeoutMs;
   let timer;
+  let removeRequestAbort;
+  const requestAbort = requestContext
+    ? new Promise((resolve) => {
+        const onAbort = () => {
+          fence.requestCancellation();
+          resolve({ requestAborted: true });
+        };
+        if (requestContext.abortSignal?.aborted) onAbort();
+        else {
+          requestContext.abortSignal?.addEventListener?.("abort", onAbort, { once: true });
+          removeRequestAbort = () => requestContext.abortSignal?.removeEventListener?.("abort", onAbort);
+        }
+      })
+    : undefined;
   const timeout = new Promise((resolve) => {
-    timer = schedule(() => resolve({ timedOut: true }), timeoutMs);
+    timer = schedule(() => resolve({ timedOut: true }), boundedTimeoutMs);
   });
   let outcome;
   try {
-    outcome = await Promise.race([settled.then((result) => ({ result })), timeout]);
+    outcome = await Promise.race([
+      settled.then((result) => ({ result })),
+      timeout,
+      ...(requestAbort ? [requestAbort] : [])
+    ]);
   } finally {
     cancel(timer);
+    removeRequestAbort?.();
   }
 
   const NOT_ATTEMPTED_PUBLICATION = Object.freeze({
@@ -233,9 +260,21 @@ async function finalizeReviewWithinDeadline(operation, {
    * observes the authoritative reviews/cs rename settling.
    */
   async function waitForPublicationQuiescence(observedResult, deadlineExceeded) {
+    const boundedQuiescenceTimeoutMs = requestContext
+      ? Math.max(0, Math.min(quiescenceTimeoutMs, requestContext.remainingMs()))
+      : quiescenceTimeoutMs;
+    if (boundedQuiescenceTimeoutMs <= 0) {
+      return report({
+        result: observedResult,
+        publication: PENDING_PUBLICATION,
+        publicationUnquiesced: true,
+        deadlineExceeded,
+        lateSettlement: fence.authoritativeSettlement()
+      });
+    }
     let quiescenceTimer;
     const quiescence = new Promise((resolve) => {
-      quiescenceTimer = schedule(() => resolve({ timedOut: true }), quiescenceTimeoutMs);
+      quiescenceTimer = schedule(() => resolve({ timedOut: true }), boundedQuiescenceTimeoutMs);
     });
     try {
       const observed = observedResult
@@ -351,6 +390,17 @@ function validateDelegationTargetRef(profile, targetRef) {
   return targetRef;
 }
 
+function validateReconcileReviewId(reviewId, reconcileOnly) {
+  if (reviewId === undefined || reviewId === null) return undefined;
+  if (!reconcileOnly) {
+    throw new DelegateAgentInputError("review_id is only accepted with reconcile_only=true.");
+  }
+  if (typeof reviewId !== "string" || !REVIEW_ID_PATTERN.test(reviewId)) {
+    throw new DelegateAgentInputError("review_id must be an rr1:<sha256> identifier.");
+  }
+  return reviewId;
+}
+
 /**
  * Why, if at all, this execution occupies the repository's one ownership slot.
  *
@@ -372,12 +422,13 @@ function safely(build) {
   }
 }
 
-function buildDefaultReviewBinder({ dependencies, writeCustody }) {
-  const collectForReview = dependencies.collectChangeSet || ((request) => collectChangeSet(
+function buildDefaultReviewBinder({ dependencies, writeCustody, requestContext }) {
+  const collectForReview = dependencies.collectChangeSet || ((request, options = {}) => collectChangeSet(
     request,
     {
       readOwnership: (canonicalRepositoryKey) =>
-        writeCustody.getWriteAccess(canonicalRepositoryKey)
+        writeCustody.getWriteAccess(canonicalRepositoryKey),
+      ...options
     }
   ));
   return safely(() => createReviewBinder({
@@ -385,11 +436,13 @@ function buildDefaultReviewBinder({ dependencies, writeCustody }) {
     coherentAdmission: dependencies.coherentAdmission || createCoherentAdmission({ writeCustody }),
     receiptStore: dependencies.receiptStore || new ReviewReceiptStore({
       stateRoot: writeCustody.stateRoot
-    })
+    }),
+    ...(requestContext?.now ? { now: requestContext.now } : {})
   }));
 }
 
-function resolveCustodyPlan(profile, runtime) {
+function resolveCustodyPlan(profile, runtime, { reconcileOnly = false } = {}) {
+  if (reconcileOnly) return "none";
   if (runtime.accessMode === "write") return "write";
   if (runtime.reviewBinding === "on" && profileParticipatesInReviewBinding(profile)) {
     return "coherent-review";
@@ -421,20 +474,15 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
   const modelOverride = env?.CLAUDE_AGENTS_MODEL;
   const model = optionalEnvironmentString(env, "CLAUDE_AGENTS_MODEL", DEFAULT_MODEL);
   const reviewBinding = resolveReviewBindingSwitch(env);
-  const timeoutOverride = env?.CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS;
-  const timeoutMs = positiveIntegerFromEnvironment(
-    env,
-    "CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS",
-    profileTimeoutMs || DEFAULT_TIMEOUT_MS,
-    "milliseconds"
-  );
-  if (timeoutMs > MAX_CLAUDE_TIMEOUT_MS) {
+  const effectiveTimeout = effectiveDelegateTimeoutFromEnvironment(env, profileTimeoutMs);
+  if (!effectiveTimeout.valid) {
     throw new DelegateAgentConfigurationError(
-      "CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS must be no greater than " +
-        MAX_CLAUDE_TIMEOUT_MS +
+      "CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS must be a positive integer no greater than " +
+        MAX_SUPPORTED_DELEGATE_TIMEOUT_MS +
         " milliseconds."
     );
   }
+  const timeoutMs = effectiveTimeout.timeoutMs;
   const maxCaptureBytes = positiveIntegerFromEnvironment(
     env,
     "CLAUDE_AGENTS_MAX_CAPTURE_BYTES",
@@ -453,10 +501,7 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
     modelStrategy: profile.modelStrategy,
     reasoningEffort: profile.reasoningEffort,
     timeoutMs,
-    timeoutSource:
-      timeoutOverride === undefined || timeoutOverride === null || timeoutOverride === ""
-        ? "profile"
-        : "operator-override",
+    timeoutSource: effectiveTimeout.source,
     maxCaptureBytes,
     accessMode: capabilityPolicy.accessMode,
     permissionMode: capabilityPolicy.permissionMode,
@@ -477,7 +522,7 @@ export function resolveAgentRuntime(profile, { env = process.env } = {}) {
 
 export async function resolveDelegationWorkingDirectory(
   requestedCwd,
-  { baseCwd = process.cwd(), statFn = stat } = {}
+  { baseCwd = process.cwd(), statFn = stat, requestContext } = {}
 ) {
   if (requestedCwd !== undefined && typeof requestedCwd !== "string") {
     throw new DelegateAgentInputError("cwd must be a string when supplied.");
@@ -490,8 +535,14 @@ export async function resolveDelegationWorkingDirectory(
   const candidate = path.resolve(requestedCwd === undefined ? baseCwd : requestedCwd.trim());
   let details;
   try {
+    requestContext?.assertActive?.("cwd-stat");
     details = await statFn(candidate);
   } catch (error) {
+    if (error instanceof RequestDeadlineError ||
+        error?.code === "claude_cancelled" ||
+        error?.code === "delegate_request_deadline_exceeded") {
+      throw error;
+    }
     throw new DelegateAgentInputError("cwd does not exist: " + candidate);
   }
 
@@ -524,6 +575,12 @@ function outcomeError(error) {
     code: error?.code || "claude_execution_failed",
     message
   };
+}
+
+function isRequestStop(error) {
+  return error instanceof RequestDeadlineError ||
+    error?.code === "claude_cancelled" ||
+    error?.code === "delegate_request_deadline_exceeded";
 }
 
 function requireExecutionId(createExecutionId) {
@@ -569,7 +626,10 @@ function baseOutcome({ profile, runtime, workspace, executionId, startedAt, now,
 function failedStatus(error) {
   return (
     error instanceof ClaudeTimeoutError ||
+    error instanceof RequestDeadlineError ||
     error?.code === "claude_timeout" ||
+    error?.code === "claude_cancelled" ||
+    error?.code === "delegate_request_deadline_exceeded" ||
     error?.timeoutOccurred === true
   )
     ? "timeout"
@@ -745,6 +805,7 @@ export async function delegateAgent(input, dependencies = {}) {
   const task = input?.task;
   const cwd = input?.cwd;
   const requestedTargetRef = input?.targetRef;
+  const requestedReviewId = input?.reviewId ?? input?.review_id;
   const abortSignal = input?.abortSignal ?? dependencies.abortSignal ?? dependencies.clientAbortSignal;
   const reconcileOnly = Boolean(
     input?.reconcileOnly === true ||
@@ -765,7 +826,8 @@ export async function delegateAgent(input, dependencies = {}) {
   const worktreeManager = dependencies.worktreeManager;
   const createExecutionId = dependencies.createExecutionId || randomUUID;
   const env = dependencies.env || process.env;
-  const now = dependencies.now || Date.now;
+  const suppliedRequestContext = dependencies.requestContext;
+  const now = dependencies.now || suppliedRequestContext?.now || Date.now;
 
   validateDelegationTask(task);
   const executionId = requireExecutionId(createExecutionId);
@@ -777,20 +839,33 @@ export async function delegateAgent(input, dependencies = {}) {
     );
   }
 
-  if (abortSignal?.aborted) {
-    throw new ClaudeRunnerError("Client cancelled delegation before execution started.", {
-      code: "claude_cancelled",
-      processStarted: false
-    });
-  }
-
   const runtime = resolveRuntime(profile, { env });
-  const targetRef = validateDelegationTargetRef(profile, requestedTargetRef);
-  const requestedCwd = await resolveCwd(cwd);
-  const resolvedWorkspace = await resolveWorkspace(requestedCwd, {
-    accessMode: runtime.accessMode
+  const requestStartedAt = now();
+  const requestSettlementBudgetMs = dependencies.requestSettlementBudgetMs ??
+    REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS;
+  const requestContext = suppliedRequestContext || createRequestDeadlineContext({
+    deadlineAt: dependencies.requestDeadlineAt ??
+      requestStartedAt + runtime.timeoutMs + requestSettlementBudgetMs,
+    abortSignal,
+    now,
+    schedule: dependencies.scheduleRequestDeadline || setTimeout,
+    cancelSchedule: dependencies.cancelRequestDeadline || clearTimeout
   });
-  const custodyPlan = resolveCustodyPlan(profile, runtime);
+
+  try {
+  requestContext.assertActive("delegation-entry");
+  const targetRef = validateDelegationTargetRef(profile, requestedTargetRef);
+  const reviewId = validateReconcileReviewId(requestedReviewId, reconcileOnly);
+  const requestedCwd = await requestContext.observe("cwd-resolution", () => resolveCwd(cwd, {
+    requestContext
+  }));
+  const resolvedWorkspace = await requestContext.observe("workspace-resolution", () => resolveWorkspace(requestedCwd, {
+    accessMode: runtime.accessMode,
+    requestContext
+  }));
+  const custodyPlan = resolveCustodyPlan(profile, runtime, { reconcileOnly });
+  const reviewEnabled = profileParticipatesInReviewBinding(profile) &&
+    (runtime.reviewBinding === "on" || reconcileOnly);
 
   // A coherent review must contend on exactly the key writers contend on. That
   // key is derived from Git's common directory, so a review running inside a
@@ -800,18 +875,22 @@ export async function delegateAgent(input, dependencies = {}) {
   const reviewBindingReasons = [];
   let workspace = resolvedWorkspace;
   let repositoryIdentityAvailable = true;
-  if (custodyPlan !== "none") {
+  if (custodyPlan !== "none" || reviewEnabled) {
     try {
-      workspace = await resolveRepositoryIdentity(resolvedWorkspace);
+      workspace = await requestContext.observe("repository-identity", () => resolveRepositoryIdentity(
+        resolvedWorkspace,
+        { requestContext }
+      ));
     } catch (error) {
+      if (isRequestStop(error)) throw error;
       if (custodyPlan === "write") throw error;
       repositoryIdentityAvailable = false;
       reviewBindingReasons.push({ code: "repository_identity_unavailable", detail: error?.code });
     }
   }
 
-  const contract = await loadContract(profile.id);
-  const startedAt = now();
+  const contract = await requestContext.observe("contract-loading", () => loadContract(profile.id));
+  const startedAt = requestStartedAt;
   let executionWorkspace = workspace;
   let reservation;
   let custodyState = custodyPlan === "none" ? "not-applicable" : "not-acquired";
@@ -834,13 +913,13 @@ export async function delegateAgent(input, dependencies = {}) {
   let outcome;
   // Everything the review path needs to hand from admission, through the
   // prompt, to the after-collection inside the release window.
-  const reviewBinder = custodyPlan === "coherent-review"
-    ? (dependencies.reviewBinder || buildDefaultReviewBinder({ dependencies, writeCustody }))
+  const reviewBinder = reviewEnabled
+    ? (dependencies.reviewBinder || buildDefaultReviewBinder({ dependencies, writeCustody, requestContext }))
     : undefined;
   const coherentAdmission = custodyPlan === "coherent-review"
     ? (dependencies.coherentAdmission || safely(() => createCoherentAdmission({ writeCustody })))
     : undefined;
-  if (custodyPlan === "coherent-review" && (!reviewBinder || !coherentAdmission)) {
+  if (reviewEnabled && (!reviewBinder || (custodyPlan === "coherent-review" && !coherentAdmission))) {
     reviewBindingReasons.push({ code: "review_binding_unavailable" });
   }
   let reviewCoherence = custodyPlan === "coherent-review"
@@ -881,14 +960,20 @@ export async function delegateAgent(input, dependencies = {}) {
       // runs, it simply cannot bind evidence to a state it did not control.
       let admission;
       try {
+        requestContext.assertActive("coherent-admission");
         admission = await coherentAdmission.admit({
           executionId,
           agentType: profile.id,
           canonicalRoot: workspace.repositoryRoot,
           canonicalRootKey: workspace.canonicalRepositoryKey,
-          ...(targetRef === undefined ? {} : { targetRef })
+          ...(targetRef === undefined ? {} : { targetRef }),
+          requestContext,
+          mutationSignal: requestContext.abortSignal
         });
+        requestContext.assertActive("coherent-admission");
       } catch (error) {
+        if (requestContext.abortSignal?.aborted) requestContext.assertActive("coherent-admission");
+        if (isRequestStop(error)) throw error;
         admission = {
           coherence: COHERENCE.DENIED,
           reasons: [{ code: "coherent_admission_failed", detail: error?.code || error?.name }]
@@ -900,10 +985,13 @@ export async function delegateAgent(input, dependencies = {}) {
         custodyState = reservation.state.toLowerCase();
         processProvenNotStarted = true;
         try {
+          requestContext.assertActive("coherent-admission-lifecycle");
           reservation = await writeCustody.markSpawning({
             executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey
+            canonicalRootKey: workspace.canonicalRepositoryKey,
+            mutationSignal: requestContext.abortSignal
           });
+          requestContext.assertActive("coherent-admission-lifecycle");
           custodyState = reservation.state.toLowerCase();
         } catch (error) {
           reviewCoherence = COHERENCE.LOST;
@@ -935,17 +1023,36 @@ export async function delegateAgent(input, dependencies = {}) {
       reviewBindingReasons.push({ code: "not_a_git_worktree", detail: workspace.rootSource });
     }
 
-    if (custodyPlan === "coherent-review" && reviewBinder) {
-      const targetSpec = await resolveReviewTargetSpec({
+    if (reviewBinder) {
+      let targetSpec = NO_REVIEW_TARGET;
+      if (reconcileOnly && !repositoryIdentityAvailable && resolvedWorkspace.rootSource === "git-boundary") {
+        reviewBeforeState = {
+          status: "unavailable",
+          coherence: COHERENCE.NOT_ATTEMPTED,
+          reasons: [{ code: "repository_identity_unavailable" }],
+          priorReviews: [],
+          receiptHistory: {
+            status: "indeterminate",
+            receipts: [],
+            diagnostics: [{ code: "review_history_completeness_unproven" }]
+          }
+        };
+      }
+      if (!reviewBeforeState) {
+      targetSpec = await requestContext.observe("review-target-resolution", () => resolveReviewTargetSpec({
         requestedTargetRef: targetRef,
         effectiveCwd: workspace.effectiveCwd,
         repositoryStateDirectory: repositoryIdentityAvailable && workspace.rootSource === "git-boundary"
           ? safely(() => writeCustody.repositoryStateDirectory(workspace.canonicalRepositoryKey))
-          : undefined
-      }).catch(() => NO_REVIEW_TARGET);
+          : undefined,
+        requestContext
+      })).catch((error) => {
+        if (isRequestStop(error)) throw error;
+        return NO_REVIEW_TARGET;
+      });
 
       try {
-        reviewBeforeState = await reviewBinder.before({
+        reviewBeforeState = await requestContext.observe("before-history-discovery", () => reviewBinder.before({
           profile,
           runtime,
           contract,
@@ -954,9 +1061,11 @@ export async function delegateAgent(input, dependencies = {}) {
           workspace,
           coherence: reviewCoherence,
           custodyExecutionId: executionId,
-          targetSpec
-        });
+          targetSpec,
+          requestContext
+        }));
       } catch (error) {
+        if (isRequestStop(error)) throw error;
         reviewBeforeState = {
           status: "unavailable",
           coherence: reviewCoherence,
@@ -969,6 +1078,7 @@ export async function delegateAgent(input, dependencies = {}) {
           }
         };
       }
+      }
 
       if (reconcileOnly) {
         const history = reviewBeforeState?.receiptHistory ?? {
@@ -976,21 +1086,40 @@ export async function delegateAgent(input, dependencies = {}) {
           receipts: reviewBeforeState?.priorReviews ?? [],
           diagnostics: [{ code: "review_history_unavailable" }]
         };
-        const freshEntry = history.receipts?.find((r) => r.verdict === "FRESH");
-        const staleEntry = history.receipts?.find((r) => r.verdict === "STALE");
-        const indeterminateEntry = history.receipts?.find((r) => r.verdict === "INDETERMINATE");
-        const selectedEntry = freshEntry ?? staleEntry ?? indeterminateEntry ?? history.receipts?.[0];
+        const historyEntries = history.allReceipts ?? history.receipts ?? [];
+        const freshEntries = historyEntries.filter((entry) => entry.verdict === "FRESH");
+        const staleEntry = historyEntries.find((entry) => entry.verdict === "STALE");
+        const indeterminateEntry = historyEntries.find((entry) => entry.verdict === "INDETERMINATE");
+        let selectedEntry;
+        let reconciliationState = "none";
+        if (reviewId) {
+          selectedEntry = historyEntries.find((entry) => entry.reviewId === reviewId);
+          reconciliationState = selectedEntry ? "requested" : "requested-missing";
+        } else if (freshEntries.length > 1) {
+          reconciliationState = "ambiguous";
+        } else if (history.status !== "complete") {
+          reconciliationState = "completeness-unproven";
+        } else if (freshEntries.length === 1) {
+          selectedEntry = freshEntries[0];
+          reconciliationState = "fresh";
+        }
+        const displayEntry = selectedEntry ?? staleEntry ?? indeterminateEntry ?? historyEntries[0];
+        const freshEntry = displayEntry?.verdict === "FRESH" ? displayEntry : undefined;
         const currentChangeSetId = reviewBeforeState?.current?.changeSetId;
 
         // Semantic result artifact recovery and cryptographic verification
         let artifactOutcome = { status: "not_attempted" };
         if (selectedEntry?.receipt && reviewBinder?.loadResultArtifact) {
           try {
-            artifactOutcome = await reviewBinder.loadResultArtifact({
+            artifactOutcome = await requestContext.observe("result-artifact-loading", () => reviewBinder.loadResultArtifact({
               canonicalRootKey: workspace.canonicalRepositoryKey,
-              receipt: selectedEntry.receipt
-            });
+              receipt: selectedEntry.receipt,
+              requestContext
+            }));
           } catch (artifactError) {
+            if (isRequestStop(artifactError)) {
+              throw artifactError;
+            }
             artifactOutcome = {
               status: "unreadable",
               error: artifactError?.code || artifactError?.name || "artifact_read_failed"
@@ -998,13 +1127,20 @@ export async function delegateAgent(input, dependencies = {}) {
           }
         }
 
-        const bindingStatus = (!selectedEntry || selectedEntry.verdict === "INDETERMINATE")
-          ? "unavailable"
-          : "bound";
+        const bindingStatus = reconciliationState === "ambiguous"
+          ? "ambiguous"
+          : ((!selectedEntry || selectedEntry.verdict === "INDETERMINATE") ? "unavailable" : "bound");
         const reviewReasons = [];
 
-        if (!selectedEntry) {
-          reviewReasons.push({ code: "no_receipts_found" });
+        if (reconciliationState === "ambiguous") {
+          reviewReasons.push({ code: "review_reconcile_ambiguous" });
+        } else if (reconciliationState === "completeness-unproven") {
+          reviewReasons.push(...(displayEntry?.reasons ?? []));
+          reviewReasons.push({ code: "review_history_completeness_unproven" });
+        } else if (reconciliationState === "requested-missing") {
+          reviewReasons.push({ code: "review_id_not_recovered" });
+        } else if (!selectedEntry) {
+          reviewReasons.push({ code: "no_fresh_receipt" });
         } else if (selectedEntry.verdict === "STALE") {
           reviewReasons.push(...(selectedEntry.reasons ?? [{ code: "review_receipt_stale" }]));
         } else if (selectedEntry.verdict === "INDETERMINATE") {
@@ -1022,7 +1158,7 @@ export async function delegateAgent(input, dependencies = {}) {
           status: bindingStatus,
           coherence: reviewCoherence,
           reasons: Object.freeze(reviewReasons),
-          changeSetId: selectedEntry?.receipt?.binding?.changeSetId ?? currentChangeSetId,
+          changeSetId: displayEntry?.receipt?.binding?.changeSetId ?? currentChangeSetId,
           beforeChangeSetId: currentChangeSetId,
           afterChangeSetId: currentChangeSetId,
           reviewId: selectedEntry?.reviewId ?? null,
@@ -1036,7 +1172,27 @@ export async function delegateAgent(input, dependencies = {}) {
         };
 
         let resultMessage;
-        if (freshEntry) {
+        if (reconciliationState === "ambiguous") {
+          resultMessage =
+            `Multiple FRESH authoritative review receipts apply to current changeSet ${currentChangeSetId}; reconciliation is AMBIGUOUS.\n` +
+            `Provide review_id to recover one exact receipt.\n` +
+            `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+        } else if (reconciliationState === "completeness-unproven") {
+          resultMessage = indeterminateEntry
+            ? `Discovered prior review receipt ${indeterminateEntry.reviewId} has INDETERMINATE freshness for current repository state.\n` +
+              `Reasons: ${(indeterminateEntry.reasons || []).map((reason) => reason.code).join(", ")}\n` +
+              `Authoritative review-history completeness is unproven; no receipt was selected.\n` +
+              `A fresh ${profile.id} delegation is required.\n` +
+              `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`
+            : `Authoritative review-history completeness is unproven for scope ${profile.id}; no receipt was selected.\n` +
+              `Reason: review_history_completeness_unproven.\n` +
+              `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+        } else if (reconciliationState === "requested-missing") {
+          resultMessage =
+            `Requested review receipt ${reviewId} was not recovered for this repository, profile, and target scope.\n` +
+            `Reconciliation fails closed.\n` +
+            `No Claude specialist was spawned; 0 Claude delegated-model quota consumed.`;
+        } else if (freshEntry && selectedEntry) {
           if (artifactOutcome.status === "verified") {
             resultMessage =
               `Reconciled authoritative review receipt ${freshEntry.reviewId} (FRESH for changeSet ${currentChangeSetId}).\n` +
@@ -1097,35 +1253,45 @@ export async function delegateAgent(input, dependencies = {}) {
 
     if (!reconcileOnly) {
       if (custodyPlan === "write") {
+        requestContext.assertActive("write-admission");
         reservation = await writeCustody.reserveWriteAccess({
           executionId,
           agentType: profile.id,
           canonicalRoot: workspace.repositoryRoot,
           canonicalRootKey: workspace.canonicalRepositoryKey,
-          ...(targetRef === undefined ? {} : { targetRef })
+          ...(targetRef === undefined ? {} : { targetRef }),
+          mutationSignal: requestContext.abortSignal
         });
+        requestContext.assertActive("write-admission");
         custodyState = reservation.state.toLowerCase();
         processProvenNotStarted = true;
 
         if (profile.id === "general-purpose") {
           const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
+          requestContext.assertActive("worktree-preparation");
           executionWorkspace = await isolatedWorktrees.prepare({
             executionId,
             canonicalRepositoryKey: workspace.canonicalRepositoryKey,
             repositoryRoot: workspace.repositoryRoot,
-            effectiveCwd: workspace.effectiveCwd
+            effectiveCwd: workspace.effectiveCwd,
+            requestContext
           });
+          requestContext.assertActive("worktree-preparation");
         } else {
+          requestContext.assertActive("write-mark-spawning");
           reservation = await writeCustody.markSpawning({
             executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey
+            canonicalRootKey: workspace.canonicalRepositoryKey,
+            mutationSignal: requestContext.abortSignal
           });
+          requestContext.assertActive("write-mark-spawning");
           custodyState = reservation.state.toLowerCase();
         }
       }
 
       // The root Claude actually operates in: the isolated worktree for
       // general-purpose, the coordinated repository root for everyone else.
+      requestContext.assertActive("prompt-composition");
       const workspaceRoot = executionWorkspace.workspaceRoot || executionWorkspace.repositoryRoot;
       const prompt = composePrompt({
         profile,
@@ -1143,6 +1309,13 @@ export async function delegateAgent(input, dependencies = {}) {
       if (lifecycleCustody) processProvenNotStarted = false;
 
       runnerInvoked = true;
+      const runnerRuntime = {
+        ...runtime,
+        timeoutMs: requestContext.clipUsefulWorkTimeout(
+          runtime.timeoutMs,
+          requestSettlementBudgetMs
+        )
+      };
       const execution = await runAgent({
         profile,
         agentType: profile.id,
@@ -1152,8 +1325,11 @@ export async function delegateAgent(input, dependencies = {}) {
         // is the same root the prompt reports as the repository root.
         repositoryRoot: executionWorkspace.repositoryRoot,
         executionId,
-        runtime,
-        abortSignal,
+        runtime: runnerRuntime,
+        abortSignal: requestContext.abortSignal,
+        now: requestContext.now,
+        schedule: requestContext.schedule,
+        cancelSchedule: requestContext.cancelSchedule,
         onChildStarted: lifecycleCustody
           ? async (processIdentity, { mutationSignal } = {}) => {
               writerProcessStarted = true;
@@ -1298,13 +1474,15 @@ export async function delegateAgent(input, dependencies = {}) {
             executionId,
             startedAt,
             completedAt: now(),
-            publication
+            publication,
+            requestContext
           }),
           {
             timeoutMs: dependencies.reviewBindingAfterTimeoutMs,
             quiescenceTimeoutMs: dependencies.reviewReceiptQuiescenceTimeoutMs,
-            schedule: dependencies.scheduleReviewBindingTimeout,
-            cancel: dependencies.cancelReviewBindingTimeout
+            schedule: dependencies.scheduleReviewBindingTimeout || requestContext.schedule,
+            cancel: dependencies.cancelReviewBindingTimeout || requestContext.cancelSchedule,
+            requestContext
           }
         );
         reviewBinding = finalized.value;
@@ -1556,14 +1734,41 @@ export async function delegateAgent(input, dependencies = {}) {
         } catch {
           // Diagnostics cannot grant release authority or destabilize the MCP.
         }
-      }
-    });
+        }
+      });
     // Nothing awaits this deliberately detached release, so it must never be
     // able to surface as an unhandled rejection in the MCP process.
     void lateRelease.catch(() => {});
   }
 
-  if (outcome && custodyPlan === "coherent-review") {
+  if (outcome && requestContext.abortSignal?.aborted) {
+    let requestStop;
+    try {
+      requestContext.assertActive("delegation-settlement");
+    } catch (error) {
+      if (isRequestStop(error)) requestStop = error;
+    }
+    if (requestStop) {
+      outcome = {
+        ...baseOutcome({
+          profile,
+          runtime,
+          workspace: executionWorkspace,
+          executionId,
+          startedAt,
+          now,
+          custodyState
+        }),
+        status: failedStatus(requestStop),
+        durationMs: Math.max(0, now() - startedAt),
+        error: outcomeError(requestStop),
+        stderrSummary: outcome.stderrSummary || "",
+        ...(Number.isSafeInteger(outcome.pid) ? { pid: outcome.pid } : {})
+      };
+    }
+  }
+
+  if (outcome && reviewBinding) {
     outcome.reviewBinding = mergeReviewBindingReasons(reviewBinding, reviewBindingReasons);
   }
 
@@ -1589,6 +1794,9 @@ export async function delegateAgent(input, dependencies = {}) {
   }
 
   return outcome;
+  } finally {
+    requestContext.dispose?.();
+  }
 }
 
 /**
@@ -1672,7 +1880,14 @@ export function formatDelegateAgentOutcome(outcome) {
     const history = binding.receiptHistory;
     if (history) {
       lines.push("ReceiptHistoryStatus: " + history.status);
-      lines.push("PriorReviews: " + history.receipts.length);
+      const totalHistoryCount = Number.isSafeInteger(history.totalCount) &&
+        history.totalCount >= history.receipts.length
+        ? history.totalCount
+        : history.receipts.length;
+      lines.push("PriorReviews: " + totalHistoryCount);
+      if (totalHistoryCount > history.receipts.length) {
+        lines.push("PriorReviewsDisplayed: " + history.receipts.length);
+      }
       for (const prior of history.receipts.slice(0, 16)) {
         const details = [
           prior.reviewId,
@@ -1753,7 +1968,15 @@ export const delegateAgentInputSchema = z.object({
     .describe(
       "When true, inspects existing durable review receipts and returns dynamic freshness for the " +
         "repository state without running Claude Code or consuming model quota. Only valid for " +
-        "review profiles (code-review, security-review)."
+      "review profiles (code-review, security-review)."
+    ),
+  review_id: z
+    .string()
+    .regex(REVIEW_ID_PATTERN, "review_id must be an rr1:<sha256> identifier.")
+    .optional()
+    .describe(
+      "Optional exact historical review receipt to recover. Accepted only with reconcile_only=true; " +
+      "without it, reconciliation refuses to choose among multiple FRESH receipts."
     )
 });
 
@@ -1774,7 +1997,14 @@ export function registerDelegateAgentTool(server, { delegate = delegateAgent } =
       inputSchema: delegateAgentInputSchema,
       outputSchema: delegateAgentOutputSchema
     },
-    async ({ agent_type: agentType, task, cwd, target_ref: targetRef, reconcile_only: reconcileOnly }, ctx) => {
+    async ({
+      agent_type: agentType,
+      task,
+      cwd,
+      target_ref: targetRef,
+      reconcile_only: reconcileOnly,
+      review_id: reviewId
+      }, ctx) => {
       const clientAbortSignal = ctx?.signal ?? ctx?.mcpReq?.signal;
       try {
         const outcome = await delegate({
@@ -1783,6 +2013,7 @@ export function registerDelegateAgentTool(server, { delegate = delegateAgent } =
           cwd,
           targetRef,
           reconcileOnly,
+          reviewId,
           abortSignal: clientAbortSignal
         }, { clientAbortSignal });
         return mcpText(

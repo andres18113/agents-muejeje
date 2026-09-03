@@ -10,6 +10,7 @@ import {
   validateReviewReceipt
 } from "./receipt-schema.mjs";
 import {
+  abandonReceiptPublication,
   beginReceiptPublication,
   receiptPublicationCancelled,
   settleReceiptPublication
@@ -115,6 +116,19 @@ function conflictError(error) {
   return ["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(error?.code);
 }
 
+function assertRequestActive(requestContext, phase) {
+  requestContext?.assertActive?.(phase);
+}
+
+function requestStopped(error) {
+  return error?.code === "claude_cancelled" ||
+    error?.code === "delegate_request_deadline_exceeded";
+}
+
+function requestMayStart(requestContext) {
+  return requestContext?.isActive?.() !== false;
+}
+
 export class ReviewReceiptStore {
   #stateRoot;
   #createNonce;
@@ -122,11 +136,15 @@ export class ReviewReceiptStore {
   #beforeAuthoritativeRename;
   #afterAuthoritativeRenameIssued;
   #beforeScopeIndex;
+  #writeFileDurably;
+  #readFile;
 
   constructor({
     stateRoot,
     createNonce = randomUUID,
     renameFn = rename,
+    writeFileDurablyFn = writeFileDurably,
+    readFileFn = readFile,
     beforeAuthoritativeRename,
     afterAuthoritativeRenameIssued,
     beforeScopeIndex
@@ -139,6 +157,8 @@ export class ReviewReceiptStore {
     this.#stateRoot = path.resolve(stateRoot);
     this.#createNonce = createNonce;
     this.#rename = renameFn;
+    this.#writeFileDurably = writeFileDurablyFn;
+    this.#readFile = readFileFn;
     this.#beforeAuthoritativeRename = beforeAuthoritativeRename;
     this.#afterAuthoritativeRenameIssued = afterAuthoritativeRenameIssued;
     this.#beforeScopeIndex = beforeScopeIndex;
@@ -169,177 +189,22 @@ export class ReviewReceiptStore {
     return path.join(this.artifactsDirectory(canonicalRootKey), resultSha256 + ".txt");
   }
 
-  /**
-   * Persists one receipt, then records a pointer to it.
-   *
-   * Order matters: the receipt is durable before anything points at it, so a
-   * crash between the two leaves an unindexed receipt rather than a pointer to
-   * nothing. An unindexed receipt is merely harder to discover; a dangling
-   * pointer would be a lie that discovery has to defend against on every read.
-   */
-  async put({ canonicalRootKey, receipt, publication, resultText, awaitIndex = true }) {
-    const validated = validateReviewReceipt(receipt);
-    if (!validated) {
-      throw new ReviewReceiptError("Refusing to store an invalid review receipt.", {
-        code: "review_receipt_invalid"
+  #resultArtifactBasis(resultText, receipt) {
+    if (typeof resultText !== "string") {
+      throw new ReviewReceiptError("A bound review receipt requires its result artifact.", {
+        code: "review_result_artifact_required"
       });
     }
-
-    const serialized = canonicalJson(validated) + "\n";
-    if (Buffer.byteLength(serialized, "utf8") > MAX_RECEIPT_BYTES) {
-      throw new ReviewReceiptError("Review receipt exceeds the maximum size.", {
-        code: "review_receipt_too_large"
+    const actualSha256 = sha256Hex(Buffer.from(resultText, "utf8"));
+    const actualBytes = Buffer.byteLength(resultText, "utf8");
+    if (actualSha256 !== receipt.result.sha256 || actualBytes !== receipt.result.bytes) {
+      throw new ReviewReceiptError("Result text does not match receipt result basis.", {
+        code: "review_result_basis_mismatch"
       });
     }
-
-    const finalDirectory = this.#receiptDirectory(
-      canonicalRootKey,
-      validated.binding.changeSetId,
-      validated.reviewId
-    );
-    const finalPath = path.join(finalDirectory, RECEIPT_FILE_NAME);
-    if (finalPath.length > MAX_RECEIPT_PATH_CHARS) {
-      throw new ReviewReceiptError("Review receipt path is too long to store safely.", {
-        code: "review_receipt_path_too_long"
-      });
-    }
-
-    const changeSetDirectory = path.dirname(finalDirectory);
-    await mkdir(changeSetDirectory, { recursive: true });
-
-    const existing = await this.#listReceiptDirectories(changeSetDirectory);
-    if (!existing.includes(digestPrefix(validated.reviewId)) && existing.length >= MAX_RECEIPTS_PER_CHANGE_SET) {
-      throw new ReviewReceiptError("This change set already holds the maximum number of receipts.", {
-        code: "review_receipt_store_full"
-      });
-    }
-
-    const staging = path.join(changeSetDirectory, ".review-" + this.#createNonce() + ".tmp");
-    let stored;
-    await mkdir(staging);
-    try {
-      await writeFileDurably(path.join(staging, RECEIPT_FILE_NAME), serialized);
-      if (typeof this.#beforeAuthoritativeRename === "function") {
-        await this.#beforeAuthoritativeRename({ receipt: validated, finalPath });
-      }
-      if (receiptPublicationCancelled(publication)) {
-        throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
-          code: "review_receipt_publication_cancelled"
-        });
-      }
-
-      // This is the authoritative boundary: the cancellation check, authority
-      // marker and reviews/cs rename invocation are synchronous and adjacent.
-      // The later reviews/sc pointer is explicitly outside this fence.
-      if (publication && !beginReceiptPublication(publication)) {
-        throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
-          code: "review_receipt_publication_cancelled"
-        });
-      }
-
-      if (typeof resultText === "string") {
-        const actualSha256 = sha256Hex(Buffer.from(resultText, "utf8"));
-        const actualBytes = Buffer.byteLength(resultText, "utf8");
-        if (actualSha256 !== validated.result.sha256 || actualBytes !== validated.result.bytes) {
-          throw new ReviewReceiptError("Result text does not match receipt result basis.", {
-            code: "review_result_basis_mismatch"
-          });
-        }
-
-        const artifactsDir = this.artifactsDirectory(canonicalRootKey);
-        await mkdir(artifactsDir, { recursive: true });
-        const targetArtifactPath = this.artifactPath(canonicalRootKey, validated.result.sha256);
-        const artifactStaging = path.join(artifactsDir, ".artifact-" + this.#createNonce() + ".tmp");
-        try {
-          await writeFileDurably(artifactStaging, resultText);
-          try {
-            await this.#rename(artifactStaging, targetArtifactPath);
-          } catch (renameErr) {
-            if (!conflictError(renameErr)) throw renameErr;
-            await rm(artifactStaging, { force: true }).catch(() => {});
-          }
-        } catch (artifactErr) {
-          await rm(artifactStaging, { force: true }).catch(() => {});
-          throw artifactErr;
-        }
-      }
-
-      let renameIssued;
-      try {
-        renameIssued = this.#rename(staging, finalDirectory);
-      } catch (error) {
-        settleReceiptPublication(publication, {
-          status: "settled",
-          disposition: "failed",
-          reviewId: validated.reviewId,
-          changeSetId: validated.binding.changeSetId,
-          errorCode: error?.code || "rename_failed"
-        });
-        throw error;
-      }
-      const authoritative = Promise.resolve(renameIssued).then(
-        () => {
-          settleReceiptPublication(publication, {
-            status: "settled",
-            disposition: "published",
-            reviewId: validated.reviewId,
-            changeSetId: validated.binding.changeSetId
-          });
-          return { published: true };
-        },
-        (error) => {
-          settleReceiptPublication(publication, {
-            status: "settled",
-            disposition: conflictError(error) ? "conflict" : "failed",
-            reviewId: validated.reviewId,
-            changeSetId: validated.binding.changeSetId,
-            errorCode: error?.code || "rename_failed"
-          });
-          return { error };
-        }
-      );
-      void authoritative.catch(() => {});
-      if (typeof this.#afterAuthoritativeRenameIssued === "function") {
-        await this.#afterAuthoritativeRenameIssued({
-          receipt: validated,
-          finalPath,
-          authoritative
-        });
-      }
-
-      const renameOutcome = await authoritative;
-      if (!renameOutcome.error) {
-        stored = "created";
-      } else {
-        const error = renameOutcome.error;
-        if (!conflictError(error)) throw error;
-        // Something is already there. Identical content is an idempotent
-        // repeat; different content under the same truncated prefix is a
-        // collision, and nothing is overwritten either way.
-        const present = await readFile(finalPath, "utf8").catch(() => undefined);
-        if (present === serialized) {
-          stored = "identical";
-        } else {
-          throw new ReviewReceiptError("A different receipt already occupies this digest prefix.", {
-            code: "review_receipt_prefix_collision"
-          });
-        }
-      }
-    } finally {
-      if (await pathExists(staging)) await rm(staging, { recursive: true, force: true });
-    }
-
-    // Scope indexing is non-evidentiary housekeeping. It starts after the
-    // durable receipt is settled and is intentionally not awaited by put(), so
-    // a stalled reviews/sc directory can neither downgrade the receipt nor
-    // retain coherent-review custody.
-    const indexing = this.#recordPointer(canonicalRootKey, validated);
-    void indexing.catch(() => {});
-    if (awaitIndex) await indexing;
-    return Object.freeze({ stored, path: finalPath, indexing });
   }
 
-  async loadResultArtifact({ canonicalRootKey, receipt }) {
+  async #readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext }) {
     const sha256 = receipt?.result?.sha256;
     const expectedBytes = receipt?.result?.bytes;
     if (
@@ -357,13 +222,12 @@ export class ReviewReceiptStore {
     const targetPath = this.artifactPath(canonicalRootKey, sha256);
     let content;
     try {
-      content = await readFile(targetPath, "utf8");
+      assertRequestActive(requestContext, "result-artifact-read");
+      content = await this.#readFile(targetPath);
     } catch (error) {
+      if (requestStopped(error)) throw error;
       if (error?.code === "ENOENT") {
-        return Object.freeze({
-          status: "missing",
-          error: "artifact_not_found"
-        });
+        return Object.freeze({ status: "missing", error: "artifact_not_found" });
       }
       return Object.freeze({
         status: "unreadable",
@@ -371,7 +235,8 @@ export class ReviewReceiptStore {
       });
     }
 
-    const actualBytes = Buffer.byteLength(content, "utf8");
+    const artifactBytes = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+    const actualBytes = artifactBytes.byteLength;
     if (actualBytes !== expectedBytes) {
       return Object.freeze({
         status: "corrupt",
@@ -381,7 +246,7 @@ export class ReviewReceiptStore {
       });
     }
 
-    const actualSha256 = sha256Hex(Buffer.from(content, "utf8"));
+    const actualSha256 = sha256Hex(artifactBytes);
     if (actualSha256 !== sha256) {
       return Object.freeze({
         status: "corrupt",
@@ -393,14 +258,237 @@ export class ReviewReceiptStore {
 
     return Object.freeze({
       status: "verified",
-      text: content,
+      text: artifactBytes.toString("utf8"),
       bytes: actualBytes,
       sha256: actualSha256
     });
   }
 
-  async #listReceiptDirectories(changeSetDirectory) {
+  async #persistAndVerifyResultArtifact({ canonicalRootKey, receipt, resultText, requestContext }) {
+    this.#resultArtifactBasis(resultText, receipt);
+    const artifactsDir = this.artifactsDirectory(canonicalRootKey);
+    assertRequestActive(requestContext, "result-artifact-directory");
+    await mkdir(artifactsDir, { recursive: true });
+    const targetArtifactPath = this.artifactPath(canonicalRootKey, receipt.result.sha256);
+    const existing = await this.#readAndVerifyResultArtifact({
+      canonicalRootKey,
+      receipt,
+      requestContext
+    });
+    if (existing.status === "verified") return "identical";
+    if (existing.status !== "missing") {
+      throw new ReviewReceiptError("Existing result artifact could not be verified.", {
+        code: "review_result_artifact_conflict"
+      });
+    }
+    const artifactStaging = path.join(artifactsDir, ".artifact-" + this.#createNonce() + ".tmp");
     try {
+      assertRequestActive(requestContext, "result-artifact-write");
+      await this.#writeFileDurably(artifactStaging, resultText);
+      try {
+        assertRequestActive(requestContext, "result-artifact-rename");
+        await this.#rename(artifactStaging, targetArtifactPath);
+      } catch (error) {
+        if (!conflictError(error)) throw error;
+        const present = await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
+        if (present.status !== "verified") {
+          throw new ReviewReceiptError(
+            "Result artifact destination could not be verified after rename conflict.",
+            { code: "review_result_artifact_conflict", cause: error }
+          );
+        }
+        return "identical";
+      }
+
+      const verified = await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
+      if (verified.status !== "verified") {
+        throw new ReviewReceiptError("Persisted result artifact could not be verified.", {
+          code: "review_result_artifact_verification_failed"
+        });
+      }
+      return "created";
+    } finally {
+      if (requestMayStart(requestContext)) {
+        await rm(artifactStaging, { force: true }).catch(() => {});
+      }
+    }
+  }
+
+  async put({ canonicalRootKey, receipt, publication, resultText, awaitIndex = true, requestContext }) {
+    let validated;
+    const abandonBeforePublication = (error) => {
+      if (publication?.guard?.publicationStarted === true) return;
+      abandonReceiptPublication(publication, {
+        status: "not-started",
+        disposition: "failed",
+        reviewId: validated?.reviewId,
+        changeSetId: validated?.binding?.changeSetId,
+        errorCode: error?.code || "publication_precondition_failed"
+      });
+    };
+
+    try {
+      assertRequestActive(requestContext, "receipt-build-validation");
+      validated = validateReviewReceipt(receipt);
+      if (!validated) {
+        throw new ReviewReceiptError("Refusing to store an invalid review receipt.", {
+          code: "review_receipt_invalid"
+        });
+      }
+
+      const serialized = canonicalJson(validated) + "\n";
+      if (Buffer.byteLength(serialized, "utf8") > MAX_RECEIPT_BYTES) {
+        throw new ReviewReceiptError("Review receipt exceeds the maximum size.", {
+          code: "review_receipt_too_large"
+        });
+      }
+
+      const finalDirectory = this.#receiptDirectory(
+        canonicalRootKey,
+        validated.binding.changeSetId,
+        validated.reviewId
+      );
+      const finalPath = path.join(finalDirectory, RECEIPT_FILE_NAME);
+      if (finalPath.length > MAX_RECEIPT_PATH_CHARS) {
+        throw new ReviewReceiptError("Review receipt path is too long to store safely.", {
+          code: "review_receipt_path_too_long"
+        });
+      }
+
+      const changeSetDirectory = path.dirname(finalDirectory);
+      if (publication || resultText !== undefined) {
+        this.#resultArtifactBasis(resultText, validated);
+      }
+
+      assertRequestActive(requestContext, "receipt-directory-create");
+      await mkdir(changeSetDirectory, { recursive: true });
+
+      const existing = await this.#listReceiptDirectories(changeSetDirectory, requestContext);
+      if (!existing.includes(digestPrefix(validated.reviewId)) && existing.length >= MAX_RECEIPTS_PER_CHANGE_SET) {
+        throw new ReviewReceiptError("This change set already holds the maximum number of receipts.", {
+          code: "review_receipt_store_full"
+        });
+      }
+
+      const staging = path.join(changeSetDirectory, ".review-" + this.#createNonce() + ".tmp");
+      let stored;
+      let renameIssued;
+      try {
+        assertRequestActive(requestContext, "receipt-staging-create");
+        await mkdir(staging);
+        assertRequestActive(requestContext, "receipt-staging-write");
+        await this.#writeFileDurably(path.join(staging, RECEIPT_FILE_NAME), serialized);
+
+        if (publication || resultText !== undefined) {
+          await this.#persistAndVerifyResultArtifact({
+            canonicalRootKey,
+            receipt: validated,
+            resultText,
+            requestContext
+          });
+        }
+
+        if (typeof this.#beforeAuthoritativeRename === "function") {
+          assertRequestActive(requestContext, "receipt-authoritative-precondition");
+          await this.#beforeAuthoritativeRename({ receipt: validated, finalPath });
+        }
+
+        assertRequestActive(requestContext, "receipt-publication-fence");
+        if (receiptPublicationCancelled(publication)) {
+          throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
+            code: "review_receipt_publication_cancelled"
+          });
+        }
+
+        if (publication && !beginReceiptPublication(publication)) {
+          throw new ReviewReceiptError("Receipt publication authority was cancelled before rename.", {
+            code: "review_receipt_publication_cancelled"
+          });
+        }
+
+        try {
+          renameIssued = this.#rename(staging, finalDirectory);
+        } catch (error) {
+          settleReceiptPublication(publication, {
+            status: "settled",
+            disposition: "failed",
+            reviewId: validated.reviewId,
+            changeSetId: validated.binding.changeSetId,
+            errorCode: error?.code || "rename_failed"
+          });
+          throw error;
+        }
+        const authoritative = Promise.resolve(renameIssued).then(
+          () => {
+            settleReceiptPublication(publication, {
+              status: "settled",
+              disposition: "published",
+              reviewId: validated.reviewId,
+              changeSetId: validated.binding.changeSetId
+            });
+            return { published: true };
+          },
+          (error) => {
+            settleReceiptPublication(publication, {
+              status: "settled",
+              disposition: conflictError(error) ? "conflict" : "failed",
+              reviewId: validated.reviewId,
+              changeSetId: validated.binding.changeSetId,
+              errorCode: error?.code || "rename_failed"
+            });
+            return { error };
+          }
+        );
+        void authoritative.catch(() => {});
+        if (typeof this.#afterAuthoritativeRenameIssued === "function") {
+          await this.#afterAuthoritativeRenameIssued({
+            receipt: validated,
+            finalPath,
+            authoritative
+          });
+        }
+
+        const renameOutcome = await authoritative;
+        if (!renameOutcome.error) {
+          stored = "created";
+        } else {
+          const error = renameOutcome.error;
+          if (!conflictError(error)) throw error;
+          assertRequestActive(requestContext, "receipt-conflict-read");
+          const present = await this.#readFile(finalPath, "utf8").catch(() => undefined);
+          if (present === serialized) {
+            stored = "identical";
+          } else {
+            throw new ReviewReceiptError("A different receipt already occupies this digest prefix.", {
+              code: "review_receipt_prefix_collision"
+            });
+          }
+        }
+      } finally {
+        if (requestMayStart(requestContext) && await pathExists(staging)) {
+          await rm(staging, { recursive: true, force: true });
+        }
+      }
+
+      const indexing = requestMayStart(requestContext)
+        ? this.#recordPointer(canonicalRootKey, validated, requestContext)
+        : Promise.resolve();
+      void indexing.catch(() => {});
+      if (awaitIndex) await indexing;
+      return Object.freeze({ stored, path: finalPath, indexing });
+    } catch (error) {
+      abandonBeforePublication(error);
+      throw error;
+    }
+  }
+
+  async loadResultArtifact({ canonicalRootKey, receipt, requestContext }) {
+    return await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
+  }
+
+  async #listReceiptDirectories(changeSetDirectory, requestContext) {
+    try {
+      assertRequestActive(requestContext, "receipt-directory-list");
       const entries = await readdir(changeSetDirectory, { withFileTypes: true });
       return entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map((entry) => entry.name);
     } catch (error) {
@@ -409,21 +497,26 @@ export class ReviewReceiptStore {
     }
   }
 
-  async #recordPointer(canonicalRootKey, receipt) {
+  async #recordPointer(canonicalRootKey, receipt, requestContext) {
     try {
+      if (!requestMayStart(requestContext)) return;
       if (typeof this.#beforeScopeIndex === "function") {
-        await this.#beforeScopeIndex({ receipt });
+        await this.#beforeScopeIndex({ receipt, requestContext });
       }
+      if (!requestMayStart(requestContext)) return;
       const scopeKey = reviewScopeKey({
         agentType: receipt.reviewer.agentType,
         targetSpec: receipt.binding.target.spec
       });
       const directory = this.#scopeDirectory(canonicalRootKey, scopeKey);
+      assertRequestActive(requestContext, "scope-index-directory-create");
       await mkdir(directory, { recursive: true });
 
       const fileName = pointerFileName(receipt.provenance.recordedAt, receipt.reviewId);
       const pointerPath = path.join(directory, fileName);
+      assertRequestActive(requestContext, "scope-index-pointer-exists");
       if (!(await pathExists(pointerPath))) {
+        assertRequestActive(requestContext, "scope-index-pointer-write");
         const payload = canonicalJson({
           changeSetId: receipt.binding.changeSetId,
           recordedAt: receipt.provenance.recordedAt,
@@ -431,14 +524,18 @@ export class ReviewReceiptStore {
         }) + "\n";
         const staging = path.join(directory, ".review-" + this.#createNonce() + ".tmp");
         try {
+          assertRequestActive(requestContext, "scope-index-staging-write");
           await writeFileDurably(staging, payload);
+          assertRequestActive(requestContext, "scope-index-rename");
           await rename(staging, pointerPath);
         } finally {
-          if (await pathExists(staging)) await rm(staging, { force: true });
+          if (requestMayStart(requestContext) && await pathExists(staging)) {
+            await rm(staging, { force: true });
+          }
         }
       }
 
-      await this.#prunePointers(directory);
+      await this.#prunePointers(directory, requestContext);
     } catch {
       // The scope index is a convenience, never evidence. Once the receipt is
       // durable, any indexing or cleanup failure must not downgrade that bound
@@ -451,20 +548,23 @@ export class ReviewReceiptStore {
    * zero-padded timestamp, so lexical order is chronological order and pruning
    * needs no reads. Only pointers are ever removed; receipts are untouchable.
    */
-  async #prunePointers(directory) {
+  async #prunePointers(directory, requestContext) {
     let names;
     try {
+      if (!requestMayStart(requestContext)) return;
       names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort();
     } catch {
       return;
     }
     if (names.length <= MAX_POINTERS_PER_SCOPE) return;
     for (const name of names.slice(0, names.length - MAX_POINTERS_PER_SCOPE)) {
+      if (!requestMayStart(requestContext)) return;
       await unlink(path.join(directory, name)).catch(() => {});
     }
   }
 
-  async #loadReceipt(receiptPath) {
+  async #loadReceipt(receiptPath, requestContext) {
+    assertRequestActive(requestContext, "receipt-load-stat");
     const details = await lstat(receiptPath);
     if (!details.isFile() || details.isSymbolicLink()) {
       return { skipped: { path: receiptPath, code: "review_receipt_not_a_file" } };
@@ -474,8 +574,10 @@ export class ReviewReceiptStore {
     }
     let parsed;
     try {
-      parsed = JSON.parse(await readFile(receiptPath, "utf8"));
-    } catch {
+      assertRequestActive(requestContext, "receipt-load-read");
+      parsed = JSON.parse(await this.#readFile(receiptPath, "utf8"));
+    } catch (error) {
+      if (requestStopped(error)) throw error;
       return { skipped: { path: receiptPath, code: "review_receipt_unparsable" } };
     }
     const validated = validateReviewReceipt(parsed);
@@ -483,7 +585,7 @@ export class ReviewReceiptStore {
     return { receipt: validated };
   }
 
-  async listForChangeSet({ canonicalRootKey, changeSetId, limit = MAX_RECEIPTS_PER_CHANGE_SET }) {
+  async listForChangeSet({ canonicalRootKey, changeSetId, limit = MAX_RECEIPTS_PER_CHANGE_SET, requestContext }) {
     if (!CHANGE_SET_ID.test(changeSetId)) {
       return Object.freeze({
         receipts: Object.freeze([]),
@@ -497,9 +599,13 @@ export class ReviewReceiptStore {
     );
     const receipts = [];
     const skipped = [];
-    for (const name of (await this.#listReceiptDirectories(changeSetDirectory)).slice(0, limit)) {
-      const outcome = await this.#loadReceipt(path.join(changeSetDirectory, name, RECEIPT_FILE_NAME))
-        .catch(() => ({ skipped: { path: name, code: "review_receipt_unreadable" } }));
+    for (const name of (await this.#listReceiptDirectories(changeSetDirectory, requestContext)).slice(0, limit)) {
+      assertRequestActive(requestContext, "receipt-change-set-loop");
+      const outcome = await this.#loadReceipt(path.join(changeSetDirectory, name, RECEIPT_FILE_NAME), requestContext)
+        .catch((error) => {
+          if (requestStopped(error)) throw error;
+          return { skipped: { path: name, code: "review_receipt_unreadable" } };
+        });
       if (outcome.skipped) skipped.push(outcome.skipped);
       // The truncated directory name is a lookup device, not an identity. The
       // full changeSetId inside the file is what decides a match.
@@ -521,16 +627,18 @@ export class ReviewReceiptStore {
    * reports `truncated` when a bound stopped it and `failed` when it could not
    * read what it needed, because in both cases it has proven nothing.
    */
-  async #recoverScopeFromReceipts({ canonicalRootKey, scopeKey, known, limit }) {
+  async #recoverScopeFromReceipts({ canonicalRootKey, scopeKey, known, requestContext }) {
     const root = path.join(this.reviewsDirectory(canonicalRootKey), RECEIPTS_DIRECTORY);
     let changeSetDirectories;
     try {
+      assertRequestActive(requestContext, "authoritative-recovery-root-list");
       changeSetDirectories = (await readdir(root, { withFileTypes: true }))
         .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
         .map((entry) => entry.name)
         .sort();
     } catch (error) {
       // No authoritative tree at all is a real, provable absence.
+      if (requestStopped(error)) throw error;
       if (error?.code === "ENOENT") return { status: "complete", recovered: [] };
       return { status: "failed", recovered: [] };
     }
@@ -542,27 +650,33 @@ export class ReviewReceiptStore {
     const recovered = [];
 
     for (const changeSetName of scanned) {
-      if (recovered.length >= limit || loads >= MAX_RECOVERY_RECEIPT_LOADS) {
+      assertRequestActive(requestContext, "authoritative-recovery-change-set-loop");
+      if (loads >= MAX_RECOVERY_RECEIPT_LOADS) {
         truncated = true;
         break;
       }
       const changeSetDirectory = path.join(root, changeSetName);
       let receiptDirectories;
       try {
-        receiptDirectories = await this.#listReceiptDirectories(changeSetDirectory);
-      } catch {
+        receiptDirectories = await this.#listReceiptDirectories(changeSetDirectory, requestContext);
+      } catch (error) {
+        if (requestStopped(error)) throw error;
         unreadable = true;
         continue;
       }
       for (const receiptName of receiptDirectories) {
-        if (recovered.length >= limit || loads >= MAX_RECOVERY_RECEIPT_LOADS) {
+        assertRequestActive(requestContext, "authoritative-recovery-receipt-loop");
+        if (loads >= MAX_RECOVERY_RECEIPT_LOADS) {
           truncated = true;
           break;
         }
         loads += 1;
         const outcome = await this
-          .#loadReceipt(path.join(changeSetDirectory, receiptName, RECEIPT_FILE_NAME))
-          .catch(() => ({ skipped: { code: "review_receipt_unreadable" } }));
+          .#loadReceipt(path.join(changeSetDirectory, receiptName, RECEIPT_FILE_NAME), requestContext)
+          .catch((error) => {
+            if (requestStopped(error)) throw error;
+            return { skipped: { code: "review_receipt_unreadable" } };
+          });
         if (!outcome.receipt) {
           // A receipt that will not validate cannot be attributed to a scope,
           // so it counts as an unknown rather than as proven irrelevant.
@@ -589,13 +703,26 @@ export class ReviewReceiptStore {
   /**
    * Finds receipts for a review scope regardless of the repository's current
    * state. This is what makes a STALE verdict reachable at all.
+   *
+   * `limit` bounds returned records, not authoritative reasoning. The index is
+   * deliberately non-evidentiary, so it is never allowed to decide that a
+   * full output list proves history exhaustiveness. The cs sweep always runs
+   * under its own hard bounds; its result separately decides whether the
+   * history can be called complete.
    */
-  async discoverForScope({ canonicalRootKey, agentType, targetSpec, limit = MAX_DISCOVERED_RECEIPTS }) {
+  async discoverForScope({
+    canonicalRootKey,
+    agentType,
+    targetSpec,
+    limit = MAX_DISCOVERED_RECEIPTS,
+    requestContext
+  }) {
     const scopeKey = reviewScopeKey({ agentType, targetSpec });
     const directory = this.#scopeDirectory(canonicalRootKey, scopeKey);
 
     let names = [];
     try {
+      assertRequestActive(requestContext, "review-history-index-list");
       names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort().reverse();
     } catch (error) {
       // An absent index is not an absent history. It falls through to the
@@ -605,12 +732,18 @@ export class ReviewReceiptStore {
 
     const receipts = [];
     const skipped = [];
-    const selected = names.slice(0, limit);
+    const selected = names.slice(0, MAX_POINTERS_PER_SCOPE);
+    if (names.length > selected.length) {
+      skipped.push({ code: "review_history_index_truncated" });
+    }
     for (const name of selected) {
+      assertRequestActive(requestContext, "review-history-index-loop");
       let pointer;
       try {
-        pointer = JSON.parse(await readFile(path.join(directory, name), "utf8"));
-      } catch {
+        assertRequestActive(requestContext, "review-history-index-read");
+        pointer = JSON.parse(await this.#readFile(path.join(directory, name), "utf8"));
+      } catch (error) {
+        if (requestStopped(error)) throw error;
         skipped.push({ path: name, code: "review_pointer_unparsable" });
         continue;
       }
@@ -622,8 +755,11 @@ export class ReviewReceiptStore {
         this.#receiptDirectory(canonicalRootKey, pointer.changeSetId, pointer.reviewId),
         RECEIPT_FILE_NAME
       );
-      const outcome = await this.#loadReceipt(receiptPath)
-        .catch(() => ({ skipped: { path: name, code: "review_pointer_dangling" } }));
+      const outcome = await this.#loadReceipt(receiptPath, requestContext)
+        .catch((error) => {
+          if (requestStopped(error)) throw error;
+          return { skipped: { path: name, code: "review_pointer_dangling" } };
+        });
       if (outcome.skipped) {
         skipped.push(RECEIPT_CORRUPTION_CODES.has(outcome.skipped.code)
           ? {
@@ -652,58 +788,53 @@ export class ReviewReceiptStore {
       }
       receipts.push(outcome.receipt);
     }
-    let truncated = names.length > selected.length;
-
-    // The index may under-report for reasons it never records. Only the
-    // authoritative tree can turn "found nothing more" into "there is nothing
-    // more", so it is consulted whenever the index did not fill the bound.
-    let recovery = { status: "not-needed", recovered: [] };
-    if (receipts.length < limit) {
-      recovery = await this.#recoverScopeFromReceipts({
-        canonicalRootKey,
-        scopeKey,
-        known: new Set(receipts.map((receipt) => receipt.reviewId)),
-        // Only the room the index left, so a merged result can never quietly
-        // exceed the caller's bound and lose receipts in the final slice.
-        limit: limit - receipts.length
-      });
-      if (recovery.recovered.length > 0) {
-        receipts.push(...recovery.recovered);
-        // Newest first, exactly as the index-ordered path reports. The
-        // tiebreak compares code units rather than using localeCompare, so the
-        // order cannot shift with the host locale.
-        receipts.sort((left, right) => {
-          if (right.provenance.recordedAt !== left.provenance.recordedAt) {
-            return right.provenance.recordedAt - left.provenance.recordedAt;
-          }
-          if (right.reviewId === left.reviewId) return 0;
-          return right.reviewId > left.reviewId ? 1 : -1;
-        });
-        skipped.push({ code: "review_history_recovered_from_receipts" });
-      }
-      if (recovery.status === "truncated") {
-        truncated = true;
-        skipped.push({ code: "review_history_recovery_truncated" });
-      } else if (recovery.status === "unreadable") {
-        skipped.push({ code: "review_history_recovery_unreadable" });
-      } else if (recovery.status === "failed") {
-        skipped.push({ code: "review_history_recovery_failed" });
-      }
+    const recovery = await this.#recoverScopeFromReceipts({
+      canonicalRootKey,
+      scopeKey,
+      known: new Set(receipts.map((receipt) => receipt.reviewId)),
+      requestContext
+    });
+    if (recovery.recovered.length > 0) {
+      receipts.push(...recovery.recovered);
+      skipped.push({ code: "review_history_recovered_from_receipts" });
+    }
+    if (recovery.status === "truncated") {
+      skipped.push({ code: "review_history_recovery_truncated" });
+      skipped.push({ code: "review_history_completeness_unproven" });
+    } else if (recovery.status === "unreadable") {
+      skipped.push({ code: "review_history_recovery_unreadable" });
+      skipped.push({ code: "review_history_completeness_unproven" });
+    } else if (recovery.status === "failed") {
+      skipped.push({ code: "review_history_recovery_failed" });
+      skipped.push({ code: "review_history_completeness_unproven" });
     }
 
-    // Belt and braces: if a merge ever overflowed the bound, the drop is
-    // reported rather than hidden by the slice below.
-    if (receipts.length > limit) truncated = true;
+    receipts.sort((left, right) => {
+      if (right.provenance.recordedAt !== left.provenance.recordedAt) {
+        return right.provenance.recordedAt - left.provenance.recordedAt;
+      }
+      if (right.reviewId === left.reviewId) return 0;
+      return right.reviewId > left.reviewId ? 1 : -1;
+    });
 
-    // A sweep that could not read the authoritative tree has proven nothing
-    // either way, so completeness is unknown rather than assumed.
+    const outputTruncated = receipts.length > limit;
+    if (outputTruncated) {
+      skipped.push({ code: "review_history_truncated" });
+      skipped.push({ code: "review_history_recovery_truncated" });
+    }
+    const truncated = recovery.status === "truncated" || outputTruncated;
+
     const status = recovery.status === "failed"
       ? "indeterminate"
-      : (skipped.length > 0 || truncated ? "partial" : "complete");
+      : (recovery.status !== "complete" || outputTruncated ? "partial" : "complete");
 
     return Object.freeze({
       status,
       receipts: Object.freeze(receipts.slice(0, limit)),
+      allReceipts: Object.freeze(receipts),
+      totalCount: receipts.length,
+      authoritativeExhaustive: recovery.status === "complete",
+      outputTruncated,
       skipped: Object.freeze(skipped),
       truncated
     });

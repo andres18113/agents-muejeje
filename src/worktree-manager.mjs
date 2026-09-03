@@ -31,14 +31,28 @@ export class WorktreeManagerError extends Error {
   }
 }
 
-async function pathExists(pathname) {
+async function pathExists(pathname, requestContext) {
   try {
+    assertRequestActive(requestContext, "worktree-path-exists");
     await lstat(pathname);
     return true;
   } catch (error) {
     if (error?.code === "ENOENT") return false;
     throw error;
   }
+}
+
+function assertRequestActive(requestContext, phase) {
+  requestContext?.assertActive?.(phase);
+}
+
+function boundedGitTimeout(requestContext) {
+  const remaining = requestContext?.remainingMs?.();
+  if (remaining === undefined) return GIT_COMMAND_TIMEOUT_MS;
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    assertRequestActive(requestContext, "worktree-git");
+  }
+  return Math.max(1, Math.min(GIT_COMMAND_TIMEOUT_MS, remaining));
 }
 
 /**
@@ -107,7 +121,8 @@ export async function resolveRepositoryCoordinationIdentity(
   {
     runGitCommand = runGit,
     realpathFn = realpath,
-    platform = process.platform
+    platform = process.platform,
+    requestContext
   } = {}
 ) {
   if (!workspace || typeof workspace !== "object") {
@@ -119,16 +134,25 @@ export async function resolveRepositoryCoordinationIdentity(
 
   let commonDirectory;
   try {
+    assertRequestActive(requestContext, "repository-identity-git");
     const result = await runGitCommand(
       ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { cwd: workspace.effectiveCwd }
+      {
+        cwd: workspace.effectiveCwd,
+        timeoutMs: boundedGitTimeout(requestContext),
+        abortSignal: requestContext?.abortSignal
+      }
     );
     const reported = result.stdout.trim();
     if (!reported) throw new Error("empty common Git directory");
+    assertRequestActive(requestContext, "repository-identity-realpath");
     commonDirectory = await realpathFn(
       path.isAbsolute(reported) ? reported : path.resolve(workspace.effectiveCwd, reported)
     );
   } catch (error) {
+    if (error?.code === "claude_cancelled" || error?.code === "delegate_request_deadline_exceeded") {
+      throw error;
+    }
     throw new WorktreeManagerError(
       "Cannot establish the canonical Git repository identity for durable write admission.",
       { code: "repository_identity_unavailable", cause: error }
@@ -188,14 +212,16 @@ export class GitWorktreeManager {
    * that dies after this point leaves behind enough evidence for the next one
    * to tell a live Git operation from a finished one.
    */
-  async #recordGitOperation(child, { executionId, canonicalRepositoryKey }) {
+  async #recordGitOperation(child, { executionId, canonicalRepositoryKey, requestContext }) {
     let observation;
     try {
+      if (requestContext?.isActive?.() === false) return;
       observation = await this.#inspectProcess(child?.pid);
     } catch {
       return;
     }
     if (observation?.status !== PROCESS_IDENTITY_STATUS.ALIVE || !observation.identity) return;
+    if (requestContext?.isActive?.() === false) return;
     await this.#writeCustody.recordWorktreeOperation({
       executionId,
       canonicalRootKey: canonicalRepositoryKey,
@@ -204,7 +230,8 @@ export class GitWorktreeManager {
         pid: observation.identity.pid,
         startTime: observation.identity.startTime,
         source: observation.identity.source
-      }
+      },
+      mutationSignal: requestContext?.abortSignal
     });
   }
 
@@ -216,6 +243,7 @@ export class GitWorktreeManager {
    *   effectiveCwd   the requested directory re-anchored inside workspaceRoot
    */
   async prepare(request) {
+    assertRequestActive(request.requestContext, "worktree-preparation");
     const workspaceRoot = this.#writeCustody.worktreeRootFor({
       canonicalRootKey: request.canonicalRepositoryKey,
       executionId: request.executionId
@@ -245,9 +273,10 @@ export class GitWorktreeManager {
 
   async #prepareInto(
     workspaceRoot,
-    { executionId, canonicalRepositoryKey, repositoryRoot, effectiveCwd }
+    { executionId, canonicalRepositoryKey, repositoryRoot, effectiveCwd, requestContext }
   ) {
-    if (await pathExists(workspaceRoot)) {
+    assertRequestActive(requestContext, "worktree-path-check");
+    if (await pathExists(workspaceRoot, requestContext)) {
       throw new WorktreeManagerError("The isolated worktree path already exists: " + workspaceRoot, {
         code: "worktree_path_conflict"
       });
@@ -255,7 +284,12 @@ export class GitWorktreeManager {
 
     let baseCommit;
     try {
-      const result = await this.#runGit(["rev-parse", "--verify", "HEAD"], { cwd: repositoryRoot });
+      assertRequestActive(requestContext, "worktree-base-commit");
+      const result = await this.#runGit(["rev-parse", "--verify", "HEAD"], {
+        cwd: repositoryRoot,
+        timeoutMs: boundedGitTimeout(requestContext),
+        abortSignal: requestContext?.abortSignal
+      });
       baseCommit = result.stdout.trim();
     } catch (error) {
       throw new WorktreeManagerError(
@@ -275,12 +309,15 @@ export class GitWorktreeManager {
       });
     }
 
+    assertRequestActive(requestContext, "worktree-directory-create");
     await mkdir(path.dirname(workspaceRoot), { recursive: true });
+    assertRequestActive(requestContext, "worktree-custody-preparation");
     await this.#writeCustody.beginWorktreePreparation({
       executionId,
       canonicalRootKey: canonicalRepositoryKey,
       baseCommit,
-      worktreeRoot: workspaceRoot
+      worktreeRoot: workspaceRoot,
+      mutationSignal: requestContext?.abortSignal
     });
     // `git worktree add` mutates the repository. Hooks are disabled so that
     // preparing an isolated workspace never executes repository-supplied
@@ -288,14 +325,18 @@ export class GitWorktreeManager {
     // sideEffectsUnproven so the caller retains custody instead of treating
     // the delegation as provably side-effect free.
     let operationRecorded = Promise.resolve();
+    assertRequestActive(requestContext, "worktree-git-add");
     const worktreeAdd = this.#runGit(["worktree", "add", "--detach", workspaceRoot, baseCommit], {
       cwd: repositoryRoot,
       disableHooks: true,
       enableLongPaths: process.platform === "win32",
+      timeoutMs: boundedGitTimeout(requestContext),
+      abortSignal: requestContext?.abortSignal,
       onSpawned: (child) => {
         operationRecorded = this.#recordGitOperation(child, {
           executionId,
-          canonicalRepositoryKey
+          canonicalRepositoryKey,
+          requestContext
         });
       }
     });
@@ -332,9 +373,11 @@ export class GitWorktreeManager {
     }
     if (addFailure) throw addFailure;
 
+    assertRequestActive(requestContext, "worktree-effective-cwd");
     const effectiveWorkerCwd = isolatedCwdFor(workspaceRoot, repositoryRoot, effectiveCwd);
     let details;
     try {
+      assertRequestActive(requestContext, "worktree-effective-cwd-stat");
       details = await this.#stat(effectiveWorkerCwd);
     } catch (error) {
       throw new WorktreeManagerError(
@@ -348,9 +391,11 @@ export class GitWorktreeManager {
       });
     }
 
+    assertRequestActive(requestContext, "worktree-mark-spawning");
     await this.#writeCustody.markSpawning({
       executionId,
-      canonicalRootKey: canonicalRepositoryKey
+      canonicalRootKey: canonicalRepositoryKey,
+      mutationSignal: requestContext?.abortSignal
     });
     return Object.freeze({
       effectiveCwd: effectiveWorkerCwd,

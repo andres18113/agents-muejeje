@@ -66,7 +66,7 @@ function receiptWith({ sections = baseSections(), reviewer = {} } = {}) {
     result: { sha256: DIGEST, bytes: 10 },
     provenance: {
       repositoryId: DIGEST,
-      producer: "claude-agents-mcp/0.2.0",
+      producer: "claude-agents-mcp/0.2.1",
       collector: "change-set-collector/v1",
       recordedAt: 3_000
     }

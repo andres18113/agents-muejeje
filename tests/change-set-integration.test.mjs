@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -691,14 +691,147 @@ function stalledRenameStore(stateRoot, { allowRename, renameEntered }) {
   return new ReviewReceiptStore({
     stateRoot,
     renameFn: async (...args) => {
-      // Authority is crossed the instant the store issues this call, so the
-      // delegation's bounds expire with the write still genuinely in flight.
-      renameEntered.resolve();
-      await allowRename.promise;
+      const targetPath = String(args[1]);
+      if (targetPath.includes(path.join("reviews", "cs"))) {
+        renameEntered.resolve();
+        await allowRename.promise;
+      }
       return await rename(...args);
     }
   });
 }
+
+async function writeTextDurably(pathname, text) {
+  const handle = await open(pathname, "wx", 0o600);
+  try {
+    await handle.writeFile(text, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+test("an artifact stall beyond AFTER's deadline never starts receipt publication", async () => {
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const artifactEntered = deferredValue();
+    const artifactFinished = deferredValue();
+    const allowArtifact = deferredValue();
+    const receiptPreconditionReached = { value: false };
+    const custody = custodyFor(stateRoot);
+    const deadlines = manualDeadlines();
+    const stopped = { done: false };
+    const receiptStore = new ReviewReceiptStore({
+      stateRoot,
+      writeFileDurablyFn: async (pathname, text) => {
+        if (String(pathname).includes(path.join("reviews", "artifacts"))) {
+          artifactEntered.resolve();
+          await allowArtifact.promise;
+          await writeTextDurably(pathname, text);
+          artifactFinished.resolve();
+          return;
+        }
+        await writeTextDurably(pathname, text);
+      },
+      beforeAuthoritativeRename: async () => {
+        receiptPreconditionReached.value = true;
+      }
+    });
+
+    const pending = delegateAgent(
+      { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
+      {
+        writeCustody: custody,
+        runAgent: completedRunner(),
+        env: {},
+        receiptStore,
+        scheduleReviewBindingTimeout: deadlines.schedule,
+        cancelReviewBindingTimeout: deadlines.cancel
+      }
+    );
+
+    await artifactEntered.promise;
+    const driver = deadlines.driveUntil(stopped);
+    const outcome = await pending;
+    stopped.done = true;
+    await driver;
+
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.custodyState, "released");
+    assert.equal(outcome.recoveryDiagnostics.mode, "not-needed");
+    assert.equal(outcome.reviewBinding.publication.status, "cancelled-before-authority");
+    assert.equal(outcome.reviewBinding.publication.authorityStarted, false);
+
+    allowArtifact.resolve();
+    await artifactFinished.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(receiptPreconditionReached.value, false, "no precondition or receipt rename may begin after the deadline fence");
+
+    const repositoryKey = await coordinationKeyFor(repositoryRoot);
+    const listed = await new ReviewReceiptStore({ stateRoot }).listForChangeSet({
+      canonicalRootKey: repositoryKey,
+      changeSetId: outcome.reviewBinding.beforeChangeSetId
+    });
+    assert.deepEqual(listed.receipts, []);
+  });
+});
+
+test("root cancellation during artifact persistence returns timeout without publishing or retaining custody", async () => {
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const abortController = new AbortController();
+    const artifactEntered = deferredValue();
+    const artifactFinished = deferredValue();
+    const allowArtifact = deferredValue();
+    const receiptPreconditionReached = { value: false };
+    const custody = custodyFor(stateRoot);
+    const receiptStore = new ReviewReceiptStore({
+      stateRoot,
+      writeFileDurablyFn: async (pathname, text) => {
+        if (String(pathname).includes(path.join("reviews", "artifacts"))) {
+          artifactEntered.resolve();
+          await allowArtifact.promise;
+          await writeTextDurably(pathname, text);
+          artifactFinished.resolve();
+          return;
+        }
+        await writeTextDurably(pathname, text);
+      },
+      beforeAuthoritativeRename: async () => {
+        receiptPreconditionReached.value = true;
+      }
+    });
+
+    const pending = delegateAgent(
+      {
+        agentType: "code-review",
+        task: "review the change set",
+        cwd: repositoryRoot,
+        abortSignal: abortController.signal
+      },
+      { writeCustody: custody, runAgent: completedRunner(), env: {}, receiptStore }
+    );
+
+    await artifactEntered.promise;
+    abortController.abort();
+    allowArtifact.resolve();
+    const outcome = await pending;
+    await artifactFinished.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(outcome.status, "timeout");
+    assert.equal(outcome.error.code, "claude_cancelled");
+    assert.equal(outcome.custodyState, "released");
+    assert.equal(outcome.reviewBinding.publication.status, "cancelled-before-authority");
+    assert.equal(receiptPreconditionReached.value, false);
+
+    const repositoryKey = await coordinationKeyFor(repositoryRoot);
+    assert.equal(await custody.getWriteAccess(repositoryKey), undefined);
+    const listed = await new ReviewReceiptStore({ stateRoot }).listForChangeSet({
+      canonicalRootKey: repositoryKey,
+      changeSetId: outcome.reviewBinding.beforeChangeSetId
+    });
+    assert.deepEqual(listed.receipts, []);
+  });
+});
 
 test("a receipt settling after quiescence releases real custody under the same guard", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {

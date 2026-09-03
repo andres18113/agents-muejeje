@@ -77,8 +77,9 @@ function errorIsPathConflict(error) {
   return ["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(error?.code);
 }
 
-export async function exists(pathname) {
+export async function exists(pathname, { mutationSignal } = {}) {
   try {
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     await lstat(pathname);
     return true;
   } catch (error) {
@@ -125,10 +126,13 @@ export async function readAuthoritativeRecord(ownershipDirectory) {
   }
 }
 
-async function writeFileDurably(pathname, text) {
+async function writeFileDurably(pathname, text, { mutationSignal } = {}) {
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   const handle = await open(pathname, "wx", 0o600);
   try {
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     await handle.writeFile(text, "utf8");
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     await handle.sync();
   } finally {
     await handle.close();
@@ -145,14 +149,17 @@ export function cancelledMutationError() {
   });
 }
 
-export async function ensureRepositoryLayout(repositoryState) {
+export async function ensureRepositoryLayout(repositoryState, { mutationSignal } = {}) {
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(repositoryState, { recursive: true });
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(path.join(repositoryState, EXECUTIONS_DIRECTORY_NAME), { recursive: true });
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(path.join(repositoryState, WORKTREES_DIRECTORY_NAME), { recursive: true });
 }
 
-export async function executionHistoryExists(repositoryState, executionId) {
-  return await exists(executionHistoryDirectoryIn(repositoryState, executionId));
+export async function executionHistoryExists(repositoryState, executionId, { mutationSignal } = {}) {
+  return await exists(executionHistoryDirectoryIn(repositoryState, executionId), { mutationSignal });
 }
 
 /**
@@ -163,18 +170,21 @@ export async function executionHistoryExists(repositoryState, executionId) {
  * written state. Returns false when another coordinator won the same rename;
  * that is a normal race outcome, not an error.
  */
-export async function createOwnershipReservation({ repositoryState, record, createNonce }) {
+export async function createOwnershipReservation({ repositoryState, record, createNonce, mutationSignal }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
-  if (await exists(ownershipDirectory)) return false;
+  if (await exists(ownershipDirectory, { mutationSignal })) return false;
 
   const temporaryDirectory = path.join(repositoryState, ".ownership-" + createNonce() + ".tmp");
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(temporaryDirectory);
   try {
     await writeFileDurably(
       path.join(temporaryDirectory, RECORD_FILE_NAME),
-      JSON.stringify(record, null, 2) + "\n"
+      JSON.stringify(record, null, 2) + "\n",
+      { mutationSignal }
     );
     try {
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
       await rename(temporaryDirectory, ownershipDirectory);
       return true;
     } catch (error) {
@@ -182,7 +192,9 @@ export async function createOwnershipReservation({ repositoryState, record, crea
       return false;
     }
   } finally {
-    if (await exists(temporaryDirectory)) await rm(temporaryDirectory, { recursive: true, force: true });
+    if (!mutationWasCancelled(mutationSignal) && await exists(temporaryDirectory)) {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   }
 }
 
@@ -218,7 +230,7 @@ export async function publishRecord({
   if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   const temporaryPath = path.join(repositoryState, ".record-" + createNonce() + ".tmp");
   try {
-    await writeFileDurably(temporaryPath, JSON.stringify(record, null, 2) + "\n");
+    await writeFileDurably(temporaryPath, JSON.stringify(record, null, 2) + "\n", { mutationSignal });
     // The test seam pauses after the next record is durable but before the
     // final authoritative read. A stale caller must then lose its CAS rather
     // than rename an old execution over a newer owner.
@@ -266,7 +278,9 @@ export async function publishRecord({
       cause: error
     });
   } finally {
-    if (await exists(temporaryPath)) await rm(temporaryPath, { force: true });
+    if (!mutationWasCancelled(mutationSignal) && await exists(temporaryPath)) {
+      await rm(temporaryPath, { force: true });
+    }
   }
 }
 

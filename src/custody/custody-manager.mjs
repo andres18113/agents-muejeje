@@ -139,7 +139,8 @@ export class DurableWriteCustodyManager {
     canonicalRoot,
     canonicalRootKey,
     custodyKind = CUSTODY_KINDS.WRITE,
-    targetRef
+    targetRef,
+    mutationSignal
   }) {
     const validId = validExecutionId(executionId);
     const validAgentType = validIdentityString("agentType", agentType);
@@ -156,6 +157,7 @@ export class DurableWriteCustodyManager {
         code: "write_custody_state_root_invalid"
       });
     }
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     const coordinatorObservation = await this.#inspectProcess(this.#currentPid);
     if (coordinatorObservation?.status !== PROCESS_IDENTITY_STATUS.ALIVE) {
       throw new WriteCustodyError("Coordinator process identity is unavailable; write admission is blocked.", {
@@ -170,10 +172,12 @@ export class DurableWriteCustodyManager {
     }
 
     for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
       const reserved = await this.#withRepositoryMutation(validRootKey, async () => {
         const repositoryState = this.repositoryStateDirectory(validRootKey);
-        await ensureRepositoryLayout(repositoryState);
-        if (await executionHistoryExists(repositoryState, validId)) {
+        await ensureRepositoryLayout(repositoryState, { mutationSignal });
+        if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+        if (await executionHistoryExists(repositoryState, validId, { mutationSignal })) {
           throw new WriteCustodyError("executionId already has durable history for this repository.", {
             code: "write_custody_execution_id_conflict"
           });
@@ -201,12 +205,14 @@ export class DurableWriteCustodyManager {
         const created = await createOwnershipReservation({
           repositoryState,
           record,
-          createNonce: this.#createNonce
+          createNonce: this.#createNonce,
+          mutationSignal
         });
         return created ? recordSnapshot(record) : undefined;
-      });
+      }, { mutationSignal });
       if (reserved) return reserved;
 
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
       const reconciliation = await this.reconcileExistingOwnership(validRootKey);
       if (reconciliation.released || reconciliation.reason === "changed") continue;
       throw new WriteCustodyError("Write custody is already retained for canonical root '" + validRoot + "'.", {
@@ -220,18 +226,22 @@ export class DurableWriteCustodyManager {
     });
   }
 
-  async beginWorktreePreparation({ executionId, canonicalRootKey, baseCommit, worktreeRoot }) {
+  async beginWorktreePreparation({ executionId, canonicalRootKey, baseCommit, worktreeRoot, mutationSignal }) {
     if (typeof baseCommit !== "string" || !/^[0-9a-f]{40,64}$/iu.test(baseCommit)) {
       throw new WriteCustodyError("A valid worktree base commit is required.", {
         code: "write_custody_worktree_metadata_invalid"
       });
     }
     validIdentityString("worktreeRoot", worktreeRoot);
-    return await this.#withRepositoryMutation(canonicalRootKey, async () =>
-      await this.#transitionOwned({ executionId, canonicalRootKey }, "PREPARING_WORKTREE", {
-        baseCommit,
-        worktreeRoot
-      })
+    return await this.#withRepositoryMutation(
+      canonicalRootKey,
+      async () => await this.#transitionOwned(
+        { executionId, canonicalRootKey },
+        "PREPARING_WORKTREE",
+        { baseCommit, worktreeRoot },
+        { mutationSignal }
+      ),
+      { mutationSignal }
     );
   }
 
@@ -241,7 +251,7 @@ export class DurableWriteCustodyManager {
    * and its PID+StartTime were established, so a coordinator crash mid-
    * preparation can be reconciled by identity instead of by guessing.
    */
-  async recordWorktreeOperation({ executionId, canonicalRootKey, gitOperation }) {
+  async recordWorktreeOperation({ executionId, canonicalRootKey, gitOperation, mutationSignal }) {
     if (!validatePersistedGitOperation(gitOperation)) {
       throw new WriteCustodyError("A valid supervised Git operation identity is required.", {
         code: "write_custody_git_operation_invalid"
@@ -261,8 +271,8 @@ export class DurableWriteCustodyManager {
           startTime: gitOperation.startTime,
           source: gitOperation.source
         }
-      });
-    });
+      }, { mutationSignal });
+    }, { mutationSignal });
   }
 
   /**
@@ -277,12 +287,17 @@ export class DurableWriteCustodyManager {
     });
   }
 
-  async markSpawning({ executionId, canonicalRootKey }) {
+  async markSpawning({ executionId, canonicalRootKey, mutationSignal }) {
     return await this.#withRepositoryMutation(canonicalRootKey, async () => {
-      const record = await this.#transitionOwned({ executionId, canonicalRootKey }, "SPAWNING");
+      const record = await this.#transitionOwned(
+        { executionId, canonicalRootKey },
+        "SPAWNING",
+        {},
+        { mutationSignal }
+      );
       this.#supervisedSpawns.set(record.repositoryId, record.executionId);
       return record;
-    });
+    }, { mutationSignal });
   }
 
   async activateWriteAccess({ executionId, canonicalRootKey, processIdentity, mutationSignal }) {

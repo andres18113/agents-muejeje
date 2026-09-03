@@ -35,6 +35,8 @@ import {
 export const RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC = 3600; // 60 minutes
 export const RECOMMENDED_CODEX_TOOL_TIMEOUT_MS = RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC * 1000;
 
+export const MAX_SUPPORTED_DELEGATE_TIMEOUT_MS = 30 * 60 * 1000;
+
 export const REVIEW_BINDING_FINALIZATION_BUDGET_MS = COLLECTION_DEADLINE_MS + 10_000; // 190_000 ms
 
 /**
@@ -58,6 +60,31 @@ export const REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS = Object.freeze(
     0
   )
 );
+
+export function effectiveDelegateTimeoutFromEnvironment(
+  env = process.env,
+  fallbackTimeoutMs = MAX_SUPPORTED_DELEGATE_TIMEOUT_MS
+) {
+  const raw = env?.CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS;
+  if (raw === undefined || raw === null || raw === "") {
+    return Object.freeze({
+      valid: Number.isSafeInteger(fallbackTimeoutMs) && fallbackTimeoutMs > 0 &&
+        fallbackTimeoutMs <= MAX_SUPPORTED_DELEGATE_TIMEOUT_MS,
+      timeoutMs: fallbackTimeoutMs,
+      source: "profile"
+    });
+  }
+  if (typeof raw !== "string" || !/^\d+$/u.test(raw.trim())) {
+    return Object.freeze({ valid: false, timeoutMs: undefined, source: "operator-override" });
+  }
+  const timeoutMs = Number(raw);
+  return Object.freeze({
+    valid: Number.isSafeInteger(timeoutMs) && timeoutMs > 0 &&
+      timeoutMs <= MAX_SUPPORTED_DELEGATE_TIMEOUT_MS,
+    timeoutMs,
+    source: "operator-override"
+  });
+}
 
 export function deriveMaxProfileTimeout(registry) {
   const profiles = Object.values(registry);
@@ -107,7 +134,7 @@ export function assertTimeoutHierarchy({
     );
   }
 
-  if (outerTimeoutMs < maxMcpLifetimeMs) {
+  if (outerTimeoutMs <= maxMcpLifetimeMs) {
     throw new TimeoutHierarchyViolationError(
       `Outer client timeout (${outerTimeoutMs}ms) does not provide sufficient settlement headroom ` +
         `for maximum bounded MCP lifetime (${maxMcpLifetimeMs}ms = ` +
@@ -129,11 +156,34 @@ export function assertTimeoutHierarchy({
 export function checkTimeoutHierarchySafety({
   codexTimeoutSec,
   maxProfileTimeoutMs,
-  settlementBudgetMs = REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS
+  settlementBudgetMs = REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS,
+  effectiveDelegateTimeoutMs = maxProfileTimeoutMs,
+  effectiveDelegateTimeoutValid = true
 }) {
   const maxProfileSec = Math.round(maxProfileTimeoutMs / 1000);
+  const effectiveTimeoutSec = Math.round(effectiveDelegateTimeoutMs / 1000);
   const settlementBudgetSec = Math.round(settlementBudgetMs / 1000);
-  const minSafeTimeoutSec = maxProfileSec + settlementBudgetSec;
+  const requiredExclusiveMs = effectiveDelegateTimeoutMs + settlementBudgetMs;
+  const minSafeTimeoutSec = Math.floor(requiredExclusiveMs / 1000) + 1;
+
+  if (!effectiveDelegateTimeoutValid ||
+      !Number.isSafeInteger(effectiveDelegateTimeoutMs) ||
+      effectiveDelegateTimeoutMs <= 0 ||
+      effectiveDelegateTimeoutMs > MAX_SUPPORTED_DELEGATE_TIMEOUT_MS) {
+    return Object.freeze({
+      safe: false,
+      status: "unsafe-effective-delegate-timeout",
+      configuredTimeoutSec: codexTimeoutSec ?? null,
+      recommendedTimeoutSec: RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
+      maxProfileTimeoutSec: maxProfileSec,
+      effectiveDelegateTimeoutSec: Number.isFinite(effectiveTimeoutSec) ? effectiveTimeoutSec : null,
+      settlementBudgetSec,
+      minSafeTimeoutSec: null,
+      message:
+        "Effective delegate timeout is invalid or exceeds the supported project maximum of " +
+        Math.round(MAX_SUPPORTED_DELEGATE_TIMEOUT_MS / 1000) + "s."
+    });
+  }
 
   if (codexTimeoutSec === undefined || codexTimeoutSec === null) {
     return Object.freeze({
@@ -142,6 +192,7 @@ export function checkTimeoutHierarchySafety({
       configuredTimeoutSec: null,
       recommendedTimeoutSec: RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
       maxProfileTimeoutSec: maxProfileSec,
+      effectiveDelegateTimeoutSec: effectiveTimeoutSec,
       settlementBudgetSec,
       minSafeTimeoutSec,
       message:
@@ -158,19 +209,21 @@ export function checkTimeoutHierarchySafety({
       configuredTimeoutSec: codexTimeoutSec,
       recommendedTimeoutSec: RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
       maxProfileTimeoutSec: maxProfileSec,
+      effectiveDelegateTimeoutSec: effectiveTimeoutSec,
       settlementBudgetSec,
       minSafeTimeoutSec,
       message: `Configured Codex MCP tool timeout (${codexTimeoutSec}) is invalid.`
     });
   }
 
-  if (numericTimeoutSec < minSafeTimeoutSec) {
+  if (numericTimeoutSec * 1000 <= requiredExclusiveMs) {
     return Object.freeze({
       safe: false,
       status: "unsafe",
       configuredTimeoutSec: numericTimeoutSec,
       recommendedTimeoutSec: RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
       maxProfileTimeoutSec: maxProfileSec,
+      effectiveDelegateTimeoutSec: effectiveTimeoutSec,
       settlementBudgetSec,
       minSafeTimeoutSec,
       message:
@@ -186,9 +239,10 @@ export function checkTimeoutHierarchySafety({
     configuredTimeoutSec: numericTimeoutSec,
     recommendedTimeoutSec: RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
     maxProfileTimeoutSec: maxProfileSec,
+    effectiveDelegateTimeoutSec: effectiveTimeoutSec,
     settlementBudgetSec,
     minSafeTimeoutSec,
-    headroomSec: numericTimeoutSec - minSafeTimeoutSec,
+    headroomSec: numericTimeoutSec - requiredExclusiveMs / 1000,
     message: `Codex MCP tool timeout (${numericTimeoutSec}s) satisfies timeout hierarchy safety.`
   });
 }

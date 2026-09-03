@@ -3,11 +3,10 @@ import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { AGENT_REGISTRY } from "../src/agent-registry.mjs";
+import { evaluateDiagnoseTimeout } from "../src/diagnose-timeout.mjs";
 import {
   RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC,
-  REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS,
-  deriveMaxProfileTimeout,
-  checkTimeoutHierarchySafety
+  REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS
 } from "../src/timeout-policy.mjs";
 
 const MINIMUM_NODE_MAJOR = 20;
@@ -78,16 +77,25 @@ for (const [name, diagnostic] of Object.entries(tools)) {
   console.log(name.padEnd(7), diagnostic.status.padEnd(11), details || diagnostic.detail || "");
 }
 
-const maxProfileTimeoutMs = deriveMaxProfileTimeout(AGENT_REGISTRY);
 const configuredCodexTimeoutSec = readCodexConfiguredTimeout();
-const timeoutSafety = checkTimeoutHierarchySafety({
+const { maxProfileTimeoutMs, effectiveDelegateTimeout, timeoutSafety } = evaluateDiagnoseTimeout({
+  registry: AGENT_REGISTRY,
   codexTimeoutSec: configuredCodexTimeoutSec,
-  maxProfileTimeoutMs
+  env: process.env
 });
 
 console.log("profile-max-useful-work", (maxProfileTimeoutMs / 1000) + "s", `(${maxProfileTimeoutMs / 60000}m)`);
+console.log(
+  "effective-delegate-useful-work",
+  effectiveDelegateTimeout.valid
+    ? (effectiveDelegateTimeout.timeoutMs / 1000) + "s (" + effectiveDelegateTimeout.source + ")"
+    : "unsafe " + effectiveDelegateTimeout.source
+);
 console.log("settlement-budget", (REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS / 1000) + "s", `(${REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS / 60000}m)`);
-console.log("min-safe-client-timeout", timeoutSafety.minSafeTimeoutSec + "s");
+console.log(
+  "min-safe-client-timeout",
+  Number.isFinite(timeoutSafety.minSafeTimeoutSec) ? timeoutSafety.minSafeTimeoutSec + "s" : "unavailable"
+);
 console.log("recommended-codex-timeout", RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC + "s");
 console.log(
   "configured-codex-timeout",

@@ -31,7 +31,11 @@ export const RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS = 30_000;
 
 export function createReceiptPublicationFence() {
   const controller = new AbortController();
-  const guard = { publicationStarted: false, publicationSettled: false };
+  const guard = {
+    publicationStarted: false,
+    publicationSettled: false,
+    settlementObserved: false
+  };
   let resolveSettlement;
   const settlement = new Promise((resolve) => {
     resolveSettlement = resolve;
@@ -40,8 +44,15 @@ export function createReceiptPublicationFence() {
     signal: controller.signal,
     guard,
     settle: (result) => {
-      if (!guard.publicationStarted || guard.publicationSettled) return false;
+      if (!guard.publicationStarted || guard.publicationSettled || guard.settlementObserved) return false;
       guard.publicationSettled = true;
+      guard.settlementObserved = true;
+      resolveSettlement(Object.freeze({ ...result }));
+      return true;
+    },
+    abandon: (result) => {
+      if (guard.publicationStarted || guard.settlementObserved) return false;
+      guard.settlementObserved = true;
       resolveSettlement(Object.freeze({ ...result }));
       return true;
     }
@@ -86,4 +97,8 @@ export function beginReceiptPublication(publication) {
  */
 export function settleReceiptPublication(publication, result) {
   return publication?.settle?.(result) === true;
+}
+
+export function abandonReceiptPublication(publication, result) {
+  return publication?.abandon?.(result) === true;
 }

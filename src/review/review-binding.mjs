@@ -7,6 +7,7 @@ import { assignmentBasis, resultBasis, reviewerBasis } from "./receipt-basis.mjs
 import { buildReviewReceipt, COHERENT_ADMISSION_KIND } from "./receipt-schema.mjs";
 import { evaluateFreshness } from "./freshness.mjs";
 import { formatReviewSubjectBlock } from "./review-subject.mjs";
+import { RECEIPT_PRODUCER_VERSION } from "../version.mjs";
 
 /**
  * The BEFORE / reviewer / AFTER lifecycle.
@@ -30,6 +31,7 @@ import { formatReviewSubjectBlock } from "./review-subject.mjs";
  */
 
 export const REVIEW_BINDING_CAPABILITY = "inspect-change-set";
+export const DEFAULT_RECEIPT_PRODUCER_VERSION = RECEIPT_PRODUCER_VERSION;
 
 export function profileParticipatesInReviewBinding(profile) {
   return Boolean(profile?.declaredCapabilities?.includes(REVIEW_BINDING_CAPABILITY));
@@ -48,10 +50,24 @@ function reasons(...codes) {
 
 const MAX_HISTORY_DIAGNOSTICS = 16;
 
-function receiptHistory(status, receipts = [], diagnostics = []) {
+function requestStopped(error) {
+  return error?.code === "claude_cancelled" ||
+    error?.code === "delegate_request_deadline_exceeded";
+}
+
+function receiptHistory(status, receipts = [], diagnostics = [], metadata = {}) {
+  const allReceipts = metadata.allReceipts ?? receipts;
+  const totalCount = Number.isSafeInteger(metadata.totalCount) && metadata.totalCount >= 0
+    ? metadata.totalCount
+    : allReceipts.length;
+  const outputTruncated = metadata.outputTruncated === true || allReceipts.length > 16;
   return Object.freeze({
     status,
     receipts: Object.freeze(receipts.slice(0, 16)),
+    allReceipts: Object.freeze(allReceipts),
+    totalCount,
+    outputTruncated,
+    authoritativeExhaustive: metadata.authoritativeExhaustive === true,
     diagnostics: Object.freeze(diagnostics.slice(0, MAX_HISTORY_DIAGNOSTICS))
   });
 }
@@ -93,7 +109,7 @@ export function createReviewBinder({
   receiptStore,
   evaluateFreshnessFn = evaluateFreshness,
   now = Date.now,
-  producerVersion = "claude-agents-mcp/0.2.0"
+  producerVersion = DEFAULT_RECEIPT_PRODUCER_VERSION
 } = {}) {
 
   /**
@@ -109,7 +125,7 @@ export function createReviewBinder({
    * verdict is used; the discovery index is a hint about where to look and is
    * never treated as evidence in its own right.
    */
-  async function discoverPriorReviews({ canonicalRootKey, agentType, targetSpec, current, basis }) {
+  async function discoverPriorReviews({ canonicalRootKey, agentType, targetSpec, current, basis, requestContext }) {
     if (!receiptStore || typeof receiptStore.discoverForScope !== "function") {
       return receiptHistory("indeterminate", [], [{ code: "review_history_unavailable" }]);
     }
@@ -118,15 +134,20 @@ export function createReviewBinder({
       discovered = await receiptStore.discoverForScope({
         canonicalRootKey,
         agentType,
-        targetSpec
+        targetSpec,
+        requestContext
       });
     } catch (error) {
+      if (requestStopped(error)) throw error;
       return receiptHistory("indeterminate", [], [{
         code: "review_history_discovery_failed",
         ...(typeof error?.code === "string" ? { detail: error.code } : {})
       }]);
     }
-    const priorReviews = discovered.receipts.map((receipt) => {
+    const discoveredReceipts = Array.isArray(discovered.allReceipts)
+      ? discovered.allReceipts
+      : (Array.isArray(discovered.receipts) ? discovered.receipts : []);
+    const priorReviews = discoveredReceipts.map((receipt) => {
       const verdict = evaluateFreshnessFn({ receipt, current, basis, now });
       return Object.freeze({
         reviewId: receipt.reviewId,
@@ -154,20 +175,29 @@ export function createReviewBinder({
       }));
     }
     const diagnostics = (discovered.skipped ?? []).map((skipped) => ({ code: skipped.code }));
-    if (discovered.truncated === true) diagnostics.push({ code: "review_history_truncated" });
+    if (discovered.truncated === true && !diagnostics.some((entry) => entry.code === "review_history_truncated")) {
+      diagnostics.push({ code: "review_history_truncated" });
+    }
     // A status this binder does not recognize is not evidence of completeness.
     // Collapsing an unknown or indeterminate discovery into "complete" is the
     // exact false-absence this three-valued status exists to prevent.
     let status;
     if (discovered.status === "complete" || discovered.status === "partial") {
-      status = diagnostics.length > 0 ? "partial" : discovered.status;
+      status = discovered.status;
     } else {
       status = "indeterminate";
       if (discovered.status !== "indeterminate") {
         diagnostics.push({ code: "review_history_status_unrecognized" });
       }
     }
-    return receiptHistory(status, priorReviews, diagnostics);
+    return receiptHistory(status, priorReviews, diagnostics, {
+      allReceipts: priorReviews,
+      totalCount: Number.isSafeInteger(discovered.totalCount)
+        ? discovered.totalCount
+        : priorReviews.length,
+      outputTruncated: discovered.outputTruncated === true || discovered.truncated === true,
+      authoritativeExhaustive: discovered.authoritativeExhaustive === true
+    });
   }
 
   async function before({
@@ -179,7 +209,8 @@ export function createReviewBinder({
     workspace,
     coherence,
     custodyExecutionId,
-    targetSpec = NO_REVIEW_TARGET
+    targetSpec = NO_REVIEW_TARGET,
+    requestContext
   }) {
     try {
       if (!profileParticipatesInReviewBinding(profile)) {
@@ -215,6 +246,13 @@ export function createReviewBinder({
         canonicalRepositoryKey: workspace.canonicalRepositoryKey,
         targetSpec,
         custodyExpectation
+      }, {
+        requestContext,
+        abortSignal: requestContext?.abortSignal,
+        deadlineAt: requestContext?.deadlineAt,
+        now: requestContext?.now,
+        schedule: requestContext?.schedule,
+        cancelSchedule: requestContext?.cancelSchedule
       });
       const collectedAt = now();
 
@@ -223,7 +261,8 @@ export function createReviewBinder({
         agentType: profile.id,
         targetSpec,
         current,
-        basis
+        basis,
+        requestContext
       });
 
       const reviewSubject = formatReviewSubjectBlock({
@@ -250,6 +289,7 @@ export function createReviewBinder({
         reasons: Object.freeze(current.status === "exact" ? [] : [...current.reasons])
       });
     } catch (error) {
+      if (requestStopped(error)) throw error;
       return unavailable(coherence ?? COHERENCE.NOT_ATTEMPTED,
         reasons({ code: "review_binding_internal_error", detail: error?.code || error?.name }));
     }
@@ -262,7 +302,8 @@ export function createReviewBinder({
     executionId,
     startedAt,
     completedAt,
-    publication
+    publication,
+    requestContext
   }) {
     try {
       if (!beforeState || beforeState.status === "unavailable") {
@@ -296,10 +337,18 @@ export function createReviewBinder({
       // The slot could have been reconciled away if this coordinator was ever
       // wrongly judged dead. If that happened the interval was not actually
       // held, and no receipt may claim it was.
-      const stillHeld = await coherentAdmission.verifyStillHeld({
-        executionId: beforeState.custodyExecutionId,
-        canonicalRootKey: workspace.canonicalRepositoryKey
-      });
+      requestContext?.assertActive?.("before-after-admission-verification");
+      const stillHeld = requestContext
+        ? await requestContext.observe("before-after-admission-verification", () => coherentAdmission.verifyStillHeld({
+            executionId: beforeState.custodyExecutionId,
+            canonicalRootKey: workspace.canonicalRepositoryKey,
+            requestContext
+          }))
+        : await coherentAdmission.verifyStillHeld({
+          executionId: beforeState.custodyExecutionId,
+          canonicalRootKey: workspace.canonicalRepositoryKey,
+          requestContext
+        });
       if (!stillHeld.held) {
         return Object.freeze({
           status: "unbound",
@@ -317,6 +366,13 @@ export function createReviewBinder({
         canonicalRepositoryKey: workspace.canonicalRepositoryKey,
         targetSpec: beforeState.targetSpec,
         custodyExpectation: { mode: "exclusive-held", executionId: beforeState.custodyExecutionId }
+      }, {
+        requestContext,
+        abortSignal: requestContext?.abortSignal,
+        deadlineAt: requestContext?.deadlineAt,
+        now: requestContext?.now,
+        schedule: requestContext?.schedule,
+        cancelSchedule: requestContext?.cancelSchedule
       });
       const afterAt = now();
 
@@ -346,10 +402,18 @@ export function createReviewBinder({
       // Collection verifies ownership at its start. Verify once more after the
       // exact snapshot has been assembled so the receipt covers the complete
       // claimed interval through AFTER, not merely the instant before it.
-      const heldThroughAfter = await coherentAdmission.verifyStillHeld({
-        executionId: beforeState.custodyExecutionId,
-        canonicalRootKey: workspace.canonicalRepositoryKey
-      });
+      requestContext?.assertActive?.("after-admission-verification");
+      const heldThroughAfter = requestContext
+        ? await requestContext.observe("after-admission-verification", () => coherentAdmission.verifyStillHeld({
+            executionId: beforeState.custodyExecutionId,
+            canonicalRootKey: workspace.canonicalRepositoryKey,
+            requestContext
+          }))
+        : await coherentAdmission.verifyStillHeld({
+          executionId: beforeState.custodyExecutionId,
+          canonicalRootKey: workspace.canonicalRepositoryKey,
+          requestContext
+        });
       if (!heldThroughAfter.held) {
         return Object.freeze({
           status: "unbound",
@@ -419,9 +483,11 @@ export function createReviewBinder({
           receipt,
           resultText: typeof outcome?.result === "string" ? outcome.result : "",
           publication,
-          awaitIndex: false
+          awaitIndex: false,
+          requestContext
         });
       } catch (error) {
+        if (requestStopped(error)) throw error;
         return unavailable(beforeState.coherence,
           reasons(error?.code === "review_receipt_publication_cancelled"
             ? { code: "review_receipt_publication_cancelled" }
@@ -445,16 +511,17 @@ export function createReviewBinder({
         receiptHistory: history
       });
     } catch (error) {
+      if (requestStopped(error)) throw error;
       return unavailable(beforeState?.coherence ?? COHERENCE.NOT_ATTEMPTED,
         reasons({ code: "review_binding_internal_error", detail: error?.code || error?.name }));
     }
   }
 
-  async function loadResultArtifact({ canonicalRootKey, receipt }) {
+  async function loadResultArtifact({ canonicalRootKey, receipt, requestContext }) {
     if (!receiptStore || typeof receiptStore.loadResultArtifact !== "function") {
       return Object.freeze({ status: "unavailable", error: "receipt_store_unavailable" });
     }
-    return await receiptStore.loadResultArtifact({ canonicalRootKey, receipt });
+    return await receiptStore.loadResultArtifact({ canonicalRootKey, receipt, requestContext });
   }
 
   return Object.freeze({ before, after, loadResultArtifact });

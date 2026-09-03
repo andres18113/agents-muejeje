@@ -1,6 +1,6 @@
 # claude-agents-mcp
 
-Version 0.2.0. This local STDIO MCP server lets Codex act as the Lead while using fresh Claude Code specialist runs for bounded delegated work. Codex validates returned evidence, runs deterministic gates, and owns the final verdict.
+Version 0.2.1 candidate. This local STDIO MCP server lets Codex act as the Lead while using fresh Claude Code specialist runs for bounded delegated work. Codex validates returned evidence, runs deterministic gates, and owns the final verdict.
 
 ## Public architecture
 
@@ -111,9 +111,13 @@ ReviewReceipt binds the committed state
           |
 Codex verifies FRESH
           |
-Codex cherry-picks the exact reviewed commit SHA into target repository
+Case A: target can fast-forward to reviewedCommitSha
           |
-target-branch deterministic gates
+target HEAD equals reviewedCommitSha; target freshness checks
+          |
+Case B: integration creates a new commit C'
+          |
+target gates, new bound review for C', and FRESH verification for C'
           |
 Codex final verdict
 ```
@@ -164,16 +168,21 @@ To bind the exact state intended for integration, Codex Lead delegates `code-rev
 ```
 `cwd` must be the exact specialist worktree `W`. The reviewer inspects the Git-visible `ChangeSet` where HEAD is now `$reviewedCommitSha`. The resulting `ReviewReceipt` binds this committed state and Codex verifies it is reported as `FRESH`. Reviewers remain strictly read-only and never execute Git write commands.
 
-### 5. Lead integration via cherry-pick
+### 5. Lead integration preserves or replaces review identity
 A worktree directory path is not a Git commit-ish. Never run `git merge <worktreeRoot>` or `git merge --squash <worktreeRoot>`. Do not use `git diff > changes.patch` as the canonical workflow because it can omit untracked files and PowerShell redirection introduces avoidable encoding differences.
 
-Codex Lead integrates the exact reviewed commit SHA into the target repository:
+**Case A — fast-forward is possible.** Preserve the reviewed identity:
 ```powershell
-git -C "<targetRepo>" cherry-pick $reviewedCommitSha
+git -C "<targetRepo>" merge --ff-only $reviewedCommitSha
+$targetHead = (git -C "<targetRepo>" rev-parse HEAD).Trim()
+if ($targetHead -ne $reviewedCommitSha) { throw "fast-forward did not preserve reviewed identity" }
 ```
+The existing receipt may remain applicable only subject to current target freshness checks.
+
+**Case B — target cannot fast-forward.** Any merge, cherry-pick, squash, rebase, or conflict resolution creates a distinct commit `C'`; in particular, cherry-pick normally does **not** preserve `$reviewedCommitSha`. Run deterministic target gates on `C'`, then run the required bound `code-review` and/or `security-review` on `C'`, verify `FRESH` for `C'`, and only then issue a final verdict. A conflict resolution always creates a new review subject and cannot inherit the old `FRESH` authorization.
 
 ### 6. Target-branch verification and final verdict
-Codex Lead reruns applicable target-branch verification gates in `<targetRepo>` after the cherry-pick. Codex Lead alone owns the final verdict before any push. The isolated worktree remains intact on disk for auditability.
+Codex Lead reruns applicable target-branch verification gates on the exact target HEAD being considered. Codex Lead alone owns the final verdict before any push. The isolated worktree remains intact on disk for auditability.
 
 ## Runtime behavior
 
@@ -201,9 +210,11 @@ The exact bound-review guarantee is:
 
 Only a successfully persisted `ReviewReceipt` makes that completed-interval claim. A receipt is written only for a completed execution when coherent admission is still verifiably held and the independently collected BEFORE and AFTER identities match. Collection, admission, persistence, or binding failure does not change the specialist's execution status or discard its text; it produces `ReviewBinding: unavailable` or `ReviewBinding: unbound` with reason codes instead.
 
-The AFTER binding runs under its own outer deadline, and a deadline observes work rather than stopping it. Receipt publication is therefore fenced across that boundary using the same rule Phase 5 applies to durable custody writes.
+The AFTER binding runs under the root request deadline, and a deadline observes work rather than proving it stopped. Receipt publication is therefore fenced across that boundary using the same rule Phase 5 applies to durable custody writes.
 
-The fence sits at exactly one place: the atomic rename that makes a receipt durable under `reviews/cs`. The cancellation check, the authority marker, and that rename are adjacent with no `await` between them, so a cancellation either lands before the check - and then no receipt can ever appear - or after authority was taken, and then the orchestrator must wait rather than release. There is no interleaving in which it does neither. Publication settlement is reported by the fence itself rather than by the binder returning, because a binder's return is not evidence about a write it merely issued.
+The publication order is exact: build and validate the receipt; persist and byte/SHA-256-verify the content-addressed result artifact; check cancellation; call `beginReceiptPublication()`; immediately invoke the authoritative `reviews/cs` rename with no `await` between marker and invocation; settle that rename; then perform non-evidentiary `reviews/sc` housekeeping. A pre-fence artifact failure leaves `publicationStarted == false`, no receipt, releasable custody, and no late-publication recovery. A rename conflict for an artifact is idempotent only after the existing target is readable and passes both exact-byte-count and SHA-256 checks; `EACCES` and `EPERM` alone prove nothing.
+
+The fence sits at exactly one place: the atomic rename that makes a receipt durable under `reviews/cs`. The cancellation check, authority marker, and rename invocation are adjacent, so cancellation either lands before authority and no receipt can ever appear, or after authority and the orchestrator must settle or retain custody. Publication settlement is reported by the fence itself rather than by the binder returning, because a binder's return is not evidence about a write it merely issued.
 
 The `reviews/sc` scope index is deliberately outside that boundary. It is non-evidentiary housekeeping that starts only after the receipt is already durable and is not awaited by publication, so a stalled or failing index can neither downgrade a receipt nor hold coherent-review custody open.
 
@@ -231,13 +242,13 @@ Durable evidence and non-evidentiary discovery are separate:
 
 The `cs` tree is authoritative immutable evidence. The bounded `sc` tree contains only lookup pointers keyed by stable review scope (reviewer profile plus declared target ref), not by the current `changeSetId`. This is why receipt A remains discoverable after the repository becomes B and can be validated and evaluated as `STALE`. A pointer is never trusted as evidence: its identifiers are strictly validated, its referenced receipt must validate, the receipt's full scope must match the lookup, and both content-addressed IDs are recomputed. At most 16 prior receipts are returned per discovery, the newest 32 pointers per scope are retained, and at most 64 immutable receipts are admitted per change set. Pointer pruning never deletes a receipt; failure to update the non-evidentiary index never downgrades or removes an already durable receipt. The system has no receipt retention or automatic cleanup.
 
-Because indexing failure is deliberately silent, an empty index is not evidence either. Nothing about an absent pointer distinguishes "no review ever happened" from "the pointer was never written", so discovery never answers `complete` from the index alone. Whenever the index does not fill the requested bound, the authoritative `cs` tree is swept under a hard bound for receipts in the same review scope. Recovered receipts are reported normally and marked `review_history_recovered_from_receipts`; a sweep stopped by its bound reports `review_history_recovery_truncated`, an entry it could not validate reports `review_history_recovery_unreadable`, and a tree it could not enumerate at all makes the history `indeterminate` with `review_history_recovery_failed`. The sweep is observational: it repairs no pointer, writes nothing, and never touches custody. Its practical effect is that a receipt orphaned by index failure or pruning stays discoverable and can still be evaluated `STALE`.
+Because indexing failure is deliberately silent, an empty or full index is not evidence either. The authoritative `cs` tree is always swept under its own hard bounds, even when the output list is already full. The output bound and the proof of authoritative exhaustiveness are separate: a newer unindexed receipt cannot be silently hidden behind a 16-entry result cap. Only a completed authoritative sweep can establish `complete`; a capped output is `partial` with `review_history_truncated`, and an interrupted or unreadable sweep reports `review_history_completeness_unproven` together with its stable recovery diagnostic. The sweep is observational: it repairs no pointer, writes nothing, and never touches custody.
 
-Receipt history is reported with an explicit completeness status, because an empty list has two very different meanings. `complete` means discovery ran and returned every receipt in scope - an empty `complete` history is a proven absence of prior reviews. `partial` means discovery ran but something was skipped or truncated: a dangling or lying pointer, a corrupt receipt, or a scope with more pointers than the bound returns. `indeterminate` means discovery could not be performed at all, so the history says nothing either way and must never be read as "no prior reviews exist". Every skip and truncation is reported as a bounded diagnostic code beside the receipts it excluded, and a skipped receipt that is still identifiable is itself listed as `INDETERMINATE` rather than dropped.
+Receipt history is reported with an explicit completeness status, because an empty list has two very different meanings. `complete` means the authoritative `cs` sweep established exhaustiveness within its configured recovery bounds and the output contains that result. `partial` means discovery ran but output or authoritative reasoning was truncated or unreadable. `indeterminate` means discovery could not be performed at all, so the history says nothing either way and must never be read as "no prior reviews exist". `reviews/sc` never proves `complete`.
 
 Freshness is computed and never stored. `FRESH` means the current exact identity matches the receipt. `STALE` means it differs and reports the changed sections. `INDETERMINATE` means the current state, receipt, or schema comparison cannot prove either answer. Contract, capability-policy, assignment, requested model, model strategy, and effort differences are reported as basis differences but never alter repository-state freshness. Prior receipts are reported; they never skip a new review or mutate/carry forward old evidence.
 
-Review binding can be disabled with `CLAUDE_AGENTS_REVIEW_BINDING=off`, which restores the Phase 5 review path: no review admission, collection, receipt, or binding output. `target_ref` is still validated at the public boundary.
+Review binding can be disabled with `CLAUDE_AGENTS_REVIEW_BINDING=off`, which disables new review binding generation. Historical `reconcile_only` remains a read-only receipt and current-ChangeSet observation, so existing durable receipts remain recoverable without acquiring coherent-review custody. `target_ref` is still validated at the public boundary.
 
 The honest limits are:
 
@@ -299,7 +310,7 @@ An `ORPHANED` or retained outcome is meant to be acted on without reading the du
 
 - `CLAUDE_AGENTS_MODEL` — Claude backend model; defaults to `opus`.
 - `CLAUDE_AGENTS_CLAUDE_BIN` — Claude executable; defaults to `claude`.
-- `CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS` — explicit delegated-call timeout override; otherwise the selected profile timeout applies.
+- `CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS` — explicit useful-work timeout override; it must be a positive integer no greater than the supported 30-minute project maximum. An unsafe override is rejected and `diagnose` reports the effective override rather than only registry defaults.
 - `CLAUDE_AGENTS_MAX_CAPTURE_BYTES` — stdout/stderr capture limit; defaults to 2 MiB.
 - `CLAUDE_AGENTS_REVIEW_BINDING` — `on` (default) enables coherent review binding; `off` restores the Phase 5 review path.
 
@@ -321,7 +332,7 @@ Layer 3: Specialist Useful-Work Execution Deadline (max profile timeout = 1800s)
    Codex's outer timeout envelope controls how long Codex will wait for a `tools/call` response before abandoning the call. By default, Codex terminates tool calls after 300 seconds (5 minutes). Because complex code and security reviews on realistic repositories can run for 10–30 minutes, `install-codex.ps1` explicitly configures `tool_timeout_sec = 3600` (60 minutes) under `[mcp_servers.claude-agents]` in `~/.codex/config.toml`.
 
 2. **Maximum bounded MCP call lifetime (`2415s` = 40.25 minutes)**:
-   The total synchronous duration of an MCP tool call comprises Claude's useful-work execution plus a strictly bounded **synchronous settlement budget** of `615s` (10.25 minutes). This settlement budget accounts for every possible post-execution or pre-execution lifecycle phase:
+   `delegate_agent` creates one root request context at entry: `{ deadlineAt, abortSignal, now }`. Its maximum lifetime is the effective useful-work timeout plus a strictly bounded **synchronous settlement budget** of `615s` (10.25 minutes), currently `2415s` (40.25 minutes) at the supported 30-minute maximum. CWD/workspace and repository identity resolution, admission, worktree preparation, target and ChangeSet observation, history recovery, artifact loading, runner supervision, AFTER binding, publication, and settlement all consume this one envelope. Useful work is clipped to leave the settlement reserve; after cancellation or the root deadline, no new evidence observation, Git/worktree action, admission, or receipt publication begins. The reserved settlement path is limited to quiescing already-issued work and terminalizing already-admitted custody so cancellation cannot leak ownership. This budget accounts for:
    - Git repository state and common directory inspection (180s)
    - Process identity confirmation (20s)
    - ChangeSet BEFORE collection deadline (180s)
@@ -351,8 +362,8 @@ If the outer client deadline is shorter than the MCP execution and settlement li
 
 To guarantee that client abandonment never occurs during normal execution, `src/timeout-policy.mjs` provides a machine-checked invariant:
 
-$$\text{Outer Client Timeout} \ge \text{Max Profile Timeout} + \text{Settlement Budget}$$
-$$3600\text{s} \ge 1800\text{s} + 615\text{s} = 2415\text{s}$$
+$$\text{Outer Client Timeout} > \text{Effective Delegate Useful Work} + \text{Settlement Budget}$$
+$$3600\text{s} > 1800\text{s} + 615\text{s} = 2415\text{s}$$
 
 ### Late-receipt discovery and reconciliation (zero Claude delegated quota)
 
@@ -373,12 +384,12 @@ Codex Lead can discover, verify, and reconcile that review receipt immediately w
 ```
 
 > [!NOTE]
-> `reconcile_only: true` is the sole explicit signal that activates reconciliation mode. `task` remains ordinary descriptive assignment/context text and never silently selects an execution mode. Non-review profiles reject `reconcile_only`.
+> `reconcile_only: true` is the sole explicit signal that activates reconciliation mode. `task` remains ordinary descriptive assignment/context text and never silently selects an execution mode. Non-review profiles reject `reconcile_only`. It has a finite root deadline and is custody-free: it observes history and the current ChangeSet; it does not create a new review.
 
 #### What `reconcile_only` does and does not do:
 
 1. **Observational read-only check**: Collects the live `ChangeSet` from the repository without acquiring write custody.
-2. **Authoritative receipt lookup**: Sweeps the durable review receipt store for the matching repository, target ref, and review profile scope.
+2. **Authoritative receipt lookup**: Sweeps the durable review receipt store for the matching repository, target ref, and review profile scope. With no `review_id`, zero FRESH receipts yields no applicable receipt, one FRESH receipt is recovered, and more than one FRESH receipt is `AMBIGUOUS` and is never selected silently. With `review_id: "rr1:<sha256>"`, only the exact receipt may be recovered; a repository, profile, or target-scope mismatch fails closed.
 3. **Independent binding vs. freshness**:
    - `reviewBinding.status` reflects historical binding: `"bound"` if a receipt is found for the historical scope, `"unavailable"` if no receipt is found or history is indeterminate. (Binding status is never `"stale"`).
    - Freshness is independently evaluated against current live state: `"FRESH"`, `"STALE"`, or `"INDETERMINATE"`.

@@ -578,7 +578,7 @@ test("runtime resolution uses the configured backend with profile effort and tim
       resolveAgentRuntime(AGENT_REGISTRY.explore, {
         env: { CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS: "2147483648" }
       }),
-    /no greater than 2147483647 milliseconds/
+    /no greater than 1800000 milliseconds/
   );
   assert.throws(
     () =>
