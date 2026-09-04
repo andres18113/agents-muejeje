@@ -6,6 +6,8 @@
  * boundary the rest of the server imports:
  *   - custody/record-schema     what a durable record may legally look like
  *   - custody/durable-store     how that record reaches and leaves the disk
+ *   - custody/publication-retry when an issued publication rename may be
+ *                               attempted again, and on what host conditions
  *   - custody/reconciliation-policy  what a live coordinator may conclude about
  *                               a record another coordinator left behind
  *   - custody/custody-manager   the state machine that drives the three
@@ -27,6 +29,11 @@ export {
   repositoryStateDirectoryIn,
   worktreeDirectoryIn
 } from "./custody/durable-store.mjs";
+export {
+  PUBLICATION_ATTEMPT,
+  WINDOWS_TRANSIENT_RENAME_CODES,
+  createPublicationRetryPolicy
+} from "./custody/publication-retry.mjs";
 export { DurableWriteCustodyManager } from "./custody/custody-manager.mjs";
 
 import { DurableWriteCustodyManager } from "./custody/custody-manager.mjs";

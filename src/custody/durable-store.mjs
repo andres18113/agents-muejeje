@@ -9,6 +9,11 @@ import {
   samePublicationAuthority,
   validIdentityString
 } from "./record-schema.mjs";
+import {
+  DEFAULT_PUBLICATION_RETRY_POLICY,
+  PUBLICATION_ATTEMPT,
+  withBoundedPublicationRetry
+} from "./publication-retry.mjs";
 
 /**
  * How durable ownership reaches the filesystem, and how it is read back.
@@ -23,6 +28,13 @@ import {
  * The publication boundary is one rename() call. Everything before it may be
  * cancelled without effect; once it is issued it may still land, so callers
  * keep their mutation queue occupied until it settles.
+ *
+ * That boundary may be attempted more than once. A Windows host can reject an
+ * issued rename outright with a sharing violation, which settles the attempt
+ * without moving anything, and publication-retry bounds how often this module
+ * may try again. Each try re-runs the whole operation - fresh authoritative
+ * observation, revalidated authority, cancellation recheck - so a retry is a
+ * newly authorized publication and never a replay of a stale one.
  */
 
 const STATE_DIRECTORY_NAME = "claude-agents-mcp";
@@ -143,6 +155,41 @@ export function mutationWasCancelled(signal) {
   return signal?.aborted === true;
 }
 
+/**
+ * Issues one publication rename and reports which state the attempt settled in.
+ *
+ * The guard is raised immediately before the call and deliberately never
+ * lowered: while a bounded retry sequence is still running another rename may
+ * still be issued, so the repository's mutation queue must stay occupied for
+ * the whole sequence rather than for one attempt.
+ *
+ * `observeIssued` is the existing test seam for pausing between an issued
+ * rename and its settlement.
+ */
+async function issuePublicationRename(from, to, {
+  renamePath,
+  publicationGuard,
+  observeIssued,
+  onAttemptState
+}) {
+  onAttemptState?.(PUBLICATION_ATTEMPT.NOT_ISSUED);
+  if (publicationGuard) publicationGuard.publicationStarted = true;
+  onAttemptState?.(PUBLICATION_ATTEMPT.ISSUED);
+  const publication = renamePath(from, to);
+  // Keep a rejection observed while a test intentionally pauses after the OS
+  // rename has been issued. The original promise is still awaited below, so its
+  // outcome remains authoritative to the mutation caller.
+  void publication.catch(() => {});
+  if (typeof observeIssued === "function") await observeIssued();
+  try {
+    await publication;
+  } catch (error) {
+    onAttemptState?.(PUBLICATION_ATTEMPT.SETTLED_FAILED, error);
+    throw error;
+  }
+  onAttemptState?.(PUBLICATION_ATTEMPT.SETTLED_PUBLISHED);
+}
+
 export function cancelledMutationError() {
   return new WriteCustodyError("Durable custody mutation authority was invalidated before publication.", {
     code: "write_custody_mutation_cancelled"
@@ -215,6 +262,14 @@ export function settleAdmissionPublication(fence, { disposition, record } = {}) 
  * renamed into place, so the ownership directory never exists in a partially
  * written state. Returns false when another coordinator won the same rename;
  * that is a normal race outcome, not an error.
+ *
+ * Admission is the one publication whose conflict and whose transient host
+ * failure arrive as the same errno: Windows reports both a directory that is
+ * already there and a directory something is momentarily holding as EPERM. The
+ * errno therefore decides nothing here. A fresh observation of the ownership
+ * slot does: still absent means the host refused a rename that could have
+ * succeeded, and may be attempted again; present means a competitor won, which
+ * is an ordinary conflict this function reports and never overwrites.
  */
 export async function createOwnershipReservation({
   repositoryState,
@@ -223,7 +278,9 @@ export async function createOwnershipReservation({
   mutationSignal,
   publicationGuard,
   admissionFence,
-  afterPublicationIssued
+  afterPublicationIssued,
+  renamePath = rename,
+  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
 }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   if (await exists(ownershipDirectory, { mutationSignal })) return false;
@@ -238,28 +295,42 @@ export async function createOwnershipReservation({
       JSON.stringify(record, null, 2) + "\n",
       { mutationSignal }
     );
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    // The next synchronous rename call is the admission publication boundary.
-    // Once it is issued it can still create durable ownership even after the
-    // caller's deadline fires, so the mutation queue must stay occupied until
-    // it settles and the caller must be told the boundary was crossed.
-    if (publicationGuard) publicationGuard.publicationStarted = true;
-    beginAdmissionPublication(admissionFence);
-    const publication = rename(temporaryDirectory, ownershipDirectory);
-    // Keep a rejection observed while a test intentionally pauses after the OS
-    // rename has been issued. The original promise is still awaited below, so
-    // its outcome remains authoritative to the mutation caller.
-    void publication.catch(() => {});
-    if (typeof afterPublicationIssued === "function") {
-      await afterPublicationIssued({ nextRecord: recordSnapshot(record) });
-    }
-    try {
-      await publication;
-    } catch (error) {
-      if (!errorIsPathConflict(error)) {
-        settleAdmissionPublication(admissionFence, { disposition: "failed" });
+    const admitted = await withBoundedPublicationRetry(async () => {
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      // The expected state for admission is an absent slot, so this is the
+      // compare step and it is repeated in full before every attempt.
+      if (await exists(ownershipDirectory, { mutationSignal })) return { conflict: true };
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      try {
+        await issuePublicationRename(temporaryDirectory, ownershipDirectory, {
+          renamePath,
+          publicationGuard,
+          observeIssued: typeof afterPublicationIssued === "function"
+            ? () => afterPublicationIssued({ nextRecord: recordSnapshot(record) })
+            : undefined,
+          onAttemptState: (state) => {
+            if (state === PUBLICATION_ATTEMPT.ISSUED) beginAdmissionPublication(admissionFence);
+          }
+        });
+      } catch (error) {
+        if (!errorIsPathConflict(error)) throw error;
+        // A conflict-shaped rejection proves nothing on its own. Ask the slot.
+        if (await exists(ownershipDirectory, { mutationSignal })) return { conflict: true };
+        // Still free: the host refused, not a competitor. Let the retry policy
+        // decide whether this is one of its transient codes.
         throw error;
       }
+      return { published: true };
+    }, {
+      policy: retryPolicy,
+      mutationSignal,
+      cancelled: mutationWasCancelled,
+      cancelledError: cancelledMutationError
+    }).catch((error) => {
+      settleAdmissionPublication(admissionFence, { disposition: "failed" });
+      throw error;
+    });
+    if (admitted.conflict) {
       settleAdmissionPublication(admissionFence, { disposition: "conflict" });
       return false;
     }
@@ -288,6 +359,12 @@ export async function createOwnershipReservation({
  * was built from, and must still belong to the same execution. A cancelled
  * mutation is refused at every checkpoint up to the rename; after the rename is
  * issued, cancellation can no longer unmake it.
+ *
+ * The compare step belongs to the attempt, not to the operation, so a retry
+ * after a transient host rejection reads the authoritative record again and
+ * revalidates the same authority. A record that moved on while this mutation
+ * was backing off loses its CAS exactly as it would have lost it on the first
+ * attempt; no stale writer can reach the slot through a retry.
  */
 export async function publishRecord({
   repositoryState,
@@ -297,7 +374,9 @@ export async function publishRecord({
   beforePublish,
   afterPublicationIssued,
   mutationSignal,
-  publicationGuard
+  publicationGuard,
+  renamePath = rename,
+  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
 }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   if (
@@ -322,37 +401,41 @@ export async function publishRecord({
         nextRecord: recordSnapshot(record)
       });
     }
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    const current = await readAuthoritativeRecord(ownershipDirectory);
-    if (current.executionId !== record.executionId) {
-      throw new WriteCustodyError("Only the durable owning execution may update custody.", {
-        code: "write_custody_owner_mismatch"
+    await withBoundedPublicationRetry(async () => {
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      const current = await readAuthoritativeRecord(ownershipDirectory);
+      if (current.executionId !== record.executionId) {
+        throw new WriteCustodyError("Only the durable owning execution may update custody.", {
+          code: "write_custody_owner_mismatch"
+        });
+      }
+      if (!samePublicationAuthority(current, expectedRecord)) {
+        throw new WriteCustodyError("Durable ownership changed before this mutation could publish.", {
+          code: "write_custody_stale_mutation"
+        });
+      }
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      // The next synchronous rename call is the publication boundary. Once it
+      // is issued it can still publish even if a caller's deadline fires. The
+      // mutation queue must then remain occupied until rename settles. Before
+      // that boundary an aborted lifecycle mutation has no publication
+      // authority and may safely stop blocking terminal recovery behind it.
+      await issuePublicationRename(temporaryPath, path.join(ownershipDirectory, RECORD_FILE_NAME), {
+        renamePath,
+        publicationGuard,
+        observeIssued: typeof afterPublicationIssued === "function"
+          ? () => afterPublicationIssued({
+              expectedRecord: recordSnapshot(expectedRecord),
+              nextRecord: recordSnapshot(record)
+            })
+          : undefined
       });
-    }
-    if (!samePublicationAuthority(current, expectedRecord)) {
-      throw new WriteCustodyError("Durable ownership changed before this mutation could publish.", {
-        code: "write_custody_stale_mutation"
-      });
-    }
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    // The next synchronous rename call is the publication boundary. Once it
-    // is issued it can still publish even if a caller's deadline fires. The
-    // mutation queue must then remain occupied until rename settles. Before
-    // that boundary an aborted lifecycle mutation has no publication
-    // authority and may safely stop blocking terminal recovery behind it.
-    if (publicationGuard) publicationGuard.publicationStarted = true;
-    const publication = rename(temporaryPath, path.join(ownershipDirectory, RECORD_FILE_NAME));
-    // Keep a rejection observed while a test intentionally pauses after the
-    // OS rename has been issued. The original promise is still awaited below
-    // so its failure remains authoritative to the mutation caller.
-    void publication.catch(() => {});
-    if (typeof afterPublicationIssued === "function") {
-      await afterPublicationIssued({
-        expectedRecord: recordSnapshot(expectedRecord),
-        nextRecord: recordSnapshot(record)
-      });
-    }
-    await publication;
+    }, {
+      policy: retryPolicy,
+      mutationSignal,
+      cancelled: mutationWasCancelled,
+      cancelledError: cancelledMutationError
+    });
   } catch (error) {
     if (error instanceof WriteCustodyError) throw error;
     throw new WriteCustodyError("Failed to persist durable ownership state.", {
@@ -373,62 +456,95 @@ export async function publishRecord({
  * A partially completed archive from an earlier attempt is recognized and
  * treated as done only when the history holds exactly this released record and
  * the ownership slot is genuinely gone. Any other combination is ambiguous.
+ *
+ * That rule is what a retry leans on. An errno alone never establishes that the
+ * archive already happened: the destination is read back and must hold exactly
+ * this released record, with the ownership slot genuinely gone, before the
+ * archive is called done. Every retry also revalidates the ownership record's
+ * authority, so a slot that changed hands during a backoff is refused.
  */
-export async function archiveOwnership({ repositoryState, record, mutationSignal, publicationGuard }) {
+export async function archiveOwnership({
+  repositoryState,
+  record,
+  mutationSignal,
+  publicationGuard,
+  renamePath = rename,
+  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
+}) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   const historyDirectory = executionHistoryDirectoryIn(repositoryState, record.executionId);
   if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(path.dirname(historyDirectory), { recursive: true });
   if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+  // An archive that already exists is accepted only on exact evidence, never on
+  // the mere fact that the destination path is occupied.
+  const settledArchive = async () => {
+    if (!(await exists(historyDirectory, { mutationSignal }))) return undefined;
+    if (await exists(ownershipDirectory, { mutationSignal })) return undefined;
+    const archived = await readAuthoritativeRecord(historyDirectory);
+    if (!samePublicationAuthority(archived, record) || archived.state !== "RELEASED") return undefined;
+    return recordSnapshot(archived);
+  };
   if (await exists(historyDirectory, { mutationSignal })) {
-    if (!(await exists(ownershipDirectory, { mutationSignal }))) {
-      const archived = await readAuthoritativeRecord(historyDirectory);
-      if (samePublicationAuthority(archived, record) && archived.state === "RELEASED") {
-        return recordSnapshot(archived);
-      }
-    }
+    const alreadyArchived = await settledArchive();
+    if (alreadyArchived) return alreadyArchived;
     throw new WriteCustodyError("Durable execution history already exists; release is ambiguous.", {
       code: "write_custody_state_ambiguous"
     });
   }
+  let archivedByRetry;
   try {
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    const current = await readAuthoritativeRecord(ownershipDirectory);
-    if (current.executionId !== record.executionId) {
-      throw new WriteCustodyError("Only the durable owning execution may archive custody.", {
-        code: "write_custody_owner_mismatch"
+    archivedByRetry = await withBoundedPublicationRetry(async ({ isRetry }) => {
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      if (isRetry) {
+        // A previous attempt was rejected without moving anything, but the
+        // destination is rechecked anyway before this one is authorized.
+        const alreadyArchived = await settledArchive();
+        if (alreadyArchived) return alreadyArchived;
+        if (await exists(historyDirectory, { mutationSignal })) {
+          throw new WriteCustodyError("Durable execution history already exists; release is ambiguous.", {
+            code: "write_custody_state_ambiguous"
+          });
+        }
+      }
+      const current = await readAuthoritativeRecord(ownershipDirectory);
+      if (current.executionId !== record.executionId) {
+        throw new WriteCustodyError("Only the durable owning execution may archive custody.", {
+          code: "write_custody_owner_mismatch"
+        });
+      }
+      if (!samePublicationAuthority(current, record)) {
+        throw new WriteCustodyError("Durable ownership changed before release could be archived.", {
+          code: "write_custody_stale_mutation"
+        });
+      }
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      // Archiving is the final durable handoff boundary. Once this rename is
+      // issued, a root cancellation cannot prove whether it landed, so the
+      // manager's mutation queue must remain occupied until it settles.
+      await issuePublicationRename(ownershipDirectory, historyDirectory, {
+        renamePath,
+        publicationGuard
       });
-    }
-    if (!samePublicationAuthority(current, record)) {
-      throw new WriteCustodyError("Durable ownership changed before release could be archived.", {
-        code: "write_custody_stale_mutation"
-      });
-    }
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    // Archiving is the final durable handoff boundary. Once this rename is
-    // issued, a root cancellation cannot prove whether it landed, so the
-    // manager's mutation queue must remain occupied until it settles.
-    if (publicationGuard) publicationGuard.publicationStarted = true;
-    const publication = rename(ownershipDirectory, historyDirectory);
-    void publication.catch(() => {});
-    await publication;
+      return undefined;
+    }, {
+      policy: retryPolicy,
+      mutationSignal,
+      cancelled: mutationWasCancelled,
+      cancelledError: cancelledMutationError
+    });
   } catch (error) {
     if (error instanceof WriteCustodyError) throw error;
     if (error?.code === "ENOENT") {
-      if (!(await exists(ownershipDirectory, { mutationSignal })) &&
-          await exists(historyDirectory, { mutationSignal })) {
-        const archived = await readAuthoritativeRecord(historyDirectory);
-        if (samePublicationAuthority(archived, record) && archived.state === "RELEASED") {
-          return recordSnapshot(archived);
-        }
-      }
+      const alreadyArchived = await settledArchive();
+      if (alreadyArchived) return alreadyArchived;
     }
     throw new WriteCustodyError("Failed to archive released ownership state.", {
       code: "write_custody_release_failed",
       cause: error
     });
   }
-  return recordSnapshot(record);
+  return archivedByRetry ?? recordSnapshot(record);
 }
 
 /**

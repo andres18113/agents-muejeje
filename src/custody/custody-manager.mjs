@@ -74,6 +74,8 @@ export class DurableWriteCustodyManager {
   #createNonce;
   #beforePublish;
   #afterPublicationIssued;
+  #renamePath;
+  #retryPolicy;
   // Each manager represents one live coordinator. A repository's authoritative
   // read/validate/publish/archive transaction is serialized here, but external
   // process observation is deliberately performed before entering this queue.
@@ -98,7 +100,13 @@ export class DurableWriteCustodyManager {
     // Test seam for observing a rename that has already been issued but has
     // not yet settled. It verifies post-boundary cancellation keeps the
     // repository mutation queue occupied until actual quiescence.
-    afterPublicationIssued
+    afterPublicationIssued,
+    // Test seam for the publication syscall itself, so the bounded retry of a
+    // transient host rejection can be exercised deterministically.
+    renamePath,
+    // Overrides the bounded publication-retry policy. Production uses the
+    // default, which is a single attempt off Windows.
+    retryPolicy
   } = {}) {
     this.#stateRoot = path.resolve(stateRoot || defaultDurableStateRoot({ env, platform }));
     this.#inspectProcess = inspectProcess;
@@ -107,6 +115,19 @@ export class DurableWriteCustodyManager {
     this.#createNonce = createNonce;
     this.#beforePublish = beforePublish;
     this.#afterPublicationIssued = afterPublicationIssued;
+    this.#renamePath = renamePath;
+    this.#retryPolicy = retryPolicy;
+  }
+
+  /**
+   * The publication seams every authoritative rename in this manager shares.
+   * Undefined entries fall back to the store's own production defaults.
+   */
+  #publicationSeams() {
+    return {
+      ...(this.#renamePath ? { renamePath: this.#renamePath } : {}),
+      ...(this.#retryPolicy ? { retryPolicy: this.#retryPolicy } : {})
+    };
   }
 
   get stateRoot() {
@@ -221,7 +242,8 @@ export class DurableWriteCustodyManager {
           mutationSignal,
           publicationGuard,
           admissionFence,
-          afterPublicationIssued: this.#afterPublicationIssued
+          afterPublicationIssued: this.#afterPublicationIssued,
+          ...this.#publicationSeams()
         });
         return created ? recordSnapshot(record) : undefined;
       }, { mutationSignal });
@@ -630,7 +652,8 @@ export class DurableWriteCustodyManager {
       repositoryState: this.repositoryStateDirectory(record.canonicalRootKey),
       record,
       mutationSignal,
-      publicationGuard
+      publicationGuard,
+      ...this.#publicationSeams()
     });
   }
 
@@ -695,7 +718,8 @@ export class DurableWriteCustodyManager {
       beforePublish: this.#beforePublish,
       afterPublicationIssued: this.#afterPublicationIssued,
       mutationSignal,
-      publicationGuard
+      publicationGuard,
+      ...this.#publicationSeams()
     });
   }
 
