@@ -24,6 +24,8 @@
 - The PreToolUse hook is an additional policy layer, never the sole gate; a hook timeout is absence, not denial, and must not be described or tested as fail-closed.
 - Commands are classified by their effective executable, so wrappers (`command`, `builtin`, `env`, `timeout`, `nice`, `nohup`, `stdbuf`, `time`, `exec`, `xargs`) cannot launder a denied program. An unresolvable wrapper is refused.
 - Native Windows Bash is not an OS sandbox. A shell blocklist does not constrain what a permitted `node`/`python`/`npm` child then does.
+- A stronger boundary must come from outside the process: WSL2, a container, a VM, or a constrained executor. This project provides none and claims none.
+- `diagnose` reports Claude runtime readiness as one of unavailable / incompatible-version / missing-required-capability / malformed-version / ready. Executable presence alone is never readiness, because production launches with `--restricted`.
 
 ## Integration Contract
 
