@@ -54,11 +54,40 @@ function recordingStore() {
   };
 }
 
+/**
+ * These fixtures describe a clean worktree with a resolved target, which is a
+ * committed review: the committed delta is the whole subject. The binder must
+ * therefore be given that delta, exactly as production gives it, or it will
+ * correctly refuse to bind a receipt to a subject the reviewer never saw.
+ */
+function completeCommittedEvidence(overrides = {}) {
+  return Object.freeze({
+    schema: "claude-agents-mcp/review-evidence/v1",
+    kind: "committed-delta",
+    completeness: "complete",
+    repositoryId: "b".repeat(64),
+    base: Object.freeze({ ref: "refs/remotes/origin/main", commit: "2".repeat(40) }),
+    head: "3".repeat(40),
+    mergeBase: "2".repeat(40),
+    range: "2".repeat(40) + ".." + "3".repeat(40),
+    files: Object.freeze([Object.freeze({ status: "M", path: "bug.js", originPath: null, binary: false })]),
+    filesTotal: 1,
+    filesTruncated: false,
+    patch: ["--- a/bug.js", "+++ b/bug.js", ""].join(String.fromCharCode(10)),
+    patchBytes: 26,
+    patchTruncated: false,
+    patchSha256: "c".repeat(64),
+    reasons: Object.freeze([]),
+    ...overrides
+  });
+}
+
 function binderWith({
   collections = [exactCollection(), exactCollection()],
   store = recordingStore(),
   held = true,
-  stillHeld = { held: true }
+  stillHeld = { held: true },
+  committedEvidence = completeCommittedEvidence()
 } = {}) {
   const queue = [...collections];
   const observed = { collectCalls: [] };
@@ -73,6 +102,7 @@ function binderWith({
         : async () => stillHeld
     },
     receiptStore: store,
+    collectCommittedEvidenceFn: async () => committedEvidence,
     now: () => 1_000
   });
   return { binder, store, observed, coherence: held ? COHERENCE.HELD : COHERENCE.DENIED };

@@ -7,6 +7,12 @@ import { assignmentBasis, resultBasis, reviewerBasis } from "./receipt-basis.mjs
 import { buildReviewReceipt, COHERENT_ADMISSION_KIND } from "./receipt-schema.mjs";
 import { evaluateFreshness } from "./freshness.mjs";
 import { formatReviewSubjectBlock } from "./review-subject.mjs";
+import {
+  EVIDENCE_COMPLETENESS,
+  collectCommittedReviewEvidence,
+  formatCommittedEvidenceBlock,
+  reviewEvidenceIdentity
+} from "./committed-evidence.mjs";
 import { RECEIPT_PRODUCER_VERSION } from "../version.mjs";
 
 /**
@@ -32,6 +38,29 @@ import { RECEIPT_PRODUCER_VERSION } from "../version.mjs";
 
 export const REVIEW_BINDING_CAPABILITY = "inspect-change-set";
 export const DEFAULT_RECEIPT_PRODUCER_VERSION = RECEIPT_PRODUCER_VERSION;
+
+/**
+ * Committed evidence is only meaningful for a review that names a base. When
+ * the worktree carries the change set itself, the change set is the subject and
+ * no committed delta is claimed; when it is clean and a target is declared, the
+ * committed delta is the only possible subject and its absence is a refusal
+ * rather than an empty review.
+ */
+function committedReviewIsApplicable(targetSpec, current) {
+  if (targetSpec?.kind !== "ref") return false;
+  // Positive evidence only. A committed review is the case where a base is
+  // declared and the worktree provably carries no changes of its own, so the
+  // committed delta is the entire subject. If the worktree state is unknown,
+  // that is not established, and the ordinary path keeps its own semantics
+  // rather than being forced through a basis it never had.
+  if (current?.status !== "exact") return false;
+  const counts = current.descriptor?.summary?.counts;
+  if (!counts) return false;
+  return counts.index === 0 &&
+    counts.worktree === 0 &&
+    counts.unmerged === 0 &&
+    counts.untracked === 0;
+}
 
 export function profileParticipatesInReviewBinding(profile) {
   return Boolean(profile?.declaredCapabilities?.includes(REVIEW_BINDING_CAPABILITY));
@@ -109,9 +138,39 @@ export function createReviewBinder({
   coherentAdmission,
   receiptStore,
   evaluateFreshnessFn = evaluateFreshness,
+  collectCommittedEvidenceFn = collectCommittedReviewEvidence,
   now = Date.now,
   producerVersion = DEFAULT_RECEIPT_PRODUCER_VERSION
 } = {}) {
+
+  /**
+   * Produces the committed delta when one is the review's actual subject.
+   *
+   * A failure here never throws: an unavailable basis is a fact this review has
+   * to report and act on, not a reason to lose the review.
+   */
+  async function collectCommittedEvidence({ workspace, targetSpec, current, requestContext }) {
+    if (!committedReviewIsApplicable(targetSpec, current)) return undefined;
+    try {
+      return await collectCommittedEvidenceFn({
+        repositoryRoot: workspace.repositoryRoot,
+        repositoryId: repositoryIdForCanonicalRootKey(workspace.canonicalRepositoryKey),
+        target: { spec: targetSpec },
+        requestContext
+      });
+    } catch (error) {
+      if (requestStopped(error)) throw error;
+      return Object.freeze({
+        schema: "claude-agents-mcp/review-evidence/v1",
+        kind: "committed-delta",
+        completeness: EVIDENCE_COMPLETENESS.UNAVAILABLE,
+        reasons: Object.freeze([Object.freeze({
+          code: "committed_evidence_failed",
+          detail: error?.code || error?.name
+        })])
+      });
+    }
+  }
 
   /**
    * Discovers prior receipts for this review scope and evaluates each against
@@ -266,16 +325,31 @@ export function createReviewBinder({
         requestContext
       });
 
-      const reviewSubject = formatReviewSubjectBlock({
-        status: current.status,
-        coherence,
-        changeSetId: current.changeSetId,
-        descriptor: current.descriptor,
-        reasons: current.reasons
+      // A reviewer cannot run Git. On a clean committed worktree the change set
+      // is empty by definition, so without this the reviewer would be asked to
+      // review commit B against base A while being shown nothing at all - and
+      // would have to be handed a diff by a human to say anything true.
+      const committedEvidence = await collectCommittedEvidence({
+        workspace,
+        targetSpec,
+        current,
+        requestContext
       });
+      const reviewSubject = [
+        formatReviewSubjectBlock({
+          status: current.status,
+          coherence,
+          changeSetId: current.changeSetId,
+          descriptor: current.descriptor,
+          reasons: current.reasons
+        }),
+        ...(committedEvidence ? ["", formatCommittedEvidenceBlock(committedEvidence)] : [])
+      ].join("\n");
 
       return Object.freeze({
         status: current.status === "exact" ? "collected" : "indeterminate",
+        committedEvidence,
+        evidenceIdentity: committedEvidence ? reviewEvidenceIdentity(committedEvidence) : undefined,
         coherence,
         custodyExecutionId,
         targetSpec,
@@ -427,9 +501,34 @@ export function createReviewBinder({
         });
       }
 
+      // A committed review whose basis was never established, or was trimmed,
+      // has no complete subject. Binding a receipt to it would assert that a
+      // result covers a delta the reviewer was not shown, which is the one
+      // claim this whole mechanism exists to make impossible. The review's
+      // findings are still returned; only the durable claim is refused.
+      const evidenceIdentity = beforeState.evidenceIdentity;
+      if (beforeState.committedEvidence &&
+          beforeState.committedEvidence.completeness !== EVIDENCE_COMPLETENESS.COMPLETE) {
+        return Object.freeze({
+          status: "unbound",
+          coherence: beforeState.coherence,
+          reasons: Object.freeze([
+            { code: "insufficient_review_scope" },
+            ...(beforeState.committedEvidence.completeness === EVIDENCE_COMPLETENESS.TRUNCATED
+              ? [{ code: "committed_evidence_truncated" }]
+              : (beforeState.committedEvidence.reasons ?? []).map((reason) => ({ ...reason })))
+          ]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          afterChangeSetId: afterState.changeSetId,
+          priorReviews,
+          receiptHistory: history
+        });
+      }
+
       const descriptor = afterState.descriptor;
       const recordedAt = now();
       const receipt = buildReviewReceipt({
+        ...(evidenceIdentity ? { evidence: evidenceIdentity } : {}),
         binding: {
           changeSetId: afterState.changeSetId,
           objectFormat: descriptor.objectFormat,

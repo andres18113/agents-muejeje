@@ -505,6 +505,9 @@ function buildDefaultReviewBinder({ dependencies, writeCustody, requestContext }
     receiptStore: dependencies.receiptStore || new ReviewReceiptStore({
       stateRoot: writeCustody.stateRoot
     }),
+    ...(dependencies.collectCommittedEvidence
+      ? { collectCommittedEvidenceFn: dependencies.collectCommittedEvidence }
+      : {}),
     ...(requestContext?.now ? { now: requestContext.now } : {})
   }));
 }

@@ -91,6 +91,28 @@ export function computeReviewId(bodyWithoutReviewId) {
   return REVIEW_ID_PREFIX + ":" + sha256Hex(Buffer.from(canonicalJson(bodyWithoutReviewId), "utf8"));
 }
 
+/**
+ * The evidence identity a receipt may bind.
+ *
+ * It is deliberately a digest and a completeness statement rather than the
+ * evidence itself: a receipt is a small immutable claim, and embedding a patch
+ * in it would make the claim's size depend on the change it describes. The
+ * digest is enough to answer the question the receipt exists to answer - which
+ * committed delta was this result produced from - and enough to refuse a
+ * receipt whose basis has been swapped.
+ */
+export const REVIEW_EVIDENCE_IDENTITY_SCHEMA = "claude-agents-mcp/review-evidence/v1";
+const EVIDENCE_KINDS = new Set(["committed-delta"]);
+const EVIDENCE_COMPLETENESS_VALUES = new Set(["complete", "truncated", "unavailable"]);
+
+function validEvidenceIdentity(evidence) {
+  if (!hasExactKeys(evidence, ["schema", "kind", "completeness", "sha256"])) return false;
+  if (evidence.schema !== REVIEW_EVIDENCE_IDENTITY_SCHEMA) return false;
+  if (!EVIDENCE_KINDS.has(evidence.kind)) return false;
+  if (!EVIDENCE_COMPLETENESS_VALUES.has(evidence.completeness)) return false;
+  return HEX_64.test(evidence.sha256);
+}
+
 export function buildReviewReceipt({
   binding,
   coherence,
@@ -98,7 +120,8 @@ export function buildReviewReceipt({
   assignment,
   execution,
   result,
-  provenance
+  provenance,
+  evidence
 }) {
   const body = {
     schema: REVIEW_RECEIPT_SCHEMA,
@@ -108,7 +131,12 @@ export function buildReviewReceipt({
     assignment,
     execution,
     result,
-    provenance
+    provenance,
+    // Present exactly when this review was given an explicit evidence basis.
+    // It is part of the body, so it is part of the reviewId: a different
+    // committed delta produces a different review identity rather than the same
+    // identity with a different meaning.
+    ...(evidence === undefined ? {} : { evidence })
   };
 
   const reviewId = computeReviewId(body);
@@ -136,10 +164,14 @@ export function buildReviewReceipt({
  */
 export function validateReviewReceipt(value) {
   try {
+    // `evidence` is optional and versioned in its own right. A receipt without
+    // it makes no claim about a committed basis; a receipt with it binds one.
     if (!hasExactKeys(value, [
       "schema", "reviewId", "binding", "coherence",
-      "reviewer", "assignment", "execution", "result", "provenance"
+      "reviewer", "assignment", "execution", "result", "provenance",
+      ...(Object.hasOwn(value ?? {}, "evidence") ? ["evidence"] : [])
     ])) return undefined;
+    if (Object.hasOwn(value, "evidence") && !validEvidenceIdentity(value.evidence)) return undefined;
     if (value.schema !== REVIEW_RECEIPT_SCHEMA) return undefined;
     if (typeof value.reviewId !== "string" || !REVIEW_ID.test(value.reviewId)) return undefined;
 

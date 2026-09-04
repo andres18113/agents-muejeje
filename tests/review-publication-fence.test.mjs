@@ -54,6 +54,27 @@ const RUNTIME = Object.freeze({
 
 const TARGET = reviewTargetSpec({ ref: "refs/remotes/origin/main", source: "request" });
 
+function completeCommittedEvidence() {
+  return Object.freeze({
+    schema: "claude-agents-mcp/review-evidence/v1",
+    kind: "committed-delta",
+    completeness: "complete",
+    repositoryId: "b".repeat(64),
+    base: Object.freeze({ ref: "refs/remotes/origin/main", commit: "2".repeat(40) }),
+    head: "3".repeat(40),
+    mergeBase: "2".repeat(40),
+    range: "2".repeat(40) + ".." + "3".repeat(40),
+    files: Object.freeze([Object.freeze({ status: "M", path: "bug.js", originPath: null, binary: false })]),
+    filesTotal: 1,
+    filesTruncated: false,
+    patch: ["--- a/bug.js", "+++ b/bug.js", ""].join(String.fromCharCode(10)),
+    patchBytes: 26,
+    patchTruncated: false,
+    patchSha256: "c".repeat(64),
+    reasons: Object.freeze([])
+  });
+}
+
 /**
  * A completed review with the same terminal evidence a real one produces, so
  * custody takes its ordinary release path and the ordering under test is the
@@ -145,6 +166,11 @@ function reviewWorld({ beforeReceiptPublication, afterReceiptPublicationIssued }
   };
   const binder = createReviewBinder({
     collectChangeSet: async () => exactCollection(),
+    // This fixture is a clean worktree with a resolved target, which is a
+    // committed review: the binder must be handed that committed delta or it
+    // will correctly refuse to bind, and the publication path exercised here
+    // would never be reached.
+    collectCommittedEvidenceFn: async () => completeCommittedEvidence(),
     coherentAdmission: { verifyStillHeld: async () => ({ held: true }) },
     receiptStore,
     now: () => 1_000
@@ -799,6 +825,11 @@ test("a real binder cancelled at its gate leaves no receipt and still releases c
   };
   const binder = createReviewBinder({
     collectChangeSet: async () => exactCollection(),
+    // This fixture is a clean worktree with a resolved target, which is a
+    // committed review: the binder must be handed that committed delta or it
+    // will correctly refuse to bind, and the publication path exercised here
+    // would never be reached.
+    collectCommittedEvidenceFn: async () => completeCommittedEvidence(),
     coherentAdmission: { verifyStillHeld: async () => ({ held: true }) },
     receiptStore,
     // The delegation stamps the execution with a real clock, and a receipt is

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +17,7 @@ import {
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
 import {
   beginAdmissionPublication,
+  repositoryStateDirectoryIn,
   settleAdmissionPublication
 } from "../src/custody/durable-store.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
@@ -442,19 +443,32 @@ test("a root cancellation after the initial admission rename is issued reports t
     const outcome = await pending;
 
     assert.equal(outcome.error.code, "claude_cancelled");
-    assert.equal(outcome.durableCustodyState, "reserved");
-    assert.equal(outcome.custodyState, "retained");
+    // The property under test is that the issued rename is never decoupled from
+    // what the caller is told. The cancellation raced a publication that really
+    // did create ownership, and the outcome reflects that record rather than
+    // reporting an admission that never happened.
+    assert.notEqual(outcome.custodyState, "not-acquired");
+    assert.equal(outcome.custodyState, "released");
     assert.ok(outcome.custodyReasons.some(
-      (reason) => reason.code === "custody_settlement_request_stopped"
+      (reason) => reason.code === "custody_settled_no_process_started"
     ));
-    assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
 
-    // The rename the cancellation raced really did create ownership, and a
-    // later coordinator must find that record rather than a free repository.
-    const durable = await new DurableWriteCustodyManager({ stateRoot })
-      .getWriteAccess(workspace.canonicalRepositoryKey);
-    assert.equal(durable.state, "RESERVED");
-    assert.equal(durable.executionId, outcome.executionId);
+    // No child of that execution ever existed, so the slot is returned rather
+    // than held for the rest of the coordinator's life - and it is returned as
+    // archived history for exactly this execution, not silently discarded.
+    const later = new DurableWriteCustodyManager({ stateRoot });
+    assert.equal(await later.getWriteAccess(workspace.canonicalRepositoryKey), undefined);
+    const archived = JSON.parse(await readFile(
+      path.join(
+        repositoryStateDirectoryIn(stateRoot, workspace.canonicalRepositoryKey),
+        "executions",
+        outcome.executionId,
+        "record.json"
+      ),
+      "utf8"
+    ));
+    assert.equal(archived.state, "RELEASED");
+    assert.equal(archived.executionId, outcome.executionId);
   });
 });
 
@@ -585,15 +599,24 @@ test("the root deadline bounds an in-flight coherent-admission operation and del
  */
 const DEADLINE_STATE_ROOT = DEADLINE_WORKSPACE.effectiveCwd + "-state";
 
+/**
+ * A stopped admission may do exactly one thing with the record it just created:
+ * return it, scoped to that execution and revision. It may not advance the
+ * lifecycle and it may not orphan anything, so those remain hard errors, and
+ * the release is recorded so a test can assert it happened exactly once.
+ */
 function stoppedAdmissionCustody(extra = {}) {
+  const settlements = [];
   return {
     stateRoot: DEADLINE_STATE_ROOT,
     repositoryStateDirectory: () => DEADLINE_STATE_ROOT + "-repository",
+    settlements,
     async markSpawning() {
       throw new Error("a stopped admission must not advance the lifecycle");
     },
-    async releaseUnstartedWriteAccess() {
-      throw new Error("a root stop must not start a second custody mutation");
+    async releaseUnstartedWriteAccess(request) {
+      settlements.push(request);
+      return { state: "RELEASED", executionId: request.executionId, revision: 1 };
     },
     async markOrphanedWriteAccess() {
       throw new Error("a root stop must not start a second custody mutation");
@@ -645,13 +668,12 @@ test("an admission rename already issued when the root stops is reported as dura
   const outcome = await pending;
   assert.equal(outcome.status, "timeout");
   assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
-  // The reservation landed, so the durable record is what gets reported. The
-  // request is over, so nothing starts a second mutation to clean it up.
-  assert.equal(outcome.durableCustodyState, "reserved");
-  assert.equal(outcome.custodyState, "retained");
-  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settlement_request_stopped"));
-  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
-  assert.equal(outcome.recoveryDiagnostics.mode, "manual-required");
+  // The reservation landed and no child of it ever existed, so this stopped
+  // request returns the one record it owns rather than leaving the repository
+  // held for the rest of the coordinator's life.
+  assert.equal(outcome.custodyState, "released");
+  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settled_no_process_started"));
+  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, false);
 });
 
 test("an admission rename that never quiesces is reported as unknown, never as not acquired", async () => {
@@ -748,10 +770,8 @@ test("a coherent review admission already published when the root stops is repor
   releaseAdmission();
   const outcome = await pending;
   assert.equal(outcome.status, "timeout");
-  assert.equal(outcome.durableCustodyState, "reserved");
-  assert.equal(outcome.custodyState, "retained");
-  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settlement_request_stopped"));
-  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
+  assert.equal(outcome.custodyState, "released");
+  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settled_no_process_started"));
 });
 
 test("the root deadline bounds an in-flight custody settlement and does not start a second mutation", async () => {
