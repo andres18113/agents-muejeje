@@ -246,6 +246,17 @@ function validateTerminalProof(proof) {
   if (proof.kind === "not-started") {
     return hasExactKeys(proof, ["kind", "observedAt"]);
   }
+  // The same live coordinator re-observing the exact child it recorded. It is
+  // kept distinct from process-identity-reconciliation because the coordinator
+  // is emphatically NOT dead here: this proof says "I am still the coordinator,
+  // I still hold the in-memory evidence that this was my child, and I have now
+  // observed that exact process to be gone."
+  if (proof.kind === "same-coordinator-process-identity") {
+    return (
+      hasExactKeys(proof, ["claude", "kind", "observedAt"]) &&
+      [PROCESS_IDENTITY_MATCH.DEAD, PROCESS_IDENTITY_MATCH.PID_REUSED].includes(proof.claude)
+    );
+  }
   if (proof.kind === "process-identity-reconciliation") {
     return (
       hasExactKeys(

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
+  PROCESS_IDENTITY_MATCH,
   PROCESS_IDENTITY_STATUS,
   compareProcessIdentity,
   inspectProcessIdentity
@@ -24,6 +25,7 @@ import {
 } from "./durable-store.mjs";
 import {
   DURABLE_STATE_SCHEMA_VERSION,
+  FORCED_TERMINATION_STATES,
   SAFE_UNSTARTED_STATES,
   TRANSITIONS,
   WriteCustodyError,
@@ -252,6 +254,22 @@ export class DurableWriteCustodyManager {
       if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
       const reconciliation = await this.reconcileExistingOwnership(validRootKey, { mutationSignal });
       if (reconciliation.released || reconciliation.reason === "changed") continue;
+      // Reconciliation deliberately retains everything belonging to a live
+      // coordinator, which includes this coordinator's own abandoned orphans.
+      // Before conceding the repository, ask whether one of those has since
+      // become provably finished.
+      if (reconciliation.reason === "live") {
+        const current = await this.#ownershipSnapshot(validRootKey);
+        if (current && FORCED_TERMINATION_STATES.has(current.state)) {
+          const reclaimed = await this.reclaimOwnOrphanedWriteAccess({
+            executionId: current.executionId,
+            canonicalRootKey: validRootKey,
+            expectedRevision: current.revision,
+            mutationSignal
+          });
+          if (reclaimed.released) continue;
+        }
+      }
       throw new WriteCustodyError("Write custody is already retained for canonical root '" + validRoot + "'.", {
         code: reconciliation.reason === "ambiguous" ? "write_custody_state_ambiguous" : "write_custody_conflict",
         details: reconciliation
@@ -542,6 +560,91 @@ export class DurableWriteCustodyManager {
         ...(claudeProcess ? { claudeProcess } : {}),
         orphanReason: validReason
       }, { mutationSignal, publicationGuard });
+    }, { mutationSignal });
+  }
+
+  /**
+   * Reclaims an orphan this very coordinator created, once its exact child is
+   * provably gone.
+   *
+   * Termination that could not be proven in time is a temporary ignorance, and
+   * it must not harden into permanent ownership. Ordinary reconciliation cannot
+   * help here by design: it answers "what may a live coordinator conclude about
+   * a record some OTHER coordinator left behind", and while this coordinator is
+   * alive its own record is never that. So the record would sit ORPHANED for
+   * the remaining life of the process even after the child died - a lockout
+   * produced by nothing more than the passage of the moment the proof was due.
+   *
+   * This is the narrow answer, and it releases on evidence rather than on time.
+   * Three things must all hold. This coordinator must still hold the in-memory
+   * evidence that it supervised that exact spawn, which no restarted or foreign
+   * coordinator can fabricate. The record must name the child it activated. And
+   * the exact durable identity - PID together with start time - must be
+   * observed gone, so a reused PID reads as reuse rather than as survival; an
+   * ambiguous observation proves nothing and is refused.
+   *
+   * The release is pinned to the execution, repository and revision it was
+   * asked about, so it can never reach work that started afterwards.
+   */
+  async reclaimOwnOrphanedWriteAccess({
+    executionId,
+    canonicalRootKey,
+    expectedRevision,
+    mutationSignal
+  }) {
+    const validId = validExecutionId(executionId);
+    const validRootKey = validIdentityString("canonicalRootKey", canonicalRootKey);
+    const repositoryId = repositoryIdForCanonicalRootKey(validRootKey);
+    // Observation happens outside the mutation queue, exactly as every other
+    // external process observation in this manager does.
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    const snapshot = await this.#ownershipSnapshot(validRootKey);
+    // Exactly the states reached because forced termination began: this
+    // coordinator published that it owns a child and is stopping it, and then
+    // could not prove the outcome. Those are the records that would otherwise
+    // sit here for the life of the process.
+    if (!snapshot || snapshot.executionId !== validId || !FORCED_TERMINATION_STATES.has(snapshot.state)) {
+      return Object.freeze({ released: false, reason: "not-own-orphan" });
+    }
+    if (this.#supervisedSpawns.get(repositoryId) !== validId || !snapshot.claudeProcess) {
+      return Object.freeze({ released: false, reason: "not-supervised-by-this-coordinator" });
+    }
+    if (snapshot.coordinatorProcess?.pid !== this.#currentPid) {
+      return Object.freeze({ released: false, reason: "not-this-coordinator" });
+    }
+    const claude = await compareProcessIdentity(snapshot.claudeProcess, {
+      inspectProcess: this.#inspectProcess,
+      abortSignal: mutationSignal
+    });
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    if (
+      claude.status === PROCESS_IDENTITY_MATCH.SAME_PROCESS ||
+      claude.status === PROCESS_IDENTITY_MATCH.AMBIGUOUS
+    ) {
+      // Still running, or unknowable. Neither is proof, so the orphan stays.
+      return Object.freeze({ released: false, reason: "claude-not-proven-gone", claude: claude.status });
+    }
+
+    return await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
+      const record = await this.#ownedRecord({ executionId: validId, canonicalRootKey: validRootKey });
+      this.#requireSettlementScope(record, expectedRevision);
+      // Re-checked inside the queue: the observation above was taken outside it.
+      if (!FORCED_TERMINATION_STATES.has(record.state) || !samePublicationAuthority(record, snapshot)) {
+        return Object.freeze({ released: false, reason: "changed" });
+      }
+      const released = await this.#terminalizeAndRelease(
+        record,
+        {
+          kind: "same-coordinator-process-identity",
+          claude: claude.status,
+          observedAt: this.#now()
+        },
+        {},
+        { mutationSignal, publicationGuard }
+      );
+      this.#liveIdentities.delete(repositoryId);
+      this.#supervisedSpawns.delete(repositoryId);
+      return Object.freeze({ released: true, reason: "own-orphan-terminal", record: released });
     }, { mutationSignal });
   }
 

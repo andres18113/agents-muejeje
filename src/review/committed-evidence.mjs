@@ -267,6 +267,37 @@ export function reviewEvidenceIdentity(evidence) {
   });
 }
 
+/**
+ * Whether a stored receipt can answer an authoritative committed-final-review.
+ *
+ * Receipts written before v0.2.2 recorded no committed-review evidence, because
+ * none was collected. They remain perfectly good historical objects - readable,
+ * their findings recoverable, their freshness computable - and nothing here
+ * invalidates them. What they cannot do is stand in for a guarantee that did
+ * not exist when they were written: a receipt whose basis was never recorded
+ * cannot prove which committed delta it covered, and treating its silence as
+ * "the delta was reviewed" would manufacture evidence retroactively.
+ *
+ * So the older receipt stays visible and stays usable for everything it was
+ * always good for, and a committed final review that requires a bound basis
+ * needs a new one.
+ */
+export const LEGACY_EVIDENCE_REASON = "legacy_receipt_without_committed_evidence";
+
+export function receiptSatisfiesCommittedReview(receipt) {
+  const evidence = receipt?.evidence;
+  if (!evidence) {
+    return Object.freeze({ applicable: false, reason: LEGACY_EVIDENCE_REASON });
+  }
+  if (evidence.kind !== COMMITTED_DELTA_KIND) {
+    return Object.freeze({ applicable: false, reason: LEGACY_EVIDENCE_REASON });
+  }
+  if (evidence.completeness !== EVIDENCE_COMPLETENESS.COMPLETE) {
+    return Object.freeze({ applicable: false, reason: "insufficient_review_scope" });
+  }
+  return Object.freeze({ applicable: true, evidence });
+}
+
 const STATUS_LABEL = Object.freeze({
   A: "added",
   M: "modified",

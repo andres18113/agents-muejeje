@@ -33,6 +33,7 @@ import { isFullyQualifiedRef } from "./git-ref-name.mjs";
 import { COLLECTION_DEADLINE_MS, collectChangeSet } from "./changeset/collector.mjs";
 import { NO_REVIEW_TARGET } from "./changeset/target.mjs";
 import { COHERENCE, createCoherentAdmission } from "./review/coherent-admission.mjs";
+import { receiptSatisfiesCommittedReview } from "./review/committed-evidence.mjs";
 import {
   RECEIPT_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
   createReceiptPublicationFence
@@ -1333,14 +1334,36 @@ export async function delegateAgent(input, dependencies = {}) {
           diagnostics: [{ code: "review_history_unavailable" }]
         };
         const historyEntries = history.allReceipts ?? history.receipts ?? [];
-        const freshEntries = historyEntries.filter((entry) => entry.verdict === "FRESH");
+        // When the current context is a committed review, only a receipt that
+        // actually bound its committed basis can answer it. Older receipts stay
+        // in the history and stay readable; they simply cannot supply a proof
+        // that was never recorded in them.
+        const requiresCommittedEvidence = Boolean(reviewBeforeState?.committedEvidence);
+        const applicability = (entry) => requiresCommittedEvidence
+          ? receiptSatisfiesCommittedReview(entry?.receipt)
+          : { applicable: true };
+        const freshEntries = historyEntries.filter(
+          (entry) => entry.verdict === "FRESH" && applicability(entry).applicable
+        );
+        const unusableFresh = historyEntries.filter(
+          (entry) => entry.verdict === "FRESH" && !applicability(entry).applicable
+        );
         const staleEntry = historyEntries.find((entry) => entry.verdict === "STALE");
         const indeterminateEntry = historyEntries.find((entry) => entry.verdict === "INDETERMINATE");
         let selectedEntry;
         let reconciliationState = "none";
         if (reviewId) {
-          selectedEntry = historyEntries.find((entry) => entry.reviewId === reviewId);
-          reconciliationState = selectedEntry ? "requested" : "requested-missing";
+          const requested = historyEntries.find((entry) => entry.reviewId === reviewId);
+          // An explicitly named receipt is still refused when it cannot answer
+          // this question: naming it does not create the evidence it lacks.
+          if (requested && !applicability(requested).applicable) {
+            reconciliationState = "evidence-unproven";
+          } else {
+            selectedEntry = requested;
+            reconciliationState = selectedEntry ? "requested" : "requested-missing";
+          }
+        } else if (freshEntries.length === 0 && unusableFresh.length > 0) {
+          reconciliationState = "evidence-unproven";
         } else if (freshEntries.length > 1) {
           reconciliationState = "ambiguous";
         } else if (history.status !== "complete") {
@@ -1385,6 +1408,14 @@ export async function delegateAgent(input, dependencies = {}) {
           reviewReasons.push({ code: "review_history_completeness_unproven" });
         } else if (reconciliationState === "requested-missing") {
           reviewReasons.push({ code: "review_id_not_recovered" });
+        } else if (reconciliationState === "evidence-unproven") {
+          // Stable, and deliberately specific: the receipt exists and is
+          // readable, it simply predates the guarantee being asked for.
+          const blocked = historyEntries.find(
+            (entry) => entry.verdict === "FRESH" && !applicability(entry).applicable
+          ) ?? unusableFresh[0];
+          reviewReasons.push({ code: applicability(blocked).reason });
+          reviewReasons.push({ code: "committed_review_evidence_required" });
         } else if (!selectedEntry) {
           reviewReasons.push({ code: "no_fresh_receipt" });
         } else if (selectedEntry.verdict === "STALE") {

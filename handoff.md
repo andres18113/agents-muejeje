@@ -16,6 +16,8 @@
 - After root cancellation no new functional work begins and no unrelated mutation starts. The cancelled invocation may perform exactly one scoped settlement of the execution it already owns, on one of exactly two proofs: its exact child closed, or no child of it ever existed (runner settled saying so, or the runner was never invoked, and preparation reported no unproven side effect).
 - A deadline's own error reports processStarted:false by construction. That is an assumption, never absence, and never settles custody.
 - Only a genuinely ambiguous termination retains: exclusion is never traded for availability, and a cancellation never locks a repository merely because the coordinator is still alive.
+- An unproven termination retains only while it stays unproven. Once the exact recorded child is observed gone, the same live coordinator reclaims its own record via `reclaimOwnOrphanedWriteAccess`, pinned to that execution/repository/revision; a restarted or foreign coordinator cannot, because the basis is in-memory supervision evidence.
+- Receipts written before v0.2.2 carry no `evidence` key. They stay valid, loadable, discoverable and their findings recoverable, but they cannot satisfy an authoritative committed final review: the stable reason is `legacy_receipt_without_committed_evidence`.
 - The rename that creates `ownership/` is a publication like any other: it holds the repository mutation queue until it settles, and a cancellation racing it yields retained or unproven custody, never `not-acquired`.
 
 ## Bash Authority
