@@ -28,9 +28,60 @@ import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
  * is the 8.3 short form (C:\\Users\\RUNNER~1\\...) of a long user directory.
  * A junction reproduces that shape deterministically here, so the contract is
  * pinned by a local test rather than by a remote runner.
+ *
+ * What this test is *not* about is how fast Windows PowerShell can cold-start.
+ * Custody admits a reservation only after observing that its own coordinator
+ * process is alive, and the production observation for that is a real
+ * `powershell.exe` query of the live process table. An observation that cannot
+ * be completed inside its budget is AMBIGUOUS, ambiguity fails closed, and
+ * admission is refused with write_custody_process_identity_ambiguous - which
+ * arrives here as an unbound review that looks exactly like an alias
+ * regression and is not one. A fixture that mints its own child identities
+ * cannot leave that observation to the real process table: it would be
+ * asserting identities no process ever had while asking Windows about
+ * processes this test never started. So the fixture supplies the deterministic
+ * observation its own identities imply, exactly as the other production-path
+ * custody tests and tests/fixtures/reserve-writer.mjs do. Production identity
+ * semantics - real PID + StartTime, PID-reuse detection, ambiguity failing
+ * closed - remain the business of tests/process-identity.test.mjs and are
+ * untouched by this.
  */
 
 let nextPid = 74_000;
+
+/**
+ * One identity source for everything this fixture models, and a start time
+ * that is a pure function of the PID. Because a supervised child and the
+ * observation of it are minted by those same two rules, the identity a child
+ * presents and the identity the process query reports are the same value -
+ * which is what makes it a real, valid, exactly-matching child identity rather
+ * than a fabricated PID with no observation behind it.
+ */
+const FIXTURE_IDENTITY_SOURCE = "aliased-workspace-test";
+
+function fixtureStartTime(pid) {
+  return String(pid * 100);
+}
+
+/**
+ * The deterministic process observation this fixture's identities require.
+ *
+ * Every process this test models - the coordinator running the review and the
+ * supervised children it starts - is alive for the whole review, so that is
+ * what the observation reports. Nothing here relaxes what production does with
+ * the answer: custody still requires an exact PID + start-time + source match,
+ * and an identity that does not match one is still refused.
+ */
+async function inspectFixtureProcess(pid) {
+  return Object.freeze({
+    status: "alive",
+    identity: Object.freeze({
+      pid,
+      startTime: fixtureStartTime(pid),
+      source: FIXTURE_IDENTITY_SOURCE
+    })
+  });
+}
 
 function git(cwd, args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8", shell: false, windowsHide: true });
@@ -106,11 +157,12 @@ function reviewerNaming(repositoryRootFor, captured) {
       agentType: "code-review",
       repositoryRoot: repositoryRootFor(repositoryRoot),
       pid,
-      startTime: String(pid * 100),
-      source: "aliased-workspace-test",
+      startTime: fixtureStartTime(pid),
+      source: FIXTURE_IDENTITY_SOURCE,
       child,
       startedAt: 1
     });
+    captured.presented.push(identity);
     await onChildStarted?.(identity, {});
     return {
       result: "REVIEW FINDINGS: inspected via an aliased path.",
@@ -129,7 +181,7 @@ function reviewerNaming(repositoryRootFor, captured) {
 }
 
 async function reviewThrough(cwd, stateRoot, repositoryRootFor) {
-  const captured = { handed: [] };
+  const captured = { handed: [], presented: [] };
   const outcome = await delegateAgent(
     {
       agentType: "code-review",
@@ -139,7 +191,10 @@ async function reviewThrough(cwd, stateRoot, repositoryRootFor) {
     },
     {
       env: {},
-      writeCustody: new DurableWriteCustodyManager({ stateRoot }),
+      writeCustody: new DurableWriteCustodyManager({
+        stateRoot,
+        inspectProcess: inspectFixtureProcess
+      }),
       receiptStore: new ReviewReceiptStore({ stateRoot }),
       runAgent: reviewerNaming(repositoryRootFor, captured)
     }
@@ -153,6 +208,26 @@ test("a committed review entered through an aliased path still binds", async () 
     // runner does. Custody granted for that root accepts that identity.
     const { outcome, captured } = await reviewThrough(alias, stateRoot, (handed) => handed);
     assert.deepEqual(captured.handed, [canonical], "the runner must be handed the canonical root");
+
+    // The child identity is a valid, exact one: it names the canonical root
+    // that granted custody, and its PID, start time and source are exactly the
+    // ones the process observation reports for that PID.
+    assert.equal(captured.presented.length, 1);
+    const [presented] = captured.presented;
+    assert.equal(presented.repositoryRoot, canonical);
+    const observed = (await inspectFixtureProcess(presented.pid)).identity;
+    assert.equal(presented.pid, observed.pid);
+    assert.equal(presented.startTime, observed.startTime);
+    assert.equal(presented.source, observed.source);
+
+    // Admission was actually granted and was still held when evidence was
+    // bound - "bound" alone would not distinguish that from a review that
+    // never contended for the slot.
+    assert.equal(
+      outcome.reviewBinding.coherence,
+      "held",
+      JSON.stringify(outcome.reviewBinding.reasons)
+    );
     assert.equal(
       outcome.reviewBinding.status,
       "bound",
@@ -179,6 +254,15 @@ test("an identity naming a different spelling of the same directory is still ref
       (reason) => reason.code === "coherent_admission_lifecycle_failed"
     )?.detail;
     assert.equal(detail, "write_custody_process_identity_invalid");
+
+    // This side only proves something if the refusal is the alias refusal. An
+    // admission that failed because the coordinator could not be observed
+    // would deny the review for a reason that has nothing to do with path
+    // spelling, and would look identical from the outside.
+    assert.ok(
+      !reasons.includes("coherent_admission_identity_ambiguous"),
+      "the alias must be refused for its spelling, never for an unavailable observation: " + reasons.join(",")
+    );
 
     // The review itself still ran and still returned its findings: an identity
     // refusal withholds the durable claim, it never fabricates a result.
