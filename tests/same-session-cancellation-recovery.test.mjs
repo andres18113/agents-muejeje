@@ -234,12 +234,21 @@ test("a cancelled writer settles its own custody and the same session admits the
   });
 });
 
-test("a cancelled writer without exact terminal proof keeps custody and still excludes the next writer", async () => {
-  await withCoordinator(async ({ request, notify, testRepo, custody, repositoryKey, diagnostics }) => {
-    // general-purpose prepares an isolated worktree before it ever spawns, so
-    // cancelling here stops the request while custody is held by an execution
-    // whose process demonstrably never started. That is an inference, not close
-    // proof, and it must not be enough to release.
+test("custody and admission never disagree after a pre-spawn cancellation", async () => {
+  await withCoordinator(async ({ request, notify, testRepo, scenarioFile, custody, repositoryKey, diagnostics }) => {
+    // general-purpose prepares an isolated worktree before it ever spawns, so a
+    // cancellation here lands somewhere inside that preparation. Which branch
+    // it lands in is a real property of the run, not of the contract: if
+    // preparation reported no unproven side effect the execution can prove no
+    // child of it exists and returns its custody, and if it could not, that
+    // ambiguity is real and the slot must stay held. Both branches are proven
+    // deterministically in tests/cancellation-phase-matrix, where the phase can
+    // be constructed exactly.
+    //
+    // What must hold on every run, whichever branch it takes, is that the two
+    // answers agree. A released slot must admit the next writer, and a retained
+    // one must refuse it. Availability without exclusion would be a lost lock;
+    // exclusion without availability is the lockout this work removed.
     const writerA = delegate(request, {
       agent_type: "general-purpose",
       task: "writer A cancelled before its child can start",
@@ -250,29 +259,37 @@ test("a cancelled writer without exact terminal proof keeps custody and still ex
       detail: "writer A durable reservation",
       diagnostics
     });
-    // Any pre-spawn state will do; what matters is that no child is proven to
-    // have run, so no close proof can exist for this execution.
     assert.notEqual(reserved.state, "ACTIVE", reserved.state);
 
     notify("notifications/cancelled", { requestId: writerA.id, reason: "transport client disconnected" });
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-
+    // Long enough for either branch to have settled; the assertion below reads
+    // whichever one actually happened rather than assuming one.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
     const retained = await custody.getWriteAccess(repositoryKey);
-    assert.ok(
-      retained,
-      "Custody without exact terminal proof must be retained for reconciliation. " + JSON.stringify(diagnostics())
-    );
-    assert.notEqual(retained.state, "RELEASED");
-    assert.equal(retained.executionId, reserved.executionId);
 
-    // And the exclusion the retained record represents is still enforced.
+    await rm(scenarioFile, { force: true });
     const writerB = await delegate(request, {
       agent_type: "task",
-      task: "writer B must be refused while custody is retained",
+      task: "writer B in the same session",
       cwd: testRepo
     }).response;
     const outcomeB = writerB.result?.structuredContent ?? writerB.result?.structured_content;
-    assert.equal(outcomeB?.status, "failed", JSON.stringify({ outcomeB, ...diagnostics() }));
-    assert.equal(outcomeB.execution.error.code, "write_custody_conflict");
+    const context = () => JSON.stringify({
+      retained: retained?.state ?? null,
+      outcomeB,
+      ...diagnostics()
+    });
+
+    if (retained) {
+      assert.notEqual(retained.state, "RELEASED", context());
+      assert.equal(retained.executionId, reserved.executionId, context());
+      assert.equal(outcomeB?.status, "failed", context());
+      assert.equal(outcomeB.execution.error.code, "write_custody_conflict", context());
+    } else {
+      // The slot was returned, so this same coordinator - never restarted -
+      // admits the next writer.
+      assert.equal(outcomeB?.status, "completed", context());
+      assert.notEqual(outcomeB.execution.id, reserved.executionId, context());
+    }
   });
 });
