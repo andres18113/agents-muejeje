@@ -8,12 +8,19 @@ import { fileURLToPath } from "node:url";
 import { getAgentProfile } from "../src/agent-registry.mjs";
 import { evaluateDiagnoseTimeout } from "../src/diagnose-timeout.mjs";
 import {
+  ADMISSION_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
   DelegateAgentConfigurationError,
   DelegateAgentInputError,
   delegateAgent,
   resolveAgentRuntime
 } from "../src/delegate-agent.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import {
+  beginAdmissionPublication,
+  settleAdmissionPublication
+} from "../src/custody/durable-store.mjs";
+import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
+import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import {
   checkTimeoutHierarchySafety,
   MAX_SUPPORTED_DELEGATE_TIMEOUT_MS
@@ -47,7 +54,11 @@ async function withRepository(callback) {
     await writeFile(path.join(repositoryRoot, "README.md"), "# reconciliation fixture\n", "utf8");
     git(repositoryRoot, ["add", "README.md"]);
     git(repositoryRoot, ["commit", "-m", "fixture"]);
-    await callback({ repositoryRoot, writeCustody: new DurableWriteCustodyManager({ stateRoot }) });
+    await callback({
+      repositoryRoot,
+      stateRoot,
+      writeCustody: new DurableWriteCustodyManager({ stateRoot })
+    });
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
@@ -379,6 +390,74 @@ test("the root observer rechecks cancellation immediately before starting a phas
   }
 });
 
+/**
+ * The same boundary end to end, against a real repository, a real durable store
+ * and a real rename.
+ *
+ * The seam pauses inside the store after the OS rename that creates ownership/
+ * has been issued and before it settles - the exact instant the audited race
+ * lives in. The client cancels there. Nothing about that cancellation can
+ * unmake the rename, so the delegation must come back describing the record
+ * that is genuinely on disk instead of reporting an admission that never
+ * happened.
+ */
+test("a root cancellation after the initial admission rename is issued reports the durable reservation", async () => {
+  await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    const workspace = await resolveRepositoryCoordinationIdentity(
+      await resolveCanonicalWorkspaceRoot(repositoryRoot)
+    );
+    let publicationIssued;
+    const admissionPublished = new Promise((resolve) => { publicationIssued = resolve; });
+    let resumePublication;
+    const publicationMayFinish = new Promise((resolve) => { resumePublication = resolve; });
+    const writeCustody = new DurableWriteCustodyManager({
+      stateRoot,
+      afterPublicationIssued: async ({ nextRecord }) => {
+        if (nextRecord.state !== "RESERVED") return;
+        publicationIssued();
+        await publicationMayFinish;
+      }
+    });
+
+    const controller = new AbortController();
+    const pending = delegateAgent(
+      {
+        agentType: "task",
+        task: "cancel after the admission rename is issued",
+        cwd: repositoryRoot,
+        abortSignal: controller.signal
+      },
+      {
+        writeCustody,
+        env: {},
+        runAgent: async () => {
+          throw new Error("a stopped admission must not reach the runner");
+        }
+      }
+    );
+
+    await admissionPublished;
+    controller.abort();
+    resumePublication();
+    const outcome = await pending;
+
+    assert.equal(outcome.error.code, "claude_cancelled");
+    assert.equal(outcome.durableCustodyState, "reserved");
+    assert.equal(outcome.custodyState, "retained");
+    assert.ok(outcome.custodyReasons.some(
+      (reason) => reason.code === "custody_settlement_request_stopped"
+    ));
+    assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
+
+    // The rename the cancellation raced really did create ownership, and a
+    // later coordinator must find that record rather than a free repository.
+    const durable = await new DurableWriteCustodyManager({ stateRoot })
+      .getWriteAccess(workspace.canonicalRepositoryKey);
+    assert.equal(durable.state, "RESERVED");
+    assert.equal(durable.executionId, outcome.executionId);
+  });
+});
+
 function manualClock(initial = 0) {
   let time = initial;
   let nextId = 1;
@@ -495,6 +574,184 @@ test("the root deadline bounds an in-flight coherent-admission operation and del
   assert.equal(outcome.status, "timeout");
   assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
   assert.equal(outcome.custodyState, "not-acquired");
+});
+
+/**
+ * The admission rename is the moment durable custody comes into existence, and
+ * a request deadline observes that rename without being able to stop it. The
+ * tests below fix what the delegation may say about custody on each side of
+ * that boundary, because "the request stopped" and "custody was never acquired"
+ * are different statements and only one of them is about disk.
+ */
+const DEADLINE_STATE_ROOT = DEADLINE_WORKSPACE.effectiveCwd + "-state";
+
+function stoppedAdmissionCustody(extra = {}) {
+  return {
+    stateRoot: DEADLINE_STATE_ROOT,
+    repositoryStateDirectory: () => DEADLINE_STATE_ROOT + "-repository",
+    async markSpawning() {
+      throw new Error("a stopped admission must not advance the lifecycle");
+    },
+    async releaseUnstartedWriteAccess() {
+      throw new Error("a root stop must not start a second custody mutation");
+    },
+    async markOrphanedWriteAccess() {
+      throw new Error("a root stop must not start a second custody mutation");
+    },
+    ...extra
+  };
+}
+
+function admissionDependencies(clock, reserveWriteAccess, extra = {}) {
+  return deadlineDependencies(clock, {
+    writeCustody: stoppedAdmissionCustody({ reserveWriteAccess }),
+    runAgent: async () => {
+      throw new Error("a stopped admission must not reach the runner");
+    },
+    ...extra
+  });
+}
+
+const RESERVED_BY_DEADLINE_EXECUTION = Object.freeze({
+  state: "RESERVED",
+  executionId: "deadline-execution"
+});
+
+test("an admission rename already issued when the root stops is reported as durable custody", async () => {
+  const clock = manualClock();
+  let admissionStarted;
+  const started = new Promise((resolve) => { admissionStarted = resolve; });
+  let releaseAdmission;
+  const admissionMayFinish = new Promise((resolve) => { releaseAdmission = resolve; });
+  const pending = delegateAgent(
+    { agentType: "task", task: "stop after the admission rename", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    admissionDependencies(clock, async ({ admissionFence }) => {
+      // Cross exactly the boundary the durable store crosses: the rename has
+      // been issued and can no longer be unmade by any later cancellation.
+      beginAdmissionPublication(admissionFence);
+      admissionStarted();
+      await admissionMayFinish;
+      settleAdmissionPublication(admissionFence, {
+        disposition: "published",
+        record: RESERVED_BY_DEADLINE_EXECUTION
+      });
+      return RESERVED_BY_DEADLINE_EXECUTION;
+    })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  releaseAdmission();
+  const outcome = await pending;
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
+  // The reservation landed, so the durable record is what gets reported. The
+  // request is over, so nothing starts a second mutation to clean it up.
+  assert.equal(outcome.durableCustodyState, "reserved");
+  assert.equal(outcome.custodyState, "retained");
+  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settlement_request_stopped"));
+  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
+  assert.equal(outcome.recoveryDiagnostics.mode, "manual-required");
+});
+
+test("an admission rename that never quiesces is reported as unknown, never as not acquired", async () => {
+  const clock = manualClock();
+  let quiescenceArmed;
+  const quiescenceScheduled = new Promise((resolve) => { quiescenceArmed = resolve; });
+  const schedule = (callback, delay) => {
+    const id = clock.schedule(callback, delay);
+    if (delay === ADMISSION_PUBLICATION_QUIESCENCE_TIMEOUT_MS) quiescenceArmed();
+    return id;
+  };
+  let admissionStarted;
+  const started = new Promise((resolve) => { admissionStarted = resolve; });
+  const pending = delegateAgent(
+    { agentType: "task", task: "admission rename never settles", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    admissionDependencies(clock, async ({ admissionFence }) => {
+      beginAdmissionPublication(admissionFence);
+      admissionStarted();
+      await new Promise(() => {});
+    }, { scheduleRequestDeadline: schedule })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  // Bounded, so a regression that never arms the quiescence wait fails this
+  // test on what it reports rather than by hanging it.
+  await Promise.race([quiescenceScheduled, new Promise((resolve) => setTimeout(resolve, 1_000))]);
+  clock.advanceTo(100 + ADMISSION_PUBLICATION_QUIESCENCE_TIMEOUT_MS);
+  const outcome = await pending;
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
+  assert.equal(outcome.custodyState, "retention-failed");
+  assert.ok(outcome.custodyReasons.some(
+    (reason) => reason.code === "custody_admission_publication_unproven"
+  ));
+  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
+  assert.equal(outcome.recoveryDiagnostics.mode, "manual-required");
+});
+
+test("a root stop before the admission rename is issued still reports custody as never acquired", async () => {
+  const clock = manualClock();
+  let admissionStarted;
+  let admissionSignal;
+  const started = new Promise((resolve) => { admissionStarted = resolve; });
+  const pending = delegateAgent(
+    { agentType: "task", task: "stop before the admission rename", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    admissionDependencies(clock, async ({ mutationSignal }) => {
+      admissionSignal = mutationSignal;
+      admissionStarted();
+      await new Promise(() => {});
+    })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  const outcome = await pending;
+  assert.equal(admissionSignal.aborted, true);
+  assert.equal(outcome.status, "timeout");
+  // Nothing was published and nothing ever can be, so this is the one case
+  // where "not acquired" is a fact rather than a guess.
+  assert.equal(outcome.custodyState, "not-acquired");
+  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, false);
+  assert.equal(outcome.recoveryDiagnostics.mode, "not-needed");
+});
+
+test("a coherent review admission already published when the root stops is reported as retained", async () => {
+  const clock = manualClock();
+  let admissionStarted;
+  const started = new Promise((resolve) => { admissionStarted = resolve; });
+  let releaseAdmission;
+  const admissionMayFinish = new Promise((resolve) => { releaseAdmission = resolve; });
+  const pending = delegateAgent(
+    { agentType: "code-review", task: "stop after coherent admission", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    deadlineDependencies(clock, {
+      env: {},
+      writeCustody: stoppedAdmissionCustody(),
+      coherentAdmission: {
+        async admit({ admissionFence }) {
+          beginAdmissionPublication(admissionFence);
+          admissionStarted();
+          await admissionMayFinish;
+          settleAdmissionPublication(admissionFence, {
+            disposition: "published",
+            record: RESERVED_BY_DEADLINE_EXECUTION
+          });
+          return Object.freeze({ coherence: "held", record: RESERVED_BY_DEADLINE_EXECUTION });
+        }
+      }
+    })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  releaseAdmission();
+  const outcome = await pending;
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.durableCustodyState, "reserved");
+  assert.equal(outcome.custodyState, "retained");
+  assert.ok(outcome.custodyReasons.some((reason) => reason.code === "custody_settlement_request_stopped"));
+  assert.equal(outcome.recoveryDiagnostics.manualInterventionRequired, true);
 });
 
 test("the root deadline bounds an in-flight custody settlement and does not start a second mutation", async () => {

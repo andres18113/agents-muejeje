@@ -306,6 +306,8 @@ The human-readable text reports the same facts, including `EffectiveCwd`, `Canon
 
 An `ORPHANED` or retained outcome is meant to be acted on without reading the durable store by hand. It names why custody was retained (`terminal-proof-unavailable`, `worktree-preparation-ambiguous`, `custody-release-proof-failed`, `custody-retention-failed`, or `review_receipt_publication_unquiesced`), whether an automatic recovery path is armed and by which mechanism, whether manual intervention is required now, and where any retained worktree was left.
 
+Admission obeys the same boundary as every later transition, because the rename that creates `ownership/` is the moment durable custody starts existing. A root cancellation that arrives before that rename is issued is conclusive: nothing was published, nothing can be, and the delegation reports custody as never acquired. A cancellation that arrives after it is issued proves nothing about disk, so the reservation's own result decides what is reported - a reservation that landed is reported as retained durable custody with `custody_settlement_request_stopped`, and one whose result never quiesced is reported as `retention-failed` with `custody_admission_publication_unproven`. Neither is ever reported as an admission that did not happen, and neither starts a second custody mutation after the request has stopped.
+
 ## Environment overrides
 
 - `CLAUDE_AGENTS_MODEL` — Claude backend model; defaults to `opus`.

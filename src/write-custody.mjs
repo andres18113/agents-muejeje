@@ -21,6 +21,7 @@ export {
   validateDurableOwnershipRecord
 } from "./custody/record-schema.mjs";
 export {
+  createAdmissionPublicationFence,
   defaultDurableStateRoot,
   executionHistoryDirectoryIn,
   repositoryStateDirectoryIn,

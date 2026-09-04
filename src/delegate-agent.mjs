@@ -26,7 +26,7 @@ import {
 } from "./timeout-policy.mjs";
 import { createRequestDeadlineContext, RequestDeadlineError } from "./request-context.mjs";
 import { composeAgentPrompt } from "./prompt-composer.mjs";
-import { PROCESS_WRITE_CUSTODY } from "./write-custody.mjs";
+import { PROCESS_WRITE_CUSTODY, createAdmissionPublicationFence } from "./write-custody.mjs";
 import { isSupportedReasoningEffort } from "./reasoning-effort.mjs";
 import { isFullyQualifiedRef } from "./git-ref-name.mjs";
 import { COLLECTION_DEADLINE_MS, collectChangeSet } from "./changeset/collector.mjs";
@@ -148,6 +148,67 @@ const REVIEW_ID_PATTERN = /^rr1:[0-9a-f]{64}$/u;
 // atomic local receipt write. Its outer bound ensures evidence machinery can
 // never retain the shared ownership slot forever.
 export const REVIEW_BINDING_FINALIZATION_TIMEOUT_MS = COLLECTION_DEADLINE_MS + 10_000;
+
+// How long a root-stopped request waits for an admission rename it has already
+// issued. The syscall is in flight, so this is quiescence, not useful work: it
+// only has to outlast one filesystem rename.
+export const ADMISSION_PUBLICATION_QUIESCENCE_TIMEOUT_MS = 5_000;
+
+/**
+ * Decides what an admission attempt actually did when the root request stopped
+ * while it was in flight.
+ *
+ * `observe()` races a request stop against an operation; it never stops the
+ * operation. For admission that race is not neutral, because the reservation's
+ * final act is a rename that creates durable ownership. Cancelling before that
+ * rename is issued is conclusive - the fence can never be crossed afterwards,
+ * so "custody was never acquired" is true. Cancelling after it is issued proves
+ * nothing at all, so the answer must come from the attempt itself.
+ *
+ * Three outcomes, and each is reported as exactly what it is:
+ *   the attempt settles with a record - custody exists and is retained;
+ *   the attempt settles without one, and the fence saw the rename lose its race
+ *     or fail - nothing durable was created;
+ *   nothing settles inside the bound - the durable state is unknown, which is
+ *     never the same statement as "not acquired".
+ */
+async function settleAdmissionAfterRequestStop(attempt, fence, {
+  timeoutMs = ADMISSION_PUBLICATION_QUIESCENCE_TIMEOUT_MS,
+  schedule = setTimeout,
+  cancel = clearTimeout,
+  // Applied only once the attempt settles, so no derived promise exists to go
+  // unhandled on the paths that never wait for one.
+  selectRecord
+} = {}) {
+  if (!attempt || fence?.publicationStarted() !== true) return { published: false };
+  let timer;
+  const quiescence = new Promise((resolve) => {
+    timer = schedule(() => resolve({ timedOut: true }), Math.max(0, timeoutMs));
+  });
+  let observed;
+  try {
+    observed = await Promise.race([
+      attempt.then(
+        (value) => ({ record: selectRecord ? selectRecord(value) : value }),
+        (error) => ({ error })
+      ),
+      quiescence
+    ]);
+  } finally {
+    cancel(timer);
+  }
+  if (observed.timedOut) return { published: false, unproven: true };
+  if (observed.record) return { published: true, record: observed.record };
+  // The attempt produced no record after crossing the boundary. Only the fence
+  // knows whether the rename that was already issued created ownership anyway.
+  const disposition = fence.disposition();
+  if (disposition === "conflict" || disposition === "failed") return { published: false };
+  if (disposition === "published") {
+    const record = fence.publishedRecord();
+    if (record) return { published: true, record };
+  }
+  return { published: false, unproven: true };
+}
 
 /**
  * Runs the AFTER binding under an outer bound, and fences its receipt
@@ -914,6 +975,10 @@ export async function delegateAgent(input, dependencies = {}) {
   const custodyReasons = [];
   let custodyReason;
   let processProvenNotStarted = false;
+  // Set when an admission rename had already been issued as the root request
+  // stopped and its result never became observable. A durable RESERVED record
+  // may exist, so the honest answer is "unknown", never "never acquired".
+  let admissionPublicationUnproven = false;
   // Where a worktree may have been left when preparation failed before the
   // delegation could adopt it. Nothing deletes it, so its location is the only
   // thing that makes the resulting retention actionable.
@@ -971,19 +1036,47 @@ export async function delegateAgent(input, dependencies = {}) {
       // as it is held. A denied one is an ordinary outcome: the review still
       // runs, it simply cannot bind evidence to a state it did not control.
       let admission;
+      const admissionFence = createAdmissionPublicationFence();
+      let admissionAttempt;
       try {
         requestContext.assertActive("coherent-admission");
-        admission = await requestContext.observe("coherent-admission", () => coherentAdmission.admit({
-          executionId,
-          agentType: profile.id,
-          canonicalRoot: workspace.repositoryRoot,
-          canonicalRootKey: workspace.canonicalRepositoryKey,
-          ...(targetRef === undefined ? {} : { targetRef }),
-          requestContext,
-          mutationSignal: requestContext.abortSignal
-        }));
+        admission = await requestContext.observe("coherent-admission", () => {
+          admissionAttempt = Promise.resolve(coherentAdmission.admit({
+            executionId,
+            agentType: profile.id,
+            canonicalRoot: workspace.repositoryRoot,
+            canonicalRootKey: workspace.canonicalRepositoryKey,
+            ...(targetRef === undefined ? {} : { targetRef }),
+            admissionFence,
+            requestContext,
+            mutationSignal: requestContext.abortSignal
+          }));
+          return admissionAttempt;
+        });
         requestContext.assertActive("coherent-admission");
       } catch (error) {
+        const requestStopped = isRequestStop(error) || requestContext.abortSignal?.aborted === true;
+        if (requestStopped) {
+          // Admission takes the same rename a writer takes, so a stop that
+          // races it is decided exactly the same way: by the rename, not by
+          // the deadline that observed it.
+          const settled = await settleAdmissionAfterRequestStop(admissionAttempt, admissionFence, {
+            timeoutMs: dependencies.admissionPublicationQuiescenceTimeoutMs,
+            schedule: requestContext.schedule,
+            cancel: requestContext.cancelSchedule,
+            // admit() answers with an admission, not with a record.
+            selectRecord: (granted) =>
+              granted?.coherence === COHERENCE.HELD ? granted.record : undefined
+          });
+          if (settled.published) {
+            reviewCoherence = COHERENCE.HELD;
+            reservation = settled.record;
+            custodyState = reservation.state.toLowerCase();
+            processProvenNotStarted = true;
+          } else if (settled.unproven) {
+            admissionPublicationUnproven = true;
+          }
+        }
         if (requestContext.abortSignal?.aborted) requestContext.assertActive("coherent-admission");
         if (isRequestStop(error)) throw error;
         admission = {
@@ -1272,14 +1365,40 @@ export async function delegateAgent(input, dependencies = {}) {
     if (!reconcileOnly) {
       if (custodyPlan === "write") {
         requestContext.assertActive("write-admission");
-        reservation = await requestContext.observe("write-admission", () => writeCustody.reserveWriteAccess({
-          executionId,
-          agentType: profile.id,
-          canonicalRoot: workspace.repositoryRoot,
-          canonicalRootKey: workspace.canonicalRepositoryKey,
-          ...(targetRef === undefined ? {} : { targetRef }),
-          mutationSignal: requestContext.abortSignal
-        }));
+        const admissionFence = createAdmissionPublicationFence();
+        let admissionAttempt;
+        try {
+          reservation = await requestContext.observe("write-admission", () => {
+            admissionAttempt = writeCustody.reserveWriteAccess({
+              executionId,
+              agentType: profile.id,
+              canonicalRoot: workspace.repositoryRoot,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              ...(targetRef === undefined ? {} : { targetRef }),
+              admissionFence,
+              mutationSignal: requestContext.abortSignal
+            });
+            return admissionAttempt;
+          });
+        } catch (error) {
+          if (!isRequestStop(error)) throw error;
+          // The stop arrived while admission was in flight. If its rename was
+          // already issued, that rename - not the timer - decides whether this
+          // execution owns the repository.
+          const settled = await settleAdmissionAfterRequestStop(admissionAttempt, admissionFence, {
+            timeoutMs: dependencies.admissionPublicationQuiescenceTimeoutMs,
+            schedule: requestContext.schedule,
+            cancel: requestContext.cancelSchedule
+          });
+          if (settled.published) {
+            reservation = settled.record;
+            custodyState = reservation.state.toLowerCase();
+            processProvenNotStarted = true;
+          } else if (settled.unproven) {
+            admissionPublicationUnproven = true;
+          }
+          throw error;
+        }
         requestContext.assertActive("write-admission");
         custodyState = reservation.state.toLowerCase();
         processProvenNotStarted = true;
@@ -1653,7 +1772,15 @@ export async function delegateAgent(input, dependencies = {}) {
     );
 
     try {
-      if (reservation) {
+      if (!reservation && admissionPublicationUnproven) {
+        // An admission rename was already issued when the root stopped and
+        // never became observable. Reporting "not acquired" here would be the
+        // one thing the publication boundary forbids: concluding durable state
+        // from a timer that only observed the operation.
+        retainWithoutStartingAnotherMutation("custody_admission_publication_unproven", {
+          stateKnown: false
+        });
+      } else if (reservation) {
         if (!requestContext.isActive()) {
           // The operation that consumed the final root instant has already
           // been told to stop. Do not start a release/orphan mutation after it;

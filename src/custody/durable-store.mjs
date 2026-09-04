@@ -163,6 +163,52 @@ export async function executionHistoryExists(repositoryState, executionId, { mut
 }
 
 /**
+ * The admission publication boundary, made observable to the request that owns
+ * the reservation.
+ *
+ * The very first rename - the one that creates ownership/ - is a publication
+ * exactly like every later one and obeys the same rule: before it is issued a
+ * cancellation removes the authority to publish for good, and once it is issued
+ * nothing can unmake it. A caller whose deadline fires mid-flight therefore
+ * cannot conclude "custody was never acquired" from the cancellation alone.
+ * The fence records which side of that boundary the reservation reached and,
+ * when the rename did land, the record it published, so the caller reports the
+ * durable truth rather than the timer's guess.
+ */
+export function createAdmissionPublicationFence() {
+  const state = { publicationStarted: false, disposition: undefined, record: undefined };
+  return Object.freeze({
+    state,
+    publicationStarted: () => state.publicationStarted === true,
+    disposition: () => state.disposition,
+    publishedRecord: () => state.record
+  });
+}
+
+/**
+ * Marks the boundary as crossed. The caller must issue the rename immediately
+ * afterwards with no intervening await: that adjacency is what makes "cancelled
+ * before publication" and "publication started" mutually exclusive.
+ *
+ * Admission may retry after losing a rename, so every attempt re-arms the fence
+ * and only the last attempt's disposition describes durable state.
+ */
+export function beginAdmissionPublication(fence) {
+  if (!fence?.state) return false;
+  fence.state.publicationStarted = true;
+  fence.state.disposition = undefined;
+  fence.state.record = undefined;
+  return true;
+}
+
+export function settleAdmissionPublication(fence, { disposition, record } = {}) {
+  if (!fence?.state || fence.state.publicationStarted !== true) return false;
+  fence.state.disposition = disposition;
+  fence.state.record = record;
+  return true;
+}
+
+/**
  * Creates the ownership directory for a brand-new reservation.
  *
  * The record is written into a private temporary directory and only then
@@ -170,29 +216,65 @@ export async function executionHistoryExists(repositoryState, executionId, { mut
  * written state. Returns false when another coordinator won the same rename;
  * that is a normal race outcome, not an error.
  */
-export async function createOwnershipReservation({ repositoryState, record, createNonce, mutationSignal }) {
+export async function createOwnershipReservation({
+  repositoryState,
+  record,
+  createNonce,
+  mutationSignal,
+  publicationGuard,
+  admissionFence,
+  afterPublicationIssued
+}) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   if (await exists(ownershipDirectory, { mutationSignal })) return false;
 
   const temporaryDirectory = path.join(repositoryState, ".ownership-" + createNonce() + ".tmp");
   if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(temporaryDirectory);
+  let published = false;
   try {
     await writeFileDurably(
       path.join(temporaryDirectory, RECORD_FILE_NAME),
       JSON.stringify(record, null, 2) + "\n",
       { mutationSignal }
     );
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    // The next synchronous rename call is the admission publication boundary.
+    // Once it is issued it can still create durable ownership even after the
+    // caller's deadline fires, so the mutation queue must stay occupied until
+    // it settles and the caller must be told the boundary was crossed.
+    if (publicationGuard) publicationGuard.publicationStarted = true;
+    beginAdmissionPublication(admissionFence);
+    const publication = rename(temporaryDirectory, ownershipDirectory);
+    // Keep a rejection observed while a test intentionally pauses after the OS
+    // rename has been issued. The original promise is still awaited below, so
+    // its outcome remains authoritative to the mutation caller.
+    void publication.catch(() => {});
+    if (typeof afterPublicationIssued === "function") {
+      await afterPublicationIssued({ nextRecord: recordSnapshot(record) });
+    }
     try {
-      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-      await rename(temporaryDirectory, ownershipDirectory);
-      return true;
+      await publication;
     } catch (error) {
-      if (!errorIsPathConflict(error)) throw error;
+      if (!errorIsPathConflict(error)) {
+        settleAdmissionPublication(admissionFence, { disposition: "failed" });
+        throw error;
+      }
+      settleAdmissionPublication(admissionFence, { disposition: "conflict" });
       return false;
     }
+    published = true;
+    settleAdmissionPublication(admissionFence, {
+      disposition: "published",
+      record: recordSnapshot(record)
+    });
+    return true;
   } finally {
-    if (!mutationWasCancelled(mutationSignal) && await exists(temporaryDirectory)) {
+    // A landed rename has already moved this directory, so there is nothing to
+    // clean up and nothing cleanup could usefully report. Running it anyway
+    // would let an unrelated stat failure turn a published reservation into a
+    // rejection, which is the one thing a crossed publication boundary forbids.
+    if (!published && !mutationWasCancelled(mutationSignal) && await exists(temporaryDirectory)) {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
   }
