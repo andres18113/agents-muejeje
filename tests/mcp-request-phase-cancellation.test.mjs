@@ -177,7 +177,18 @@ async function cancelAtMarker({ client, markerDirectory, marker, request }) {
   await delay(50);
 }
 
-test("STDIO cancellation during worktree preparation retains unstarted custody instead of starting post-cancellation cleanup", async () => {
+/**
+ * A cancellation that lands before any child of the execution exists leaves the
+ * coordinator able to prove something exact: this invocation still owns this
+ * record, no Claude process of it was ever started, and preparation reported no
+ * unproven side effect. That is proof of absence, not a deadline's assumption
+ * that nothing started, and it is enough to return the invocation's own custody.
+ *
+ * Retaining here would lock the repository for the remaining life of the
+ * coordinator - reconciliation cannot reclaim a slot whose coordinator is still
+ * alive - which is the lockout this contract exists to prevent.
+ */
+test("STDIO cancellation before any child exists returns that invocation's own custody", async () => {
   await withTransport("worktree-preparation", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
     const request = client.request("tools/call", {
       name: "delegate_agent",
@@ -189,13 +200,16 @@ test("STDIO cancellation during worktree preparation retains unstarted custody i
       diagnose: () => "stderr=" + JSON.stringify(String(client.stderr).slice(-1200))
     });
     await cancelAtMarker({ client, markerDirectory, marker: "worktree-preparation", request });
-    await waitFor(async () => (await custody.getWriteAccess(repositoryKey))?.state === "RESERVED", {
-      detail: "retained worktree custody"
+    await waitFor(async () => (await custody.getWriteAccess(repositoryKey)) === undefined, {
+      detail: "settled worktree custody",
+      diagnose: async () => "state=" + JSON.stringify(
+        (await custody.getWriteAccess(repositoryKey))?.state ?? null
+      )
     });
   });
 });
 
-test("STDIO cancellation during BEFORE history discovery retains coherent review custody instead of starting post-cancellation cleanup", async () => {
+test("STDIO cancellation during BEFORE history discovery returns the coherent review's own custody", async () => {
   await withTransport("before-history", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
     const request = client.request("tools/call", {
       name: "delegate_agent",
@@ -207,11 +221,13 @@ test("STDIO cancellation during BEFORE history discovery retains coherent review
       diagnose: () => "stderr=" + JSON.stringify(String(client.stderr).slice(-1200))
     });
     await cancelAtMarker({ client, markerDirectory, marker: "before-history", request });
-    await waitFor(async () => {
-      const record = await custody.getWriteAccess(repositoryKey);
-      return record !== undefined && record.state !== "RELEASED";
-    }, {
-      detail: "retained coherent review custody"
+    // No reviewer process was ever spawned and no receipt authority was taken,
+    // so the review can prove its own absence and returns the slot.
+    await waitFor(async () => (await custody.getWriteAccess(repositoryKey)) === undefined, {
+      detail: "settled coherent review custody",
+      diagnose: async () => "state=" + JSON.stringify(
+        (await custody.getWriteAccess(repositoryKey))?.state ?? null
+      )
     });
   });
 });

@@ -372,9 +372,15 @@ export class DurableWriteCustodyManager {
     }, { mutationSignal });
   }
 
-  async releaseUnstartedWriteAccess({ executionId, canonicalRootKey, mutationSignal }) {
+  async releaseUnstartedWriteAccess({
+    executionId,
+    canonicalRootKey,
+    expectedRevision,
+    mutationSignal
+  }) {
     return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+      this.#requireSettlementScope(record, expectedRevision);
       if (!SAFE_UNSTARTED_STATES.has(record.state) || record.claudeProcess) {
         throw new WriteCustodyError(
           "Write custody may be released without child terminal proof only when the runner proved no child started.",

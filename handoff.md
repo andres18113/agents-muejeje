@@ -13,7 +13,9 @@
 - A result-artifact conflict is idempotent only after exact byte-count and SHA-256 verification of the destination.
 - `reviews/sc` is non-evidentiary. Only an authoritative `reviews/cs` sweep can establish complete history; `authoritativeExhaustive` and `outputTruncated` separately report scan completeness and caller output bounds.
 - No `review_id` reconciliation selects among multiple FRESH receipts; it returns structured reason `multiple_fresh_reviews`. An exact requested ID must match the current repository/profile/target scope or fails closed.
-- After root cancellation no new functional work begins and no unrelated mutation starts. The cancelled invocation may perform exactly one scoped terminal settlement of the execution it already owns, and only on proven exact close; anything else remains for ordinary reconciliation.
+- After root cancellation no new functional work begins and no unrelated mutation starts. The cancelled invocation may perform exactly one scoped settlement of the execution it already owns, on one of exactly two proofs: its exact child closed, or no child of it ever existed (runner settled saying so, or the runner was never invoked, and preparation reported no unproven side effect).
+- A deadline's own error reports processStarted:false by construction. That is an assumption, never absence, and never settles custody.
+- Only a genuinely ambiguous termination retains: exclusion is never traded for availability, and a cancellation never locks a repository merely because the coordinator is still alive.
 - The rename that creates `ownership/` is a publication like any other: it holds the repository mutation queue until it settles, and a cancellation racing it yields retained or unproven custody, never `not-acquired`.
 
 ## Bash Authority

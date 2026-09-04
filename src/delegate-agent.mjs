@@ -837,15 +837,26 @@ function terminalSettlementAuthority({
   releaseAuthorizedBy,
   writerProcessStarted,
   terminalProof,
+  processAbsenceProven,
+  workspacePreparationAmbiguous,
   reservation
 }) {
-  if (!writerProcessStarted || !terminalProof || !reservation) return undefined;
-  const release = releaseAuthorizedBy?.(false);
+  if (!reservation) return undefined;
+  // Two, and only two, things a stopped request can still prove about the
+  // execution it owns. Either its exact child closed, or no child of it ever
+  // existed. Everything else - including a deadline's own assumption that
+  // nothing started - is not evidence and settles nothing.
+  const provenTerminal = writerProcessStarted && Boolean(terminalProof);
+  const provenAbsent = !writerProcessStarted &&
+    processAbsenceProven === true &&
+    !workspacePreparationAmbiguous;
+  if (!provenTerminal && !provenAbsent) return undefined;
+  const release = releaseAuthorizedBy?.(provenAbsent);
   if (!release) return undefined;
   const scope = Number.isSafeInteger(reservation.revision)
     ? { expectedRevision: reservation.revision }
     : {};
-  return { release, scope };
+  return { release, scope, basis: provenTerminal ? "terminal-proof" : "absence-proven" };
 }
 
 /**
@@ -1087,6 +1098,12 @@ export async function delegateAgent(input, dependencies = {}) {
   const custodyReasons = [];
   let custodyReason;
   let processProvenNotStarted = false;
+  // Stronger than processProvenNotStarted, and deliberately so. A request stop
+  // produces an error that reports processStarted:false by construction, which
+  // is the deadline's own assumption rather than an observation. Only the
+  // runner's actual settlement - or never having invoked it at all - proves
+  // that no child of this execution exists.
+  let processAbsenceProven = false;
   // Set when an admission rename had already been issued as the root request
   // stopped and its result never became observable. A durable RESERVED record
   // may exist, so the honest answer is "unknown", never "never acquired".
@@ -1701,6 +1718,11 @@ export async function delegateAgent(input, dependencies = {}) {
     writerProcessIdentity = writerProcessIdentity || error?.processIdentity || runnerEvidence?.processIdentity;
     terminalProof = error?.terminalProof ?? runnerEvidence?.terminalProof;
     processProvenNotStarted = !runnerInvoked || error?.processStarted === false;
+    processAbsenceProven = !runnerInvoked || (
+      isRequestStop(error)
+        ? runnerEvidence?.processStarted === false
+        : error?.processStarted === false
+    );
     workspacePreparationAmbiguous = error?.sideEffectsUnproven === true;
     outcome = {
       ...baseOutcome({
@@ -1924,6 +1946,8 @@ export async function delegateAgent(input, dependencies = {}) {
                 releaseAuthorizedBy,
                 writerProcessStarted,
                 terminalProof,
+                processAbsenceProven,
+                workspacePreparationAmbiguous,
                 reservation
               });
           if (!settlement) {
@@ -1944,7 +1968,9 @@ export async function delegateAgent(input, dependencies = {}) {
               const released = await settlement.release(settlementSignal.signal, settlement.scope);
               custodyState = released.state.toLowerCase();
               reservation = released;
-              custodyReason = "custody_settled_after_request_stop";
+              custodyReason = settlement.basis === "absence-proven"
+                ? "custody_settled_no_process_started"
+                : "custody_settled_after_request_stop";
               custodyReasons.push({ code: custodyReason });
               if (outcome) outcome.custodyState = custodyState;
             } catch (settlementError) {
