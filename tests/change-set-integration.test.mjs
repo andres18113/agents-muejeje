@@ -819,12 +819,18 @@ test("root cancellation during artifact persistence returns timeout without publ
 
     assert.equal(outcome.status, "timeout");
     assert.equal(outcome.error.code, "claude_cancelled");
-    assert.equal(outcome.custodyState, "retained");
+    // Nothing was published and nothing can be: the fence was never crossed, so
+    // no receipt can appear after this point.
     assert.equal(outcome.reviewBinding.publication.status, "cancelled-before-authority");
     assert.equal(receiptPreconditionReached.value, false);
+    // With no receipt outstanding and the reviewer's exact child proven closed,
+    // the cancelled request still owns exactly one thing - this execution's
+    // custody - and returning it is the one settlement it may perform. A
+    // publication still in flight would forbid this, and does elsewhere.
+    assert.equal(outcome.custodyState, "released");
 
     const repositoryKey = await coordinationKeyFor(repositoryRoot);
-    assert.notEqual(await custody.getWriteAccess(repositoryKey), undefined);
+    assert.equal(await custody.getWriteAccess(repositoryKey), undefined);
     const listed = await new ReviewReceiptStore({ stateRoot }).listForChangeSet({
       canonicalRootKey: repositoryKey,
       changeSetId: outcome.reviewBinding.beforeChangeSetId
