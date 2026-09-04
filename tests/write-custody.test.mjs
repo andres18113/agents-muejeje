@@ -1490,3 +1490,51 @@ test("foreign or ambiguous late proof cannot release ORPHANED custody", async ()
     assert.equal((await first.getWriteAccess(rootAKey)).state, "ORPHANED");
   });
 });
+
+/**
+ * A settlement that runs after its request has stopped carries no request
+ * authority - only authority over the one execution it owns. Naming the
+ * revision is what makes that scope checkable, so a record that advanced in the
+ * meantime is a different durable fact this settlement has no standing to act
+ * on. Without this pin, "release the custody I own" would quietly become
+ * "release whatever is in that slot now".
+ */
+test("a scoped terminal settlement refuses a record that moved since it was observed", async () => {
+  await withState(async (stateRoot) => {
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100);
+    const identity = childIdentity();
+    await reserve(custody);
+    const observed = await activate(custody, identity);
+
+    // The exact revision this settlement observed still owns the slot.
+    const moved = await custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "coordinator-observed-elsewhere"
+    });
+    assert.notEqual(moved.revision, observed.revision);
+
+    await assert.rejects(
+      custody.releaseWriteAccessAfterTerminal({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: terminalProof(identity),
+        expectedRevision: observed.revision
+      }),
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_settlement_scope_lost"
+    );
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.state, "ORPHANED");
+    assert.equal(authoritative.revision, moved.revision);
+
+    // Naming the revision that is actually there settles exactly that record.
+    const released = await custody.releaseOrphanedWriteAccessAfterTerminal({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      terminalProof: terminalProof(identity, 1_300)
+    });
+    assert.equal(released.state, "RELEASED");
+  });
+});
