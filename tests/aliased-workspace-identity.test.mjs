@@ -10,6 +10,10 @@ import { delegateAgent } from "../src/delegate-agent.mjs";
 import { ReviewReceiptStore } from "../src/review/receipt-store.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import {
+  inspectSyntheticProcess,
+  syntheticStartTime
+} from "./fixtures/synthetic-process-identity.mjs";
 
 /**
  * One directory, two spellings.
@@ -58,30 +62,7 @@ let nextPid = 74_000;
  * than a fabricated PID with no observation behind it.
  */
 const FIXTURE_IDENTITY_SOURCE = "aliased-workspace-test";
-
-function fixtureStartTime(pid) {
-  return String(pid * 100);
-}
-
-/**
- * The deterministic process observation this fixture's identities require.
- *
- * Every process this test models - the coordinator running the review and the
- * supervised children it starts - is alive for the whole review, so that is
- * what the observation reports. Nothing here relaxes what production does with
- * the answer: custody still requires an exact PID + start-time + source match,
- * and an identity that does not match one is still refused.
- */
-async function inspectFixtureProcess(pid) {
-  return Object.freeze({
-    status: "alive",
-    identity: Object.freeze({
-      pid,
-      startTime: fixtureStartTime(pid),
-      source: FIXTURE_IDENTITY_SOURCE
-    })
-  });
-}
+const inspectFixtureProcess = inspectSyntheticProcess(FIXTURE_IDENTITY_SOURCE);
 
 function git(cwd, args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8", shell: false, windowsHide: true });
@@ -157,7 +138,7 @@ function reviewerNaming(repositoryRootFor, captured) {
       agentType: "code-review",
       repositoryRoot: repositoryRootFor(repositoryRoot),
       pid,
-      startTime: fixtureStartTime(pid),
+      startTime: syntheticStartTime(pid),
       source: FIXTURE_IDENTITY_SOURCE,
       child,
       startedAt: 1

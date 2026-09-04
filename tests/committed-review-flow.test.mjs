@@ -10,6 +10,10 @@ import { EVIDENCE_COMPLETENESS } from "../src/review/committed-evidence.mjs";
 import { ReviewReceiptStore } from "../src/review/receipt-store.mjs";
 import { validateReviewReceipt } from "../src/review/receipt-schema.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import {
+  inspectSyntheticProcess,
+  syntheticStartTime
+} from "./fixtures/synthetic-process-identity.mjs";
 
 /**
  * The end of the committed-review question: does the reviewer actually receive
@@ -28,6 +32,10 @@ import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
  */
 
 let nextPid = 52_000;
+
+/** This fixture mints its own children, so it supplies their observation. */
+const IDENTITY_SOURCE = "committed-review-flow";
+const inspectProcess = inspectSyntheticProcess(IDENTITY_SOURCE);
 
 function git(cwd, args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8", shell: false, windowsHide: true });
@@ -58,8 +66,8 @@ function capturingReviewer(captured) {
       agentType: "code-review",
       repositoryRoot,
       pid,
-      startTime: String(pid * 100),
-      source: "committed-review-flow",
+      startTime: syntheticStartTime(pid),
+      source: IDENTITY_SOURCE,
       child,
       startedAt: 1
     });
@@ -116,7 +124,7 @@ async function withCommittedRepository(callback) {
 
 async function reviewCommitted({ repository, stateRoot, extra = {} }) {
   const captured = { prompts: [], repositoryRoots: [], repository };
-  const writeCustody = new DurableWriteCustodyManager({ stateRoot });
+  const writeCustody = new DurableWriteCustodyManager({ stateRoot, inspectProcess });
   const receiptStore = new ReviewReceiptStore({ stateRoot });
   const outcome = await delegateAgent(
     {

@@ -1,4 +1,5 @@
 import { DurableWriteCustodyManager } from "../../src/write-custody.mjs";
+import { probeSyntheticProcess } from "./synthetic-process-identity.mjs";
 
 const [
   stateRoot,
@@ -10,22 +11,7 @@ const [
 
 const IDENTITY_SOURCE = "phase6-fixture-identity";
 
-async function inspectProcess(pid) {
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    if (error?.code === "ESRCH") return Object.freeze({ status: "dead" });
-    return Object.freeze({ status: "ambiguous", reason: "fixture-probe-failed" });
-  }
-  return Object.freeze({
-    status: "alive",
-    identity: Object.freeze({
-      pid,
-      startTime: String(pid * 100),
-      source: IDENTITY_SOURCE
-    })
-  });
-}
+const inspectProcess = probeSyntheticProcess(IDENTITY_SOURCE);
 
 function waitForRelease() {
   return new Promise((resolve) => {

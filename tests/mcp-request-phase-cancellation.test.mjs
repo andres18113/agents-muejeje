@@ -7,6 +7,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import { inspectSyntheticProcess } from "./fixtures/synthetic-process-identity.mjs";
+
+// Matches the identities the spawned server fixture mints.
+const inspectProcess = inspectSyntheticProcess("stdio-cancellation-fixture");
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 
@@ -154,7 +158,7 @@ async function withTransport(phase, callback) {
       client,
       repositoryRoot,
       markerDirectory,
-      custody: new DurableWriteCustodyManager({ stateRoot }),
+      custody: new DurableWriteCustodyManager({ stateRoot, inspectProcess }),
       repositoryKey: workspace.canonicalRepositoryKey
     });
   } finally {

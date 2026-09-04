@@ -1,4 +1,5 @@
 import { DurableWriteCustodyManager } from "../../src/write-custody.mjs";
+import { probeSyntheticProcess } from "./synthetic-process-identity.mjs";
 
 const [stateRoot, canonicalRoot, executionId, identityMode] = process.argv.slice(2);
 
@@ -17,26 +18,7 @@ const [stateRoot, canonicalRoot, executionId, identityMode] = process.argv.slice
  * PID-reuse detection, ambiguity failing closed) are exercised by the dedicated
  * Windows integration tests instead.
  */
-function deterministicIdentity() {
-  return async (pid) => {
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if (error?.code === "ESRCH") {
-        return Object.freeze({ status: "dead" });
-      }
-      return Object.freeze({ status: "ambiguous", reason: "fixture-probe-failed" });
-    }
-    return Object.freeze({
-      status: "alive",
-      identity: Object.freeze({
-        pid,
-        startTime: String(pid * 100),
-        source: "fixture-deterministic-identity"
-      })
-    });
-  };
-}
+const deterministicIdentity = () => probeSyntheticProcess("fixture-deterministic-identity");
 
 /** Holds the reservation open until the parent says the contention is over. */
 function waitForRelease() {

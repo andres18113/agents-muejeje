@@ -11,6 +11,11 @@ import { runClaudeAgent } from "../src/claude-runner.mjs";
 import { delegateAgent, resolveAgentRuntime } from "../src/delegate-agent.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
 import { repositoryIdForCanonicalRootKey } from "../src/write-custody.mjs";
+import { inspectSyntheticProcess } from "./fixtures/synthetic-process-identity.mjs";
+
+// The children this file mints all name "test" and already carry pid * 100 as
+// their start time, so this is the observation they imply.
+const inspectProcess = inspectSyntheticProcess("test");
 import { sha256Hex } from "../src/canonical-json.mjs";
 import { SECTION_NAMES, changeSetIdFromSectionDigests } from "../src/changeset/descriptor.mjs";
 import { NO_REVIEW_TARGET } from "../src/changeset/target.mjs";
@@ -58,7 +63,7 @@ async function withDisposableRepo(callback) {
   git(repoDir, ["add", "-A"]);
   git(repoDir, ["commit", "-m", "feat: initial commit"]);
 
-  const writeCustody = new DurableWriteCustodyManager({ stateRoot });
+  const writeCustody = new DurableWriteCustodyManager({ stateRoot, inspectProcess });
 
   try {
     await callback({ repoDir, stateRoot, writeCustody });

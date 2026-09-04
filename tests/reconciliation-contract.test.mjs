@@ -16,6 +16,10 @@ import {
 } from "../src/delegate-agent.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
 import {
+  inspectSyntheticProcess,
+  syntheticStartTime
+} from "./fixtures/synthetic-process-identity.mjs";
+import {
   beginAdmissionPublication,
   repositoryStateDirectoryIn,
   settleAdmissionPublication
@@ -58,7 +62,7 @@ async function withRepository(callback) {
     await callback({
       repositoryRoot,
       stateRoot,
-      writeCustody: new DurableWriteCustodyManager({ stateRoot })
+      writeCustody: new DurableWriteCustodyManager({ stateRoot, inspectProcess })
     });
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
@@ -66,6 +70,10 @@ async function withRepository(callback) {
 }
 
 let nextPid = 71_000;
+
+/** This fixture mints its own children, so it supplies their observation. */
+const IDENTITY_SOURCE = "reconciliation-contract";
+const inspectProcess = inspectSyntheticProcess(IDENTITY_SOURCE);
 
 function completedReviewRunner(result) {
   return async ({ executionId, agentType, repositoryRoot, onChildStarted }) => {
@@ -77,8 +85,8 @@ function completedReviewRunner(result) {
       pid,
       child: { pid },
       startedAt: Date.now(),
-      startTime: String(pid * 100),
-      source: "reconciliation-contract"
+      startTime: syntheticStartTime(pid),
+      source: IDENTITY_SOURCE
     };
     await onChildStarted?.(processIdentity);
     return {
@@ -413,6 +421,7 @@ test("a root cancellation after the initial admission rename is issued reports t
     const publicationMayFinish = new Promise((resolve) => { resumePublication = resolve; });
     const writeCustody = new DurableWriteCustodyManager({
       stateRoot,
+      inspectProcess,
       afterPublicationIssued: async ({ nextRecord }) => {
         if (nextRecord.state !== "RESERVED") return;
         publicationIssued();
@@ -456,7 +465,7 @@ test("a root cancellation after the initial admission rename is issued reports t
     // No child of that execution ever existed, so the slot is returned rather
     // than held for the rest of the coordinator's life - and it is returned as
     // archived history for exactly this execution, not silently discarded.
-    const later = new DurableWriteCustodyManager({ stateRoot });
+    const later = new DurableWriteCustodyManager({ stateRoot, inspectProcess });
     assert.equal(await later.getWriteAccess(workspace.canonicalRepositoryKey), undefined);
     const archived = JSON.parse(await readFile(
       path.join(

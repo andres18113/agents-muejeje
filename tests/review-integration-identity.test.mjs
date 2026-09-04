@@ -6,6 +6,14 @@ import path from "node:path";
 import test from "node:test";
 import { delegateAgent } from "../src/delegate-agent.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import {
+  inspectSyntheticProcess,
+  syntheticStartTime
+} from "./fixtures/synthetic-process-identity.mjs";
+
+/** This fixture mints its own children, so it supplies their observation. */
+const IDENTITY_SOURCE = "integration-identity";
+const inspectProcess = inspectSyntheticProcess(IDENTITY_SOURCE);
 
 function git(cwd, args) {
   const result = spawnSync("git", args, {
@@ -42,7 +50,10 @@ async function withRepository(callback) {
     await writeFile(path.join(repositoryRoot, "subject.txt"), "base\n", "utf8");
     git(repositoryRoot, ["add", "subject.txt"]);
     git(repositoryRoot, ["commit", "-m", "base"]);
-    await callback({ repositoryRoot, writeCustody: new DurableWriteCustodyManager({ stateRoot }) });
+    await callback({
+      repositoryRoot,
+      writeCustody: new DurableWriteCustodyManager({ stateRoot, inspectProcess })
+    });
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   }
@@ -60,8 +71,8 @@ function reviewRunner() {
       pid,
       child: { pid },
       startedAt: Date.now(),
-      startTime: String(pid * 100),
-      source: "integration-identity"
+      startTime: syntheticStartTime(pid),
+      source: IDENTITY_SOURCE
     };
     await onChildStarted?.(processIdentity);
     return {

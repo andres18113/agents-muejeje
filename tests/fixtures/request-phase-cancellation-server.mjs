@@ -5,6 +5,10 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { delegateAgent, registerDelegateAgentTool } from "../../src/delegate-agent.mjs";
 import { ReviewReceiptStore } from "../../src/review/receipt-store.mjs";
 import { DurableWriteCustodyManager } from "../../src/write-custody.mjs";
+import {
+  inspectSyntheticProcess,
+  syntheticStartTime
+} from "./synthetic-process-identity.mjs";
 
 const phase = process.env.CLAUDE_AGENTS_TEST_PHASE;
 const stateRoot = process.env.CLAUDE_AGENTS_TEST_STATE_ROOT;
@@ -14,7 +18,11 @@ if (!phase || !stateRoot || !markerDirectory) {
   throw new Error("Cancellation fixture requires phase, state root, and marker directory.");
 }
 
-const writeCustody = new DurableWriteCustodyManager({ stateRoot });
+const IDENTITY_SOURCE = "stdio-cancellation-fixture";
+const writeCustody = new DurableWriteCustodyManager({
+  stateRoot,
+  inspectProcess: inspectSyntheticProcess(IDENTITY_SOURCE)
+});
 let nextPid = 91_000;
 
 function cancellationError() {
@@ -47,8 +55,8 @@ function seededReviewRunner() {
       pid,
       child: { pid },
       startedAt: Date.now(),
-      startTime: String(pid * 100),
-      source: "stdio-cancellation-fixture"
+      startTime: syntheticStartTime(pid),
+      source: IDENTITY_SOURCE
     };
     await onChildStarted?.(processIdentity);
     return {
