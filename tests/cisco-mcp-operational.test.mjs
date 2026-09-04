@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { delegateAgent } from "../src/delegate-agent.mjs";
 import { collectChangeSet } from "../src/changeset/collector.mjs";
 import { NO_REVIEW_TARGET } from "../src/changeset/target.mjs";
@@ -14,25 +13,12 @@ import { buildReviewReceipt } from "../src/review/receipt-schema.mjs";
 import { ReviewReceiptStore } from "../src/review/receipt-store.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
+import { FAKE_CLAUDE_EXE, ensureFakeClaude } from "./fixtures/fake-claude-build.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs");
-const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
+const fakeClaudeExe = FAKE_CLAUDE_EXE;
 
 const OPTIONAL_CISCO_MCP_DIR = process.env.CLAUDE_AGENTS_CISCO_MCP_DIR;
 const OPTIONAL_CISCO_MCP_REVISION = process.env.CLAUDE_AGENTS_CISCO_MCP_REVISION;
-
-function findCsc() {
-  const candidates = [
-    process.env.CSC_PATH,
-    "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe",
-    "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
-  ].filter(Boolean);
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return "csc.exe";
-}
 
 function git(cwd, args) {
   const result = spawnSync("git", args, {
@@ -52,19 +38,6 @@ function git(cwd, args) {
     assert.fail(`git ${args.join(" ")} in '${cwd}' failed: ${errorDetails}`);
   }
   return result.stdout.trim();
-}
-
-function ensureFakeClaude() {
-  if (!existsSync(fakeClaudeExe)) {
-    const csc = findCsc();
-    const res = spawnSync(csc, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
-      windowsHide: true,
-      shell: false
-    });
-    if (res.status !== 0 || res.error) {
-      assert.fail("Failed to compile FakeClaude.cs: " + (res.error?.message || res.stderr || res.stdout));
-    }
-  }
 }
 
 function captureGitSnapshot(cwd) {
@@ -192,7 +165,6 @@ async function withDisposableCiscoRepo(callback) {
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
-
 
 test("source-worktree safety & Cisco-MCP compatibility: writer delegations isolate changes in detached worktree without touching source repo", async () => {
   ensureFakeClaude();

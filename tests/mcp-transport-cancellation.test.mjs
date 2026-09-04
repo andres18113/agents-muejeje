@@ -10,11 +10,10 @@ import { defaultDurableStateRoot, repositoryStateDirectoryIn } from "../src/cust
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import { FAKE_CLAUDE_EXE, ensureFakeClaude } from "./fixtures/fake-claude-build.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs");
-const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
-const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
+const fakeClaudeExe = FAKE_CLAUDE_EXE;
 
 /**
  * This test exercises exactly one thing: a request that is already durably
@@ -44,16 +43,6 @@ const POLL_INTERVAL_MS = 50;
 
 /** Durable states from which the delegation can no longer reach ACTIVE. */
 const SETTLED_STATES = new Set(["RELEASED", "ORPHANED", "HANDOFF_READY", "TERMINAL_PROVEN"]);
-
-function ensureFakeClaude() {
-  if (!existsSync(fakeClaudeExe)) {
-    const res = spawnSync(cscPath, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
-      windowsHide: true,
-      shell: false
-    });
-    assert.equal(res.status, 0, "Failed to compile FakeClaude.cs: " + (res.stderr || res.stdout));
-  }
-}
 
 function processIsAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;

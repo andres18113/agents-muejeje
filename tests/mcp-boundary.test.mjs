@@ -1,27 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { delegateAgentOutputSchema } from "../src/delegate-outcome.mjs";
+import { FAKE_CLAUDE_EXE, ensureFakeClaude } from "./fixtures/fake-claude-build.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs");
-const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
-const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
-
-function ensureFakeClaude() {
-  if (!existsSync(fakeClaudeExe)) {
-    const res = spawnSync(cscPath, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
-      windowsHide: true,
-      shell: false
-    });
-    assert.equal(res.status, 0, "Failed to compile FakeClaude.cs: " + (res.stderr || res.stdout));
-  }
-}
+const fakeClaudeExe = FAKE_CLAUDE_EXE;
 
 class McpTestClient {
   #child;

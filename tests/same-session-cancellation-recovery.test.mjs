@@ -10,6 +10,7 @@ import { defaultDurableStateRoot } from "../src/custody/durable-store.mjs";
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
+import { FAKE_CLAUDE_EXE, ensureFakeClaude } from "./fixtures/fake-claude-build.mjs";
 
 /**
  * Cancelling a writer must not cost the repository its next writer.
@@ -30,25 +31,13 @@ import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs");
-const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
-const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
+const fakeClaudeExe = FAKE_CLAUDE_EXE;
 
 // Watchdogs only. Every wait below ends on a durable condition or on proof that
 // the condition can no longer occur; these bounds exist so a hung run fails.
 const READINESS_WATCHDOG_MS = 120_000;
 const SETTLEMENT_WATCHDOG_MS = 60_000;
 const POLL_INTERVAL_MS = 50;
-
-function ensureFakeClaude() {
-  if (!existsSync(fakeClaudeExe)) {
-    const res = spawnSync(cscPath, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
-      windowsHide: true,
-      shell: false
-    });
-    assert.equal(res.status, 0, "Failed to compile FakeClaude.cs: " + (res.stderr || res.stdout));
-  }
-}
 
 async function withCoordinator(callback) {
   ensureFakeClaude();
