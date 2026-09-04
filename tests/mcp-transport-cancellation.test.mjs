@@ -16,6 +16,36 @@ const fakeClaudeSource = path.join(repoRoot, "tests", "fixtures", "FakeClaude.cs
 const fakeClaudeExe = path.join(repoRoot, "tests", "fixtures", "fake-claude.exe");
 const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
 
+/**
+ * This test exercises exactly one thing: a request that is already durably
+ * ACTIVE is cancelled at the transport, and custody must be retained rather
+ * than released by post-stop cleanup.
+ *
+ * Everything before that cancellation is setup, and setup is not the subject.
+ * The readiness path spends its time in real subprocesses - several `git`
+ * invocations plus two Windows process-identity queries, one for the
+ * coordinator and one for the spawned child - so its wall-clock duration is a
+ * property of machine load, not of the behaviour under test. Measured on this
+ * project it ranges from under a second when idle to over eleven seconds while
+ * two full suites run concurrently.
+ *
+ * A fixed readiness budget therefore tests the machine. These bounds are
+ * watchdogs instead: they exist only so a genuinely hung run fails instead of
+ * hanging forever, and they are an order of magnitude above the slowest
+ * observed healthy readiness. Progress is decided by the durable record, never
+ * by the clock.
+ */
+const READINESS_WATCHDOG_MS = 120_000;
+const TERMINATION_WATCHDOG_MS = 60_000;
+// The post-stop assertion is a negative one - no release mutation may start -
+// so it is checked continuously across this window rather than sampled once
+// after a sleep.
+const POST_STOP_OBSERVATION_MS = 1_500;
+const POLL_INTERVAL_MS = 50;
+
+/** Durable states from which the delegation can no longer reach ACTIVE. */
+const SETTLED_STATES = new Set(["RELEASED", "ORPHANED", "HANDOFF_READY", "TERMINAL_PROVEN"]);
+
 function ensureFakeClaude() {
   if (!existsSync(fakeClaudeExe)) {
     const res = spawnSync(cscPath, ["/nologo", "/out:" + fakeClaudeExe, fakeClaudeSource], {
@@ -23,6 +53,16 @@ function ensureFakeClaude() {
       shell: false
     });
     assert.equal(res.status, 0, "Failed to compile FakeClaude.cs: " + (res.stderr || res.stdout));
+  }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
   }
 }
 
@@ -46,9 +86,19 @@ test("transport-level request cancellation aborts child execution and retains cu
 
   await writeFile(path.join(tempDir, "fake-claude-scenario.json"), JSON.stringify({ scenario: "hang" }), "utf8");
 
-  const cleanEnv = { ...process.env };
-  for (const k of Object.keys(cleanEnv)) {
-    if (k.toLowerCase() === "localappdata") delete cleanEnv[k];
+  // The server under test reads its own configuration from the environment,
+  // including CLAUDE_AGENTS_DELEGATE_TIMEOUT_MS, which caps the useful-work
+  // envelope and therefore the whole root request. An operator override present
+  // in the developer's shell would silently move that bound into the readiness
+  // path this test waits on, so the fixture declares the entire CLAUDE_AGENTS_*
+  // surface itself instead of inheriting it. With no override the `task`
+  // profile's own 20-minute envelope applies, which is far outside any
+  // readiness time this test can observe.
+  const cleanEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    const upper = name.toUpperCase();
+    if (upper === "LOCALAPPDATA" || upper.startsWith("CLAUDE_AGENTS_")) continue;
+    cleanEnv[name] = value;
   }
   cleanEnv.LOCALAPPDATA = stateRoot;
   cleanEnv.TEMP = tempDir;
@@ -59,6 +109,14 @@ test("transport-level request cancellation aborts child execution and retains cu
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: cleanEnv
+  });
+  let serverExit;
+  serverChild.on("exit", (code, signal) => {
+    serverExit = { code, signal };
+  });
+  let serverStderr = "";
+  serverChild.stderr.on("data", (chunk) => {
+    serverStderr += chunk.toString("utf8");
   });
 
   let buffer = "";
@@ -83,29 +141,35 @@ test("transport-level request cancellation aborts child execution and retains cu
 
   const sendRequest = (method, params = {}) => {
     const id = nextId++;
-    return new Promise((resolve) => {
+    const response = new Promise((resolve) => {
       pending.set(id, resolve);
       serverChild.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
+    return { id, response };
   };
 
   const sendNotification = (method, params = {}) => {
     serverChild.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
   };
 
+  const startedAt = Date.now();
+  // Bounded: one entry per observed change, not per poll.
+  const stateTrace = [];
+
   try {
     // 1. Initialize MCP connection and await server acknowledgement
-    const initRes = await sendRequest("initialize", {
+    const initCall = sendRequest("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "hermetic-cancellation-client", version: "1.0.0" }
     });
+    const initRes = await initCall.response;
     assert.equal(initRes.result.serverInfo.name, "claude-agents");
 
     sendNotification("notifications/initialized");
 
     // 2. Invoke delegate_agent tool (starts FakeClaude which hangs)
-    const callPromise = sendRequest("tools/call", {
+    const toolCall = sendRequest("tools/call", {
       name: "delegate_agent",
       arguments: {
         agent_type: "task",
@@ -113,43 +177,147 @@ test("transport-level request cancellation aborts child execution and retains cu
         cwd: testRepo
       }
     });
+    // A cancelled request is never answered, so this response only ever arrives
+    // when the delegation settled on its own - which means the scenario under
+    // test never happened and the wait below must stop and say so.
+    let toolResponse;
+    void toolCall.response.then((msg) => {
+      toolResponse = msg;
+    });
 
-    // 3. Wait for child to be spawned and reach durable ACTIVE state
     const durableRoot = defaultDurableStateRoot({ env: { LOCALAPPDATA: stateRoot } });
     const initialWorkspace = await resolveCanonicalWorkspaceRoot(testRepo);
     const resolvedWorkspace = await resolveRepositoryCoordinationIdentity(initialWorkspace);
     const repoKey = resolvedWorkspace.canonicalRepositoryKey;
     const custody = new DurableWriteCustodyManager({ stateRoot: durableRoot });
 
-    let activeRecord = null;
-    for (let i = 0; i < 50; i++) {
-      activeRecord = await custody.getWriteAccess(repoKey);
-      if (activeRecord?.state === "ACTIVE") break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    assert.equal(activeRecord?.state, "ACTIVE", "Execution must reach durable ACTIVE state before cancellation");
+    const readDurable = async () => {
+      try {
+        return { record: await custody.getWriteAccess(repoKey) };
+      } catch (error) {
+        return { readError: error?.code || error?.name || String(error) };
+      }
+    };
+    const observe = (label, { record, readError } = {}) => {
+      const state = record?.state ?? (readError ? "read-error:" + readError : "absent");
+      const last = stateTrace[stateTrace.length - 1];
+      if (last?.label === label && last?.state === state) return state;
+      stateTrace.push({
+        at: Date.now() - startedAt,
+        label,
+        state,
+        revision: record?.revision,
+        transitions: record?.transitions?.map((transition) => transition.state).join(">"),
+        ...(record?.orphanReason ? { orphanReason: record.orphanReason } : {})
+      });
+      return state;
+    };
+    const diagnose = (summary) => {
+      const outcome = toolResponse?.result?.structuredContent ?? toolResponse?.result?.structured_content;
+      return [
+        summary,
+        "stateTrace=" + JSON.stringify(stateTrace),
+        "toolResponded=" + Boolean(toolResponse),
+        "toolError=" + JSON.stringify(outcome?.execution?.error ?? null),
+        "toolCustody=" + JSON.stringify(outcome?.custody ?? null),
+        "serverExit=" + JSON.stringify(serverExit ?? null),
+        "serverStderr=" + JSON.stringify(serverStderr.slice(-1500))
+      ].join("\n  ");
+    };
 
-    // 4. Send protocol-level cancellation notification
+    // 3. Wait for the durable ACTIVE state itself. The loop ends on a real
+    // condition - ACTIVE reached, or the delegation provably unable to reach it
+    // - and the watchdog exists only so a hang cannot stall the suite.
+    let activeRecord = null;
+    let unreachable;
+    const readinessDeadline = Date.now() + READINESS_WATCHDOG_MS;
+    while (Date.now() < readinessDeadline) {
+      const observation = await readDurable();
+      const state = observe("readiness", observation);
+      if (state === "ACTIVE") {
+        activeRecord = observation.record;
+        break;
+      }
+      if (SETTLED_STATES.has(state)) {
+        unreachable = "the delegation settled in " + state + " before reaching ACTIVE";
+        break;
+      }
+      if (toolResponse) {
+        unreachable = "the delegation answered tools/call before reaching ACTIVE";
+        break;
+      }
+      if (serverExit) {
+        unreachable = "the MCP server exited before the delegation reached ACTIVE";
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+
+    assert.ok(
+      activeRecord,
+      diagnose(
+        unreachable
+          ? "Execution could not reach durable ACTIVE: " + unreachable +
+            ". The transport-cancellation scenario was never entered, so this run proves nothing about it."
+          : "Execution did not reach durable ACTIVE within the " + READINESS_WATCHDOG_MS +
+            "ms readiness watchdog."
+      )
+    );
+
+    // 4. Send protocol-level cancellation notification for the exact request id
     sendNotification("notifications/cancelled", {
-      requestId: 2,
+      requestId: toolCall.id,
       reason: "transport client disconnected"
     });
 
-    // 5. A root-stopped request may not begin a new durable release mutation.
-    // The record stays retained for ordinary reconciliation rather than making
-    // post-cancellation cleanup look like an in-bound settlement.
-    await new Promise((resolve) => setTimeout(resolve, 750));
-    const retainedRecord = await custody.getWriteAccess(repoKey);
-    assert.ok(retainedRecord, "Cancellation must retain durable custody for reconciliation");
-    assert.notEqual(retainedRecord.state, "RELEASED", "Cancellation must not start a post-stop release");
+    // 5. Cancellation must actually reach the child. The durable record names
+    // the exact Claude process, so its disappearance is the real signal that
+    // forced termination ran, rather than an assumed interval. Pid reuse cannot
+    // make this wait wrong: it is only a synchronization hint, and every
+    // assertion below is made against the durable record.
+    const claudePid = activeRecord.claudeProcess?.pid;
+    assert.ok(Number.isSafeInteger(claudePid), diagnose("Durable ACTIVE record must name the Claude process."));
+    const terminationDeadline = Date.now() + TERMINATION_WATCHDOG_MS;
+    let terminated = false;
+    while (Date.now() < terminationDeadline) {
+      if (!processIsAlive(claudePid)) {
+        terminated = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+    assert.ok(
+      terminated,
+      diagnose("Cancellation must force-terminate the exact Claude child (pid " + claudePid + ").")
+    );
 
-    // 6. The durable lifecycle reached ACTIVE before cancellation, but no
+    // 6. A root-stopped request may not begin a new durable release mutation.
+    // The record stays retained for ordinary reconciliation rather than making
+    // post-cancellation cleanup look like an in-bound settlement. This is a
+    // negative property, so it is verified continuously across the observation
+    // window instead of sampled once.
+    const observationDeadline = Date.now() + POST_STOP_OBSERVATION_MS;
+    let retainedRecord;
+    while (Date.now() < observationDeadline) {
+      const observation = await readDurable();
+      observe("post-stop", observation);
+      retainedRecord = observation.record;
+      assert.ok(retainedRecord, diagnose("Cancellation must retain durable custody for reconciliation."));
+      assert.notEqual(
+        retainedRecord.state,
+        "RELEASED",
+        diagnose("Cancellation must not start a post-stop release.")
+      );
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+
+    // 7. The durable lifecycle reached ACTIVE before cancellation, but no
     // post-stop release transition is allowed. A future reconciliation owns
     // the terminal-proof and archival decision.
     const states = retainedRecord.transitions.map((t) => t.state);
-    assert.ok(states.includes("SPAWNING"), "Transitions must include SPAWNING");
-    assert.ok(states.includes("ACTIVE"), "Transitions must include ACTIVE");
-    assert.ok(!states.includes("RELEASED"), "Transitions must not include a post-stop RELEASED state");
+    assert.ok(states.includes("SPAWNING"), diagnose("Transitions must include SPAWNING"));
+    assert.ok(states.includes("ACTIVE"), diagnose("Transitions must include ACTIVE"));
+    assert.ok(!states.includes("RELEASED"), diagnose("Transitions must not include a post-stop RELEASED state"));
   } finally {
     serverChild.kill();
     await rm(fixtureRoot, { recursive: true, force: true }).catch(() => {});
