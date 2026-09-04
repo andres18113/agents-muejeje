@@ -111,7 +111,7 @@ test("reconcile_only never silently selects among multiple FRESH receipts and re
     assert.equal(ambiguous.custodyState, "not-applicable");
     assert.equal(ambiguous.reviewBinding.status, "ambiguous");
     assert.equal(ambiguous.reviewBinding.reviewId, null);
-    assert.ok(ambiguous.reviewBinding.reasons.some((reason) => reason.code === "review_reconcile_ambiguous"));
+    assert.ok(ambiguous.reviewBinding.reasons.some((reason) => reason.code === "multiple_fresh_reviews"));
     assert.match(ambiguous.result, /Multiple FRESH authoritative review receipts/u);
 
     const exact = await delegateAgent(
@@ -128,6 +128,7 @@ test("reconcile_only never silently selects among multiple FRESH receipts and re
     assert.equal(exact.reviewBinding.status, "bound");
     assert.equal(exact.reviewBinding.reviewId, first.reviewBinding.reviewId);
     assert.match(exact.result, /ALPHA FINDINGS/u);
+    assert.match(exact.result, /Result Artifact: VERIFIED/u);
     assert.doesNotMatch(exact.result, /BETA FINDINGS/u);
 
     const wrongScope = await delegateAgent(
@@ -142,6 +143,94 @@ test("reconcile_only never silently selects among multiple FRESH receipts and re
     );
     assert.equal(wrongScope.reviewBinding.status, "unavailable");
     assert.ok(wrongScope.reviewBinding.reasons.some((reason) => reason.code === "review_id_not_recovered"));
+
+    const wrongTarget = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "recover code review under the wrong target",
+        reconcileOnly: true,
+        reviewId: first.reviewBinding.reviewId,
+        targetRef: "refs/heads/main",
+        cwd: repositoryRoot
+      },
+      { writeCustody, runAgent: neverRun, env: {} }
+    );
+    assert.equal(wrongTarget.reviewBinding.status, "unavailable");
+    assert.ok(wrongTarget.reviewBinding.reasons.some((reason) => reason.code === "review_id_not_recovered"));
+
+    const nonexistent = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "recover a nonexistent review",
+        reconcileOnly: true,
+        reviewId: "rr1:" + "f".repeat(64),
+        cwd: repositoryRoot
+      },
+      { writeCustody, runAgent: neverRun, env: {} }
+    );
+    assert.equal(nonexistent.reviewBinding.status, "unavailable");
+    assert.ok(nonexistent.reviewBinding.reasons.some((reason) => reason.code === "review_id_not_recovered"));
+
+    const otherRepository = path.join(path.dirname(repositoryRoot), "other-repository");
+    await mkdir(otherRepository, { recursive: true });
+    git(otherRepository, ["init", "-b", "main"]);
+    git(otherRepository, ["config", "user.name", "Other Repository"]);
+    git(otherRepository, ["config", "user.email", "other@example.invalid"]);
+    await writeFile(path.join(otherRepository, "README.md"), "# other repository\n", "utf8");
+    git(otherRepository, ["add", "README.md"]);
+    git(otherRepository, ["commit", "-m", "other fixture"]);
+    const wrongRepository = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "recover code review under the wrong repository",
+        reconcileOnly: true,
+        reviewId: first.reviewBinding.reviewId,
+        cwd: otherRepository
+      },
+      { writeCustody, runAgent: neverRun, env: {} }
+    );
+    assert.equal(wrongRepository.reviewBinding.status, "unavailable");
+    assert.ok(wrongRepository.reviewBinding.reasons.some((reason) => reason.code === "review_id_not_recovered"));
+
+    await writeFile(path.join(repositoryRoot, "README.md"), "# stale fixture\n", "utf8");
+    const stale = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "recover an exact stale review",
+        reconcileOnly: true,
+        reviewId: first.reviewBinding.reviewId,
+        cwd: repositoryRoot
+      },
+      { writeCustody, runAgent: neverRun, env: {} }
+    );
+    assert.equal(stale.reviewBinding.status, "bound");
+    assert.equal(stale.reviewBinding.reviewId, first.reviewBinding.reviewId);
+    assert.ok(stale.reviewBinding.reasons.some((reason) => reason.code === "worktree_state_changed"));
+    assert.match(stale.result, /STALE/u);
+
+    const indeterminate = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "recover an exact indeterminate review",
+        reconcileOnly: true,
+        reviewId: first.reviewBinding.reviewId,
+        cwd: repositoryRoot
+      },
+      {
+        writeCustody,
+        runAgent: neverRun,
+        env: {},
+        collectChangeSet: async () => ({
+          status: "indeterminate",
+          reasons: [{ code: "untracked_directory_opaque" }]
+        })
+      }
+    );
+    assert.equal(indeterminate.reviewBinding.status, "unavailable");
+    assert.equal(indeterminate.reviewBinding.reviewId, first.reviewBinding.reviewId);
+    assert.ok(indeterminate.reviewBinding.reasons.some((reason) => reason.code === "untracked_directory_opaque"));
+    assert.match(indeterminate.result, /INDETERMINATE/u);
+    assert.equal(runnerCalls, 0);
 
     await assert.rejects(
       delegateAgent(
@@ -380,6 +469,85 @@ test("one root request deadline bounds reconcile_only even without a Claude runn
   assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
 });
 
+test("the root deadline bounds an in-flight coherent-admission operation and delivers its abort signal", async () => {
+  const clock = manualClock();
+  let admissionStarted;
+  let admissionSignal;
+  const started = new Promise((resolve) => { admissionStarted = resolve; });
+  const pending = delegateAgent(
+    { agentType: "code-review", task: "bound coherent admission", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    deadlineDependencies(clock, {
+      env: {},
+      coherentAdmission: {
+        async admit({ mutationSignal }) {
+          admissionSignal = mutationSignal;
+          admissionStarted();
+          await new Promise(() => {});
+        }
+      }
+    })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  const outcome = await pending;
+  assert.equal(admissionSignal.aborted, true);
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
+  assert.equal(outcome.custodyState, "not-acquired");
+});
+
+test("the root deadline bounds an in-flight custody settlement and does not start a second mutation", async () => {
+  const clock = manualClock();
+  let releaseStarted;
+  let releaseSignal;
+  const started = new Promise((resolve) => { releaseStarted = resolve; });
+  const pending = delegateAgent(
+    { agentType: "code-review", task: "bound custody settlement", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    deadlineDependencies(clock, {
+      env: {},
+      coherentAdmission: {
+        async admit() { return { coherence: "held", record: { state: "RESERVED" } }; }
+      },
+      reviewBinder: {
+        async before() {
+          return {
+            status: "unavailable",
+            coherence: "held",
+            reasons: [{ code: "review_binding_unavailable" }],
+            priorReviews: [],
+            receiptHistory: { status: "indeterminate", receipts: [], diagnostics: [] }
+          };
+        }
+      },
+      writeCustody: {
+        stateRoot: "C:\\deadline-state",
+        repositoryStateDirectory: () => "C:\\deadline-state\\repository",
+        async markSpawning() { return { state: "SPAWNING" }; },
+        async releaseUnstartedWriteAccess({ mutationSignal }) {
+          releaseSignal = mutationSignal;
+          releaseStarted();
+          await new Promise(() => {});
+        },
+        async markOrphanedWriteAccess() {
+          throw new Error("root stop must not start a second custody mutation");
+        }
+      },
+      runAgent: async () => {
+        throw Object.assign(new Error("runner proved no child started"), { processStarted: false });
+      }
+    })
+  );
+
+  await started;
+  clock.advanceTo(100);
+  const outcome = await pending;
+  assert.equal(releaseSignal.aborted, true);
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "delegate_request_deadline_exceeded");
+  assert.equal(outcome.custodyState, "retention-failed");
+});
+
 test("the root envelope clips Claude useful work while reserving settlement", async () => {
   const clock = manualClock();
   let usefulWorkTimeout;
@@ -394,4 +562,55 @@ test("the root envelope clips Claude useful work while reserving settlement", as
   );
   assert.equal(outcome.status, "completed");
   assert.equal(usefulWorkTimeout, 60);
+});
+
+test("pre-run work consumes the root envelope before runner clipping and insufficient reserve fails before spawn", async () => {
+  const clock = manualClock();
+  let runnerStarted;
+  let runnerSignal;
+  let usefulWorkTimeout;
+  const started = new Promise((resolve) => { runnerStarted = resolve; });
+  const pending = delegateAgent(
+    { agentType: "code-review", task: "clip after deterministic prework", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    deadlineDependencies(clock, {
+      loadContract: async () => {
+        clock.advanceTo(55);
+        return "deadline contract";
+      },
+      runAgent: async ({ runtime, abortSignal }) => {
+        usefulWorkTimeout = runtime.timeoutMs;
+        runnerSignal = abortSignal;
+        runnerStarted();
+        await new Promise(() => {});
+      }
+    })
+  );
+
+  await started;
+  // 100ms root deadline - 55ms pre-run work - 40ms mandatory settlement = 5ms.
+  assert.equal(usefulWorkTimeout, 5);
+  clock.advanceTo(100);
+  const timedOut = await pending;
+  assert.equal(runnerSignal.aborted, true);
+  assert.equal(timedOut.status, "timeout");
+  assert.equal(timedOut.error.code, "delegate_request_deadline_exceeded");
+
+  const insufficientClock = manualClock();
+  let runnerCalls = 0;
+  const insufficient = await delegateAgent(
+    { agentType: "code-review", task: "reserve before runner", cwd: DEADLINE_WORKSPACE.effectiveCwd },
+    deadlineDependencies(insufficientClock, {
+      loadContract: async () => {
+        insufficientClock.advanceTo(60);
+        return "deadline contract";
+      },
+      runAgent: async () => {
+        runnerCalls += 1;
+        throw new Error("runner must not start without settlement reserve");
+      }
+    })
+  );
+  assert.equal(runnerCalls, 0);
+  assert.equal(insufficient.status, "timeout");
+  assert.equal(insufficient.error.code, "delegate_request_deadline_exceeded");
 });

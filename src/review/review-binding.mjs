@@ -67,7 +67,8 @@ function receiptHistory(status, receipts = [], diagnostics = [], metadata = {}) 
     allReceipts: Object.freeze(allReceipts),
     totalCount,
     outputTruncated,
-    authoritativeExhaustive: metadata.authoritativeExhaustive === true,
+    authoritativeExhaustive: metadata.authoritativeExhaustive === true ||
+      (metadata.authoritativeExhaustive === undefined && status === "complete"),
     diagnostics: Object.freeze(diagnostics.slice(0, MAX_HISTORY_DIAGNOSTICS))
   });
 }

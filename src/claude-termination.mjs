@@ -59,11 +59,23 @@ function terminalResult(status, method, terminalProof, extras = {}) {
  * boundary from publishing; a rename already issued remains serialized until
  * it settles, so later custody mutations cannot overtake it.
  */
-export function startDurableLifecycleMutation(callback, processIdentity, context) {
+export function startDurableLifecycleMutation(callback, processIdentity, context = {}) {
   const controller = new AbortController();
+  const externalAbortSignal = context.abortSignal;
+  const cancelFromExternalSignal = () => controller.abort();
+  if (externalAbortSignal?.aborted) {
+    cancelFromExternalSignal();
+  } else {
+    externalAbortSignal?.addEventListener("abort", cancelFromExternalSignal, { once: true });
+  }
+  const cancelledBeforeCallback = Symbol("cancelled-before-lifecycle-callback");
   let callbackStarted = false;
   const promise = Promise.resolve()
     .then(() => {
+      // This check closes the gap between scheduling the lifecycle callback
+      // and its first microtask. A root-stopped request must not begin a new
+      // durable transition after its caller has settled.
+      if (controller.signal.aborted) return cancelledBeforeCallback;
       callbackStarted = true;
       return callback?.(processIdentity, {
         mutationSignal: controller.signal,
@@ -72,12 +84,18 @@ export function startDurableLifecycleMutation(callback, processIdentity, context
       });
     })
     .then(
-      (value) => Object.freeze({ kind: "completed", value }),
+      (value) => value === cancelledBeforeCallback
+        ? Object.freeze({ kind: "cancelled" })
+        : Object.freeze({ kind: "completed", value }),
       (error) => Object.freeze({ kind: "failed", error })
-  );
+    )
+    .finally(() => externalAbortSignal?.removeEventListener("abort", cancelFromExternalSignal));
   return Object.freeze({
     promise,
-    requestCancellation: () => controller.abort(),
+    requestCancellation: () => {
+      controller.abort();
+      externalAbortSignal?.removeEventListener("abort", cancelFromExternalSignal);
+    },
     hasStarted: () => callbackStarted
   });
 }
@@ -369,6 +387,7 @@ export async function terminateStartedChild({
   executionDeadlineAt,
   terminationTimeoutMs,
   inspectProcess,
+  abortSignal,
   now,
   schedule,
   cancelSchedule
@@ -384,7 +403,8 @@ export async function terminateStartedChild({
   if (processIdentity && onTerminationStarted) {
     const mutation = startDurableLifecycleMutation(onTerminationStarted, processIdentity, {
       executionDeadlineAt,
-      terminationDeadlineAt
+      terminationDeadlineAt,
+      abortSignal
     });
     const transitionOutcome = await waitForPromiseUntil(
       Promise.race([
@@ -407,6 +427,8 @@ export async function terminateStartedChild({
       durableTransition = Object.freeze({ status: "completed" });
     } else if (transitionOutcome.value?.kind === "failed") {
       durableTransition = Object.freeze({ status: "failed", error: transitionOutcome.value.error });
+    } else if (transitionOutcome.value?.kind === "cancelled") {
+      durableTransition = Object.freeze({ status: "cancelled", cancellationRequested: true });
     } else if (transitionOutcome.value?.kind === "close") {
       mutation.requestCancellation();
       durableTransition = Object.freeze({

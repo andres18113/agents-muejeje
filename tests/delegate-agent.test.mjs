@@ -1974,6 +1974,121 @@ test("profile deadlines include identity and durable activation setup", async ()
   assert.equal(stalledActivationChild.killCalls, 1);
 });
 
+test("root cancellation during identity capture never starts durable activation", async () => {
+  const controller = new AbortController();
+  const child = createFakeChild();
+  let releaseIdentity;
+  const identityMayFinish = new Promise((resolve) => {
+    releaseIdentity = resolve;
+  });
+  let notifyIdentityStarted;
+  const identityStarted = new Promise((resolve) => {
+    notifyIdentityStarted = resolve;
+  });
+  let activated = false;
+
+  const pending = runClaudeAgent({
+    prompt: "root cancellation during identity",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    abortSignal: controller.signal,
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    async inspectProcess() {
+      notifyIdentityStarted();
+      return await identityMayFinish;
+    },
+    onChildStarted() {
+      activated = true;
+    },
+    terminateChild: terminateFakeChild
+  });
+
+  await identityStarted;
+  controller.abort();
+  releaseIdentity({
+    status: "alive",
+    identity: { pid: child.pid, startTime: String(child.pid * 100), source: "test-process-start" }
+  });
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_cancelled");
+    return true;
+  });
+  assert.equal(activated, false);
+  assert.equal(child.killCalls, 1);
+});
+
+test("root cancellation before deferred settings creation starts no runner filesystem setup", async () => {
+  const controller = new AbortController();
+  let settingsStarted = false;
+  let spawnStarted = false;
+  const pending = runClaudeAgent({
+    prompt: "root cancellation before settings",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    abortSignal: controller.signal,
+    createSettings: async () => {
+      settingsStarted = true;
+      return {
+        settingsPath: "C:\\temp\\must-not-exist.json",
+        cleanup: async () => {}
+      };
+    },
+    spawnProcess: () => {
+      spawnStarted = true;
+      return createFakeChild();
+    }
+  });
+  controller.abort();
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_cancelled");
+    assert.equal(error.processStarted, false);
+    return true;
+  });
+  assert.equal(settingsStarted, false);
+  assert.equal(spawnStarted, false);
+});
+
+test("root cancellation reaches an in-flight durable activation mutation", async () => {
+  const controller = new AbortController();
+  const child = createFakeChild();
+  let releaseActivation;
+  const activationMayFinish = new Promise((resolve) => {
+    releaseActivation = resolve;
+  });
+  let notifyActivationStarted;
+  const activationStarted = new Promise((resolve) => {
+    notifyActivationStarted = resolve;
+  });
+  let activationSignal;
+
+  const pending = runClaudeAgent({
+    prompt: "root cancellation during activation",
+    cwd: projectRoot,
+    runtime: runtimeForTest({ timeoutMs: 1_000 }),
+    abortSignal: controller.signal,
+    createSettings: fakeSettings(),
+    spawnProcess: () => child,
+    async onChildStarted(_processIdentity, { mutationSignal }) {
+      activationSignal = mutationSignal;
+      notifyActivationStarted();
+      await activationMayFinish;
+    },
+    terminateChild: terminateFakeChild
+  });
+
+  await activationStarted;
+  controller.abort();
+  const signalWasAborted = activationSignal.aborted;
+  releaseActivation();
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "claude_cancelled");
+    return true;
+  });
+  assert.equal(signalWasAborted, true);
+  assert.equal(child.killCalls, 1);
+});
+
 test("a timed-out durable termination transition reports cancellation without claiming pre-publication invalidation", async () => {
   const child = createFakeChild();
   let mutationSignal;

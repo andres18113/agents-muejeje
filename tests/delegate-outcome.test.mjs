@@ -108,6 +108,8 @@ test("the versioned public outcome projects the complete bounded evidence contra
   assert.equal(projected.review.beforeChangeSetId, CS_A);
   assert.equal(projected.review.afterChangeSetId, CS_B);
   assert.equal(projected.review.receiptHistory.status, "partial");
+  assert.equal(projected.review.receiptHistory.authoritativeExhaustive, false);
+  assert.equal(projected.review.receiptHistory.outputTruncated, false);
   assert.equal(projected.review.receiptHistory.receipts[0].freshness.verdict, "STALE");
   assert.deepEqual(
     projected.review.receiptHistory.receipts[0].freshness.changedSections,
@@ -187,6 +189,8 @@ test("public diagnostic arrays, strings and serialized output are deterministica
   }));
   assert.equal(marked.review.receiptHistory.count, repeatedReceipts.length);
   assert.equal(marked.review.receiptHistory.receipts.length, MAX_PUBLIC_HISTORY_RECEIPTS);
+  assert.equal(marked.review.receiptHistory.authoritativeExhaustive, true);
+  assert.equal(marked.review.receiptHistory.outputTruncated, true);
   assert.deepEqual(marked.review.receiptHistory.diagnostics, [
     { code: "public_receipt_history_truncated" }
   ]);
@@ -204,6 +208,8 @@ test("public diagnostic arrays, strings and serialized output are deterministica
     }
   }));
   assert.equal(unprojectable.review.receiptHistory.count, 1);
+  assert.equal(unprojectable.review.receiptHistory.authoritativeExhaustive, true);
+  assert.equal(unprojectable.review.receiptHistory.outputTruncated, false);
   assert.deepEqual(unprojectable.review.receiptHistory.receipts, []);
   assert.deepEqual(unprojectable.review.receiptHistory.diagnostics, [
     { code: "public_receipt_history_unprojectable" }
@@ -228,6 +234,8 @@ test("public receipt history distinguishes empty success from failed discovery",
   assert.deepEqual(empty.review.receiptHistory, {
     status: "complete",
     count: 0,
+    authoritativeExhaustive: true,
+    outputTruncated: false,
     receipts: [],
     diagnostics: []
   });
@@ -250,6 +258,40 @@ test("public receipt history distinguishes empty success from failed discovery",
     code: "review_history_discovery_failed",
     detail: "EACCES"
   }]);
+});
+
+test("public receipt history separates an exhaustive 17-receipt scan from its 16-receipt output bound", () => {
+  const authoritativeReceipts = Array.from({ length: 17 }, (_, index) => ({
+    reviewId: "rr1:" + index.toString(16).padStart(64, "0"),
+    agentType: "code-review",
+    changeSetId: "cs1:" + index.toString(16).padStart(64, "0"),
+    recordedAt: 100 + index,
+    verdict: "FRESH",
+    changedSections: [],
+    basisDifferences: [],
+    reasons: []
+  }));
+  const projected = projectDelegateAgentOutcome(fullOutcome({
+    reviewBinding: {
+      ...fullOutcome().reviewBinding,
+      receiptHistory: {
+        status: "partial",
+        totalCount: 17,
+        authoritativeExhaustive: true,
+        outputTruncated: true,
+        receipts: authoritativeReceipts,
+        diagnostics: []
+      }
+    }
+  }));
+
+  assert.equal(projected.review.receiptHistory.count, 17);
+  assert.equal(projected.review.receiptHistory.receipts.length, 16);
+  assert.equal(projected.review.receiptHistory.authoritativeExhaustive, true);
+  assert.equal(projected.review.receiptHistory.outputTruncated, true);
+  assert.ok(projected.review.receiptHistory.diagnostics.some((reason) =>
+    reason.code === "public_receipt_history_truncated"
+  ));
 });
 
 test("every member of a shared public domain survives projection unchanged", () => {

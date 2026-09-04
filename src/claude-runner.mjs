@@ -80,6 +80,34 @@ function summarizeBuffer(buffer, streamName) {
 }
 
 /**
+ * Observes request cancellation without making a phase's useful-work deadline
+ * depend on the cancellation listener. Callers dispose it as soon as their
+ * phase settles, so a later root stop cannot affect a completed phase.
+ */
+function observeRequestAbort(abortSignal) {
+  let abortListener;
+  let settled = false;
+  const promise = new Promise((resolve) => {
+    if (!abortSignal) return;
+    const reportAbort = () => {
+      if (settled) return;
+      settled = true;
+      resolve(Object.freeze({ kind: "request-aborted" }));
+    };
+    abortListener = reportAbort;
+    if (abortSignal.aborted) {
+      reportAbort();
+    } else {
+      abortSignal.addEventListener("abort", abortListener, { once: true });
+    }
+  });
+  return Object.freeze({
+    promise,
+    dispose: () => abortSignal?.removeEventListener("abort", abortListener)
+  });
+}
+
+/**
  * Binds one Claude child to the repository that granted its write custody.
  *
  * repositoryRoot is always the coordinated repository root, never the isolated
@@ -316,6 +344,14 @@ export async function runClaudeAgent({
   const startedAt = invocationStartedAt;
   const executionDeadlineAt = startedAt + runtime.timeoutMs;
   const durationMs = () => Math.max(0, now() - startedAt);
+  const cancellationBeforeSpawn = () => new ClaudeRunnerError(
+    "Client cancelled delegation before execution started.",
+    {
+      code: "claude_cancelled",
+      processStarted: false,
+      durationMs: durationMs()
+    }
+  );
   const profileTimeoutBeforeSpawn = () => new ClaudeTimeoutError(runtime.timeoutMs, {
     durationMs: durationMs(),
     processStarted: false
@@ -331,10 +367,16 @@ export async function runClaudeAgent({
       cancelSchedule
     });
 
-  const settingsPromise = Promise.resolve().then(() => createSettings({
-    executionId,
-    shellPolicy: runtime.shellPolicy
-  }));
+  const settingsPromise = Promise.resolve().then(() => {
+    // An abort can arrive after the synchronous entry check but before this
+    // first deferred operation starts. Do not create per-run files for an
+    // already-stopped request.
+    if (abortSignal?.aborted) throw cancellationBeforeSpawn();
+    return createSettings({
+      executionId,
+      shellPolicy: runtime.shellPolicy
+    });
+  });
   const settingsOutcome = await waitForPromiseUntil(settingsPromise, {
     deadlineAt: executionDeadlineAt,
     now,
@@ -354,9 +396,12 @@ export async function runClaudeAgent({
       },
       () => {}
     );
-    throw profileTimeoutBeforeSpawn();
+    throw abortSignal?.aborted ? cancellationBeforeSpawn() : profileTimeoutBeforeSpawn();
   }
   if (settingsOutcome.error) {
+    if (abortSignal?.aborted || settingsOutcome.error?.code === "claude_cancelled") {
+      throw cancellationBeforeSpawn();
+    }
     const settingsError = settingsOutcome.error instanceof ClaudeRuntimeSettingsError
       ? settingsOutcome.error
       : new ClaudeRuntimeSettingsError(String(settingsOutcome.error), { cause: settingsOutcome.error });
@@ -368,6 +413,16 @@ export async function runClaudeAgent({
     });
   }
   const settings = settingsOutcome.value;
+  if (abortSignal?.aborted) {
+    await cleanupAndThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      error: cancellationBeforeSpawn(),
+      lifecycle: { processStarted: false }
+    });
+  }
   if (remainingMs(executionDeadlineAt, now) <= 0) {
     await cleanupAndThrow({
       settings,
@@ -403,8 +458,23 @@ export async function runClaudeAgent({
     });
   }
 
+  if (abortSignal?.aborted) {
+    await cleanupAndThrow({
+      settings,
+      startedAt,
+      now,
+      pid: undefined,
+      error: cancellationBeforeSpawn(),
+      lifecycle: { processStarted: false }
+    });
+  }
+
   let child;
   try {
+    // This is the final gate before the OS process-creation call. A request
+    // can still abort inside that non-preemptible call; the post-spawn phase
+    // observes it and terminates the exact returned child.
+    if (abortSignal?.aborted) throw cancellationBeforeSpawn();
     child = spawnProcess(runtime.claudeBin, args, {
       cwd,
       env: runtime.childEnvironment,
@@ -413,6 +483,16 @@ export async function runClaudeAgent({
       stdio: ["pipe", "pipe", "pipe"]
     });
   } catch (error) {
+    if (error?.code === "claude_cancelled") {
+      await cleanupAndThrow({
+        settings,
+        startedAt,
+        now,
+        pid: undefined,
+        lifecycle: { processStarted: false },
+        error
+      });
+    }
     await cleanupAndThrow({
       settings,
       startedAt,
@@ -432,6 +512,12 @@ export async function runClaudeAgent({
     });
   }
 
+  const cancellationAfterSpawn = () => new ClaudeRunnerError("Client cancelled delegation.", {
+    code: "claude_cancelled",
+    durationMs: durationMs(),
+    pid: child?.pid,
+    processStarted: true
+  });
   const processIdentityCandidate = createProcessIdentityCandidate({
     child,
     executionId,
@@ -497,6 +583,7 @@ export async function runClaudeAgent({
       executionDeadlineAt,
       terminationTimeoutMs,
       inspectProcess,
+      abortSignal,
       now,
       schedule,
       cancelSchedule
@@ -525,8 +612,10 @@ export async function runClaudeAgent({
         })
       })
     );
+  const identityAbort = observeRequestAbort(abortSignal);
   const identityLifecycle = Promise.race([
     identityInspection,
+    identityAbort.promise,
     terminalObserver.errorPromise.then((observation) => ({ kind: "error", observation })),
     terminalObserver.exitPromise.then((observation) => ({ kind: "exit", observation })),
     terminalObserver.terminalPromise.then((observation) => ({ kind: "close", observation }))
@@ -537,6 +626,7 @@ export async function runClaudeAgent({
     schedule,
     cancelSchedule
   });
+  identityAbort.dispose();
   // This query is only for initial durable binding. Once the exact child has
   // another lifecycle outcome, it cannot become useful and is cancelled; the
   // process-identity module still bounds its read-only close observation.
@@ -575,6 +665,10 @@ export async function runClaudeAgent({
 
   if (identityOutcome.timedOut) {
     const error = await stopAndBuildError(new ClaudeTimeoutError(runtime.timeoutMs));
+    await cleanupAndThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (identityOutcome.value?.kind === "request-aborted") {
+    const error = await stopAndBuildError(cancellationAfterSpawn());
     await cleanupAndThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
   }
   if (identityOutcome.error) {
@@ -619,16 +713,20 @@ export async function runClaudeAgent({
   lifecycle.processIdentity = processIdentity;
 
   const activation = startDurableLifecycleMutation(onChildStarted, processIdentity, {
-    executionDeadlineAt
+    executionDeadlineAt,
+    abortSignal
   });
+  const activationAbort = observeRequestAbort(abortSignal);
   const activationOutcome = await waitForPromiseUntil(
     Promise.race([
       activation.promise,
+      activationAbort.promise,
       terminalObserver.errorPromise.then((observation) => Object.freeze({ kind: "child-error", observation })),
       terminalObserver.terminalPromise.then((terminalProof) => Object.freeze({ kind: "close", terminalProof }))
     ]),
     { deadlineAt: executionDeadlineAt, now, schedule, cancelSchedule }
   );
+  activationAbort.dispose();
   if (activationOutcome.timedOut) {
     activation.requestCancellation();
     const error = await stopAndBuildError(new ClaudeTimeoutError(runtime.timeoutMs));
@@ -646,6 +744,14 @@ export async function runClaudeAgent({
         processStarted: true
       })
     );
+    await cleanupAndThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
+  }
+  if (
+    activationOutcome.value?.kind === "request-aborted" ||
+    activationOutcome.value?.kind === "cancelled"
+  ) {
+    activation.requestCancellation();
+    const error = await stopAndBuildError(cancellationAfterSpawn());
     await cleanupAndThrow({ settings, startedAt, now, pid: child?.pid, error, lifecycle });
   }
   if (activationOutcome.value?.kind === "child-error") {

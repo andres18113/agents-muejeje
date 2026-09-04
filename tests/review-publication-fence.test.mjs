@@ -465,6 +465,86 @@ test("a publication settling after the quiescence timeout takes the guarded late
   );
 });
 
+test("a publication settling after root cancellation never starts a detached custody release", async () => {
+  const maySettle = deferred();
+  const publicationStarted = deferred();
+  let lateReleaseCalls = 0;
+  const abortController = new AbortController();
+  const world = delegationWorld({
+    afterHook: async ({ publication, events, receipts }) => {
+      beginReceiptPublication(publication);
+      events.push("publication-in-flight");
+      publicationStarted.resolve();
+      await maySettle.promise;
+      receipts.push("durable");
+      events.push("receipt-durable");
+      settleReceiptPublication(publication, {
+        status: "settled",
+        disposition: "published",
+        reviewId: "rr1:" + "b".repeat(64),
+        changeSetId: "cs1:" + "a".repeat(64)
+      });
+      return { status: "bound", coherence: COHERENCE.HELD, reasons: [], priorReviews: [] };
+    },
+    afterTimeoutMs: 10,
+    quiescenceTimeoutMs: 20
+  });
+  world.dependencies.onLateReviewPublicationRelease = () => { lateReleaseCalls += 1; };
+
+  const pending = delegateAgent(
+    {
+      agentType: "code-review",
+      task: "review",
+      cwd: WORKSPACE.effectiveCwd,
+      abortSignal: abortController.signal
+    },
+    world.dependencies
+  );
+  await publicationStarted.promise;
+  abortController.abort();
+  const outcome = await pending;
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.custodyState, "retained");
+
+  maySettle.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(world.events, ["publication-in-flight", "receipt-durable"]);
+  assert.equal(lateReleaseCalls, 0);
+});
+
+test("root cancellation between AFTER scheduling and its microtask starts no binder work", async () => {
+  const abortController = new AbortController();
+  let afterStarted = false;
+  const world = delegationWorld({
+    afterHook: () => {
+      afterStarted = true;
+      throw new Error("AFTER work must not start after root cancellation");
+    }
+  });
+  // finalizeReviewWithinDeadline schedules the binder before it asks this
+  // timeout factory for a timer. Cancelling from here deterministically lands
+  // in that microtask gap.
+  world.dependencies.scheduleReviewBindingTimeout = (callback, delay) => {
+    abortController.abort();
+    return setTimeout(callback, delay);
+  };
+  world.dependencies.cancelReviewBindingTimeout = clearTimeout;
+
+  const outcome = await delegateAgent(
+    {
+      agentType: "code-review",
+      task: "review",
+      cwd: WORKSPACE.effectiveCwd,
+      abortSignal: abortController.signal
+    },
+    world.dependencies
+  );
+  assert.equal(outcome.status, "timeout");
+  assert.equal(outcome.error.code, "claude_cancelled");
+  assert.equal(afterStarted, false);
+  assert.equal(outcome.custodyState, "retained");
+});
+
 test("settled authoritative publication is enough to release even if later housekeeping stalls", async () => {
   const world = delegationWorld({
     afterHook: async ({ publication, events, receipts }) => {

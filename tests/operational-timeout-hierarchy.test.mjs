@@ -200,7 +200,7 @@ test("machine-checked timeout hierarchy enforces client > MCP lifetime > profile
     (err) => err instanceof TimeoutHierarchyViolationError && err.code === "insufficient_settlement_headroom"
   );
 
-  // Calculation of max bounded MCP lifetime
+  // Calculation of the maximum root MCP response envelope
   assert.equal(calculateMaxMcpLifetime(1800_000), 2415_000);
 
   // Maintainer safety guard: ensure recommended outer timeout covers all registered profiles

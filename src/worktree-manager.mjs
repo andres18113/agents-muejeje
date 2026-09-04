@@ -216,7 +216,9 @@ export class GitWorktreeManager {
     let observation;
     try {
       if (requestContext?.isActive?.() === false) return;
-      observation = await this.#inspectProcess(child?.pid);
+      observation = await this.#inspectProcess(child?.pid, {
+        abortSignal: requestContext?.abortSignal
+      });
     } catch {
       return;
     }
@@ -366,9 +368,11 @@ export class GitWorktreeManager {
       addFailure.code === "worktree_git_failed" ||
       addFailure.terminationProven === true;
     if (gitChildProvenClosed) {
+      assertRequestActive(requestContext, "worktree-git-operation-clear");
       await this.#writeCustody.clearWorktreeOperation({
         executionId,
-        canonicalRootKey: canonicalRepositoryKey
+        canonicalRootKey: canonicalRepositoryKey,
+        ...(requestContext?.abortSignal ? { mutationSignal: requestContext.abortSignal } : {})
       });
     }
     if (addFailure) throw addFailure;

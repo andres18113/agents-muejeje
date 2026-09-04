@@ -13,12 +13,12 @@ import {
  *
  *   client tool-call deadline (Codex MCP tool timeout)
  *     >
- *   maximum bounded MCP call lifetime
+ *   root MCP response envelope
  *     >
  *   Claude useful-work execution envelope (profile timeout / runtime.timeoutMs)
  *
  * Where:
- *   maximum bounded MCP call lifetime =
+ *   root MCP response envelope =
  *     max(profile timeout) + REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS
  *
  * Semantic definition:
@@ -30,6 +30,8 @@ import {
  *
  * And REQUIRED_SYNCHRONOUS_SETTLEMENT_BUDGET_MS is derived strictly from
  * the actual bounded synchronous lifecycle phases that can keep tools/call pending.
+ * It bounds response settlement under normal event-loop scheduling; it is not
+ * a claim that an already-issued kernel I/O operation has been preempted.
  */
 
 export const RECOMMENDED_CODEX_TOOL_TIMEOUT_SEC = 3600; // 60 minutes
@@ -137,7 +139,7 @@ export function assertTimeoutHierarchy({
   if (outerTimeoutMs <= maxMcpLifetimeMs) {
     throw new TimeoutHierarchyViolationError(
       `Outer client timeout (${outerTimeoutMs}ms) does not provide sufficient settlement headroom ` +
-        `for maximum bounded MCP lifetime (${maxMcpLifetimeMs}ms = ` +
+        `for root MCP response envelope (${maxMcpLifetimeMs}ms = ` +
         `${maxProfileTimeoutMs}ms useful work + ${settlementBudgetMs}ms settlement budget).`,
       { code: "insufficient_settlement_headroom", outerTimeoutMs, maxProfileTimeoutMs, settlementBudgetMs, maxMcpLifetimeMs }
     );
@@ -228,7 +230,7 @@ export function checkTimeoutHierarchySafety({
       minSafeTimeoutSec,
       message:
         `Configured Codex tool timeout (${numericTimeoutSec}s) is dangerously below the ` +
-        `minimum safe MCP lifetime budget (${minSafeTimeoutSec}s). ` +
+        `minimum safe MCP response-envelope budget (${minSafeTimeoutSec}s). ` +
         `Synchronous calls can be abandoned before MCP execution settles.`
     });
   }

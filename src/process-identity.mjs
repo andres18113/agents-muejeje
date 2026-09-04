@@ -326,7 +326,7 @@ export async function requireLiveProcessIdentity(pid, dependencies = {}) {
 
 export async function compareProcessIdentity(
   storedIdentity,
-  { inspectProcess = inspectProcessIdentity } = {}
+  { inspectProcess = inspectProcessIdentity, ...inspectionOptions } = {}
 ) {
   let stored;
   try {
@@ -337,7 +337,7 @@ export async function compareProcessIdentity(
 
   let observation;
   try {
-    observation = await inspectProcess(stored.pid);
+    observation = await inspectProcess(stored.pid, inspectionOptions);
   } catch {
     return Object.freeze({ status: PROCESS_IDENTITY_MATCH.AMBIGUOUS, reason: "inspection-threw" });
   }

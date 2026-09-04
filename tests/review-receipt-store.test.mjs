@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -149,6 +149,37 @@ test("a receipt is written atomically and leaves no staging directory behind", a
     const changeSetDirectory = path.dirname(path.dirname(result.path));
     const leftovers = (await readdir(changeSetDirectory)).filter((name) => name.startsWith("."));
     assert.deepEqual(leftovers, []);
+  });
+});
+
+test("receipt provenance cannot authorize a different repository scope", async () => {
+  await withState(async (stateRoot) => {
+    const receipts = store(stateRoot);
+    const receipt = receiptFor();
+    await assert.rejects(
+      receipts.put({ canonicalRootKey: "c:\\other-repository", receipt }),
+      (error) => {
+        assert.equal(error.code, "review_receipt_repository_mismatch");
+        return true;
+      }
+    );
+
+    const written = await receipts.put({ canonicalRootKey: ROOT_KEY, receipt });
+    const otherRootKey = "c:\\other-repository";
+    const relativePath = path.relative(receipts.reviewsDirectory(ROOT_KEY), written.path);
+    const graftedPath = path.join(receipts.reviewsDirectory(otherRootKey), relativePath);
+    await mkdir(path.dirname(graftedPath), { recursive: true });
+    await copyFile(written.path, graftedPath);
+
+    const found = await receipts.discoverForScope({
+      canonicalRootKey: otherRootKey,
+      agentType: receipt.reviewer.agentType,
+      targetSpec: receipt.binding.target.spec
+    });
+    assert.equal(found.status, "partial");
+    assert.equal(found.authoritativeExhaustive, false);
+    assert.deepEqual(found.receipts, []);
+    assert.ok(found.skipped.some((entry) => entry.code === "review_history_recovery_unreadable"));
   });
 });
 

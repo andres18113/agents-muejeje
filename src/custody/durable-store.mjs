@@ -292,12 +292,14 @@ export async function publishRecord({
  * treated as done only when the history holds exactly this released record and
  * the ownership slot is genuinely gone. Any other combination is ambiguous.
  */
-export async function archiveOwnership({ repositoryState, record }) {
+export async function archiveOwnership({ repositoryState, record, mutationSignal, publicationGuard }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   const historyDirectory = executionHistoryDirectoryIn(repositoryState, record.executionId);
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   await mkdir(path.dirname(historyDirectory), { recursive: true });
-  if (await exists(historyDirectory)) {
-    if (!(await exists(ownershipDirectory))) {
+  if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+  if (await exists(historyDirectory, { mutationSignal })) {
+    if (!(await exists(ownershipDirectory, { mutationSignal }))) {
       const archived = await readAuthoritativeRecord(historyDirectory);
       if (samePublicationAuthority(archived, record) && archived.state === "RELEASED") {
         return recordSnapshot(archived);
@@ -308,6 +310,7 @@ export async function archiveOwnership({ repositoryState, record }) {
     });
   }
   try {
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     const current = await readAuthoritativeRecord(ownershipDirectory);
     if (current.executionId !== record.executionId) {
       throw new WriteCustodyError("Only the durable owning execution may archive custody.", {
@@ -319,11 +322,19 @@ export async function archiveOwnership({ repositoryState, record }) {
         code: "write_custody_stale_mutation"
       });
     }
-    await rename(ownershipDirectory, historyDirectory);
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    // Archiving is the final durable handoff boundary. Once this rename is
+    // issued, a root cancellation cannot prove whether it landed, so the
+    // manager's mutation queue must remain occupied until it settles.
+    if (publicationGuard) publicationGuard.publicationStarted = true;
+    const publication = rename(ownershipDirectory, historyDirectory);
+    void publication.catch(() => {});
+    await publication;
   } catch (error) {
     if (error instanceof WriteCustodyError) throw error;
     if (error?.code === "ENOENT") {
-      if (!(await exists(ownershipDirectory)) && await exists(historyDirectory)) {
+      if (!(await exists(ownershipDirectory, { mutationSignal })) &&
+          await exists(historyDirectory, { mutationSignal })) {
         const archived = await readAuthoritativeRecord(historyDirectory);
         if (samePublicationAuthority(archived, record) && archived.state === "RELEASED") {
           return recordSnapshot(archived);

@@ -79,6 +79,10 @@ const historyReceiptSchema = z.object({
 const receiptHistorySchema = z.object({
   status: z.enum(RECEIPT_HISTORY_STATUSES),
   count: safeInteger,
+  // These answer independent questions. Exhaustive discovery does not mean a
+  // bounded transport returned every discovered receipt.
+  authoritativeExhaustive: z.boolean(),
+  outputTruncated: z.boolean(),
   receipts: z.array(historyReceiptSchema).max(MAX_PUBLIC_HISTORY_RECEIPTS),
   diagnostics: z.array(reasonSchema).max(MAX_PUBLIC_HISTORY_DIAGNOSTICS)
 }).strict();
@@ -256,6 +260,11 @@ function projectReceiptHistory(binding) {
   const totalCount = Number.isSafeInteger(source?.totalCount) && source.totalCount >= sourceReceipts.length
     ? source.totalCount
     : sourceReceipts.length;
+  const authoritativeExhaustive = source?.authoritativeExhaustive === true ||
+    (source?.authoritativeExhaustive === undefined && sourceStatus === "complete");
+  const outputTruncated = source?.outputTruncated === true ||
+    totalCount > sourceReceipts.length ||
+    sourceReceipts.length > MAX_PUBLIC_HISTORY_RECEIPTS;
   const receipts = sourceReceipts.slice(0, MAX_PUBLIC_HISTORY_RECEIPTS).flatMap((receipt) => {
     const reviewId = validId(receipt?.reviewId, REVIEW_ID);
     const changeSetId = validId(receipt?.changeSetId, CHANGE_SET_ID);
@@ -289,17 +298,19 @@ function projectReceiptHistory(binding) {
   // `count` is how many receipts the discovery actually held, not how many
   // survived the public bound, so a capped list can never read as the whole
   // history. Anything dropped here says so by code.
-  if ((receipts.length < sourceReceipts.length || totalCount > sourceReceipts.length) &&
-      diagnostics.length < MAX_PUBLIC_HISTORY_DIAGNOSTICS) {
+  if (outputTruncated && diagnostics.length < MAX_PUBLIC_HISTORY_DIAGNOSTICS) {
     diagnostics.push({
-      code: totalCount > sourceReceipts.length || sourceReceipts.length > MAX_PUBLIC_HISTORY_RECEIPTS
-        ? "public_receipt_history_truncated"
-        : "public_receipt_history_unprojectable"
+      code: "public_receipt_history_truncated"
     });
+  } else if (receipts.length < sourceReceipts.length &&
+             diagnostics.length < MAX_PUBLIC_HISTORY_DIAGNOSTICS) {
+    diagnostics.push({ code: "public_receipt_history_unprojectable" });
   }
   return {
     status: sourceStatus,
     count: totalCount,
+    authoritativeExhaustive,
+    outputTruncated,
     receipts,
     diagnostics
   };

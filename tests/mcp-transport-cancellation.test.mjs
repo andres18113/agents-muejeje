@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { defaultDurableStateRoot, repositoryStateDirectoryIn } from "../src/custody/durable-store.mjs";
+import { defaultDurableStateRoot } from "../src/custody/durable-store.mjs";
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
@@ -26,7 +26,7 @@ function ensureFakeClaude() {
   }
 }
 
-test("transport-level request cancellation aborts child execution, proves termination, and releases custody", async () => {
+test("transport-level request cancellation aborts child execution and retains custody for reconciliation", async () => {
   ensureFakeClaude();
 
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "mcp-cancel-hermetic-"));
@@ -135,36 +135,21 @@ test("transport-level request cancellation aborts child execution, proves termin
       reason: "transport client disconnected"
     });
 
-    // 5. Poll for durable state to settle to RELEASED
-    let custodyReleased = false;
-    for (let i = 0; i < 50; i++) {
-      const current = await custody.getWriteAccess(repoKey);
-      if (current === undefined) {
-        custodyReleased = true;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    assert.equal(custodyReleased, true, "Active write custody must be cleanly released after cancellation");
+    // 5. A root-stopped request may not begin a new durable release mutation.
+    // The record stays retained for ordinary reconciliation rather than making
+    // post-cancellation cleanup look like an in-bound settlement.
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    const retainedRecord = await custody.getWriteAccess(repoKey);
+    assert.ok(retainedRecord, "Cancellation must retain durable custody for reconciliation");
+    assert.notEqual(retainedRecord.state, "RELEASED", "Cancellation must not start a post-stop release");
 
-    // 6. Verify archived execution history transitions and terminal proof
-    const repoStateDir = repositoryStateDirectoryIn(durableRoot, repoKey);
-    const execDir = path.join(repoStateDir, "executions");
-    const executionDirs = await readdir(execDir);
-    assert.equal(executionDirs.length, 1, "Exactly one execution must be archived");
-
-    const recordText = await readFile(path.join(execDir, executionDirs[0], "record.json"), "utf8");
-    const record = JSON.parse(recordText);
-
-    assert.equal(record.state, "RELEASED");
-    const states = record.transitions.map((t) => t.state);
+    // 6. The durable lifecycle reached ACTIVE before cancellation, but no
+    // post-stop release transition is allowed. A future reconciliation owns
+    // the terminal-proof and archival decision.
+    const states = retainedRecord.transitions.map((t) => t.state);
     assert.ok(states.includes("SPAWNING"), "Transitions must include SPAWNING");
     assert.ok(states.includes("ACTIVE"), "Transitions must include ACTIVE");
-    assert.ok(states.includes("TERMINATING"), "Transitions must include TERMINATING");
-    assert.ok(states.includes("TERMINAL_PROVEN"), "Transitions must include TERMINAL_PROVEN");
-    assert.ok(states.includes("RELEASED"), "Transitions must include RELEASED");
-    assert.equal(record.terminalProof?.kind, "child-event");
-    assert.equal(record.terminalProof?.event, "close");
+    assert.ok(!states.includes("RELEASED"), "Transitions must not include a post-stop RELEASED state");
   } finally {
     serverChild.kill();
     await rm(fixtureRoot, { recursive: true, force: true }).catch(() => {});

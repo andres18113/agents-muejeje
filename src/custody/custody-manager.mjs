@@ -158,7 +158,10 @@ export class DurableWriteCustodyManager {
       });
     }
     if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    const coordinatorObservation = await this.#inspectProcess(this.#currentPid);
+    const coordinatorObservation = await this.#inspectProcess(this.#currentPid, {
+      abortSignal: mutationSignal
+    });
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     if (coordinatorObservation?.status !== PROCESS_IDENTITY_STATUS.ALIVE) {
       throw new WriteCustodyError("Coordinator process identity is unavailable; write admission is blocked.", {
         code: "write_custody_process_identity_ambiguous"
@@ -213,7 +216,7 @@ export class DurableWriteCustodyManager {
       if (reserved) return reserved;
 
       if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-      const reconciliation = await this.reconcileExistingOwnership(validRootKey);
+      const reconciliation = await this.reconcileExistingOwnership(validRootKey, { mutationSignal });
       if (reconciliation.released || reconciliation.reason === "changed") continue;
       throw new WriteCustodyError("Write custody is already retained for canonical root '" + validRoot + "'.", {
         code: reconciliation.reason === "ambiguous" ? "write_custody_state_ambiguous" : "write_custody_conflict",
@@ -279,12 +282,12 @@ export class DurableWriteCustodyManager {
    * Clears the recorded Git operation. The caller must already hold supervised
    * terminal proof (the exact Git child closed); a timeout is never enough.
    */
-  async clearWorktreeOperation({ executionId, canonicalRootKey }) {
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+  async clearWorktreeOperation({ executionId, canonicalRootKey, mutationSignal }) {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (!record.gitOperation) return recordSnapshot(record);
-      return await this.#amendRecord(record, { gitOperation: undefined });
-    });
+      return await this.#amendRecord(record, { gitOperation: undefined }, { mutationSignal, publicationGuard });
+    }, { mutationSignal });
   }
 
   async markSpawning({ executionId, canonicalRootKey, mutationSignal }) {
@@ -335,8 +338,8 @@ export class DurableWriteCustodyManager {
     }, { mutationSignal });
   }
 
-  async releaseUnstartedWriteAccess({ executionId, canonicalRootKey }) {
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+  async releaseUnstartedWriteAccess({ executionId, canonicalRootKey, mutationSignal }) {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (!SAFE_UNSTARTED_STATES.has(record.state) || record.claudeProcess) {
         throw new WriteCustodyError(
@@ -344,12 +347,17 @@ export class DurableWriteCustodyManager {
           { code: "write_custody_terminal_proof_required" }
         );
       }
-      return await this.#terminalizeAndRelease(record, { kind: "not-started", observedAt: this.#now() });
-    });
+      return await this.#terminalizeAndRelease(
+        record,
+        { kind: "not-started", observedAt: this.#now() },
+        {},
+        { mutationSignal, publicationGuard }
+      );
+    }, { mutationSignal });
   }
 
-  async releaseWriteAccessAfterTerminal({ executionId, canonicalRootKey, terminalProof }) {
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+  async releaseWriteAccessAfterTerminal({ executionId, canonicalRootKey, terminalProof, mutationSignal }) {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (!["SPAWNING", "ACTIVE", "TERMINATING"].includes(record.state)) {
         throw new WriteCustodyError("Write custody cannot return from its current state.", {
@@ -360,14 +368,19 @@ export class DurableWriteCustodyManager {
       this.#requireLiveIdentity(record, terminalProof.processIdentity, {
         allowUnpersistedIdentity: record.state === "SPAWNING"
       });
-      return await this.#terminalizeAndRelease(record, {
-        kind: "child-event",
-        event: terminalProof.event,
-        observedAt: terminalProof.observedAt
-      }, record.claudeProcess
-        ? {}
-        : { claudeProcess: durableProcessIdentity(terminalProof.processIdentity) });
-    });
+      return await this.#terminalizeAndRelease(
+        record,
+        {
+          kind: "child-event",
+          event: terminalProof.event,
+          observedAt: terminalProof.observedAt
+        },
+        record.claudeProcess
+          ? {}
+          : { claudeProcess: durableProcessIdentity(terminalProof.processIdentity) },
+        { mutationSignal, publicationGuard }
+      );
+    }, { mutationSignal });
   }
 
   /**
@@ -381,8 +394,8 @@ export class DurableWriteCustodyManager {
    * other or later coordinator. No fake durable identity is ever fabricated or
    * persisted.
    */
-  async releaseWriteAccessAfterSupervisedClose({ executionId, canonicalRootKey, terminalProof }) {
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+  async releaseWriteAccessAfterSupervisedClose({ executionId, canonicalRootKey, terminalProof, mutationSignal }) {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (record.state !== "SPAWNING") {
         throw new WriteCustodyError(
@@ -397,12 +410,17 @@ export class DurableWriteCustodyManager {
         );
       }
       this.#requireSupervisedCloseAuthority(record, terminalProof);
-      return await this.#terminalizeAndRelease(record, {
-        kind: "supervised-child-close",
-        event: "close",
-        observedAt: terminalProof.observedAt
-      });
-    });
+      return await this.#terminalizeAndRelease(
+        record,
+        {
+          kind: "supervised-child-close",
+          event: "close",
+          observedAt: terminalProof.observedAt
+        },
+        {},
+        { mutationSignal, publicationGuard }
+      );
+    }, { mutationSignal });
   }
 
   /**
@@ -411,8 +429,8 @@ export class DurableWriteCustodyManager {
    * its own ORPHANED record. Restarted or foreign coordinators have no matching
    * in-memory identity/supervision evidence and remain fail-closed.
    */
-  async releaseOrphanedWriteAccessAfterTerminal({ executionId, canonicalRootKey, terminalProof }) {
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+  async releaseOrphanedWriteAccessAfterTerminal({ executionId, canonicalRootKey, terminalProof, mutationSignal }) {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (record.state !== "ORPHANED") {
         throw new WriteCustodyError("Late terminal proof may only recover an orphaned execution.", {
@@ -427,25 +445,35 @@ export class DurableWriteCustodyManager {
           });
         }
         this.#requireSupervisedCloseAuthority(record, terminalProof);
-        return await this.#terminalizeAndRelease(record, {
-          kind: "supervised-child-close",
-          event: "close",
-          observedAt: terminalProof.observedAt
-        });
+        return await this.#terminalizeAndRelease(
+          record,
+          {
+            kind: "supervised-child-close",
+            event: "close",
+            observedAt: terminalProof.observedAt
+          },
+          {},
+          { mutationSignal, publicationGuard }
+        );
       }
       this.#validateCloseTerminalProof(terminalProof);
       this.#requireLiveIdentity(record, terminalProof.processIdentity);
-      return await this.#terminalizeAndRelease(record, {
-        kind: "child-event",
-        event: "close",
-        observedAt: terminalProof.observedAt
-      });
-    });
+      return await this.#terminalizeAndRelease(
+        record,
+        {
+          kind: "child-event",
+          event: "close",
+          observedAt: terminalProof.observedAt
+        },
+        {},
+        { mutationSignal, publicationGuard }
+      );
+    }, { mutationSignal });
   }
 
-  async markOrphanedWriteAccess({ executionId, canonicalRootKey, processIdentity, reason }) {
+  async markOrphanedWriteAccess({ executionId, canonicalRootKey, processIdentity, reason, mutationSignal }) {
     const validReason = validIdentityString("orphan reason", reason);
-    return await this.#withRepositoryMutation(canonicalRootKey, async () => {
+    return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (record.state === "ORPHANED") return recordSnapshot(record);
       let claudeProcess = record.claudeProcess;
@@ -459,8 +487,8 @@ export class DurableWriteCustodyManager {
       return await this.#transitionRecord(record, "ORPHANED", {
         ...(claudeProcess ? { claudeProcess } : {}),
         orphanReason: validReason
-      });
-    });
+      }, { mutationSignal, publicationGuard });
+    }, { mutationSignal });
   }
 
   async getWriteAccess(canonicalRootKey) {
@@ -479,40 +507,49 @@ export class DurableWriteCustodyManager {
    * by publication authority immediately before any resulting state change, so a
    * conclusion drawn from stale evidence can never publish.
    */
-  async reconcileExistingOwnership(canonicalRootKey) {
+  async reconcileExistingOwnership(canonicalRootKey, { mutationSignal } = {}) {
     const validRootKey = validIdentityString("canonicalRootKey", canonicalRootKey);
-    const snapshot = await this.#withRepositoryMutation(validRootKey, async () =>
-      await this.#ownershipSnapshot(validRootKey)
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    const snapshot = await this.#withRepositoryMutation(
+      validRootKey,
+      async () => await this.#ownershipSnapshot(validRootKey),
+      { mutationSignal }
     );
     if (!snapshot) return Object.freeze({ released: true, reason: "free" });
     if (snapshot.state === "RELEASED") {
-      return await this.#withRepositoryMutation(validRootKey, async () => {
+      return await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
         const current = await this.#ownedRecord({ executionId: snapshot.executionId, canonicalRootKey: validRootKey });
         if (!samePublicationAuthority(current, snapshot)) {
           return Object.freeze({ released: false, reason: "changed" });
         }
-        const released = await this.#archive(current);
+        const released = await this.#archive(current, { mutationSignal, publicationGuard });
         return Object.freeze({ released: true, reason: "released-record", record: released });
-      });
+      }, { mutationSignal });
     }
 
     const coordinator = await compareProcessIdentity(snapshot.coordinatorProcess, {
-      inspectProcess: this.#inspectProcess
+      inspectProcess: this.#inspectProcess,
+      abortSignal: mutationSignal
     });
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     let gitOperation;
     let claude;
     if (reconciliationNeedsGitObservation(snapshot, coordinator.status)) {
       gitOperation = await compareProcessIdentity(snapshot.gitOperation, {
-        inspectProcess: this.#inspectProcess
+        inspectProcess: this.#inspectProcess,
+        abortSignal: mutationSignal
       });
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     }
     if (reconciliationNeedsClaudeObservation(snapshot, coordinator.status)) {
       claude = await compareProcessIdentity(snapshot.claudeProcess, {
-        inspectProcess: this.#inspectProcess
+        inspectProcess: this.#inspectProcess,
+        abortSignal: mutationSignal
       });
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
     }
 
-    return await this.#withRepositoryMutation(validRootKey, async () => {
+    return await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
       const current = await this.#ownershipSnapshot(validRootKey);
       if (!current) return Object.freeze({ released: true, reason: "free" });
       if (!samePublicationAuthority(current, snapshot)) {
@@ -523,63 +560,65 @@ export class DurableWriteCustodyManager {
         coordinator: coordinator.status,
         gitOperation: gitOperation?.status,
         claude: claude?.status
-      }));
-    });
+      }), { mutationSignal, publicationGuard });
+    }, { mutationSignal });
   }
 
-  async #applyReconciliation(record, decision) {
+  async #applyReconciliation(record, decision, options = {}) {
     if (decision.action === RECONCILIATION_ACTION.RETAIN) return decision.outcome;
     if (decision.action === RECONCILIATION_ACTION.ORPHAN) {
-      await this.#orphanDuringReconciliation(record, decision.orphanReason);
+      await this.#orphanDuringReconciliation(record, decision.orphanReason, options);
       return decision.outcome;
     }
     if (decision.action === RECONCILIATION_ACTION.COMPLETE_TERMINAL_RELEASE) {
-      const released = await this.#completeTerminalRelease(record);
+      const released = await this.#completeTerminalRelease(record, options);
       return Object.freeze({ ...decision.outcome, record: released });
     }
     const released = await this.#terminalizeAndRelease(record, {
       ...decision.terminalProof,
       observedAt: this.#now()
-    });
+    }, {}, options);
     return Object.freeze({ ...decision.outcome, record: released });
   }
 
-  async #orphanDuringReconciliation(record, reason) {
+  async #orphanDuringReconciliation(record, reason, options = {}) {
     if (record.state === "ORPHANED") return recordSnapshot(record);
-    return await this.#transitionRecord(record, "ORPHANED", { orphanReason: reason });
+    return await this.#transitionRecord(record, "ORPHANED", { orphanReason: reason }, options);
   }
 
-  async #terminalizeAndRelease(record, terminalProof, additions = {}) {
+  async #terminalizeAndRelease(record, terminalProof, additions = {}, options = {}) {
     let current = record;
     if (current.state !== "TERMINAL_PROVEN") {
-      current = await this.#transitionRecord(current, "TERMINAL_PROVEN", { ...additions, terminalProof });
+      current = await this.#transitionRecord(current, "TERMINAL_PROVEN", { ...additions, terminalProof }, options);
     }
-    return await this.#completeTerminalRelease(current);
+    return await this.#completeTerminalRelease(current, options);
   }
 
-  async #completeTerminalRelease(record) {
+  async #completeTerminalRelease(record, options = {}) {
     let current = record;
     if (current.state === "TERMINAL_PROVEN") {
-      current = await this.#transitionRecord(current, "HANDOFF_READY");
+      current = await this.#transitionRecord(current, "HANDOFF_READY", {}, options);
     }
     if (current.state === "HANDOFF_READY") {
-      current = await this.#transitionRecord(current, "RELEASED");
+      current = await this.#transitionRecord(current, "RELEASED", {}, options);
     }
     if (current.state !== "RELEASED") {
       throw new WriteCustodyError("Terminal ownership cannot be released from its current state.", {
         code: "write_custody_state_invalid"
       });
     }
-    const released = await this.#archive(current);
+    const released = await this.#archive(current, options);
     this.#liveIdentities.delete(current.repositoryId);
     this.#supervisedSpawns.delete(current.repositoryId);
     return released;
   }
 
-  async #archive(record) {
+  async #archive(record, { mutationSignal, publicationGuard } = {}) {
     return await archiveOwnership({
       repositoryState: this.repositoryStateDirectory(record.canonicalRootKey),
-      record
+      record,
+      mutationSignal,
+      publicationGuard
     });
   }
 

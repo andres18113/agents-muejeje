@@ -138,7 +138,7 @@ async function cancelAtMarker({ client, markerDirectory, marker, request }) {
   await delay(50);
 }
 
-test("STDIO cancellation during worktree preparation releases unstarted custody", async () => {
+test("STDIO cancellation during worktree preparation retains unstarted custody instead of starting post-cancellation cleanup", async () => {
   await withTransport("worktree-preparation", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
     const request = client.request("tools/call", {
       name: "delegate_agent",
@@ -146,13 +146,13 @@ test("STDIO cancellation during worktree preparation releases unstarted custody"
     });
     await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), { detail: "worktree reservation" });
     await cancelAtMarker({ client, markerDirectory, marker: "worktree-preparation", request });
-    await waitFor(async () => (await custody.getWriteAccess(repositoryKey)) === undefined, {
-      detail: "released worktree custody"
+    await waitFor(async () => (await custody.getWriteAccess(repositoryKey))?.state === "RESERVED", {
+      detail: "retained worktree custody"
     });
   });
 });
 
-test("STDIO cancellation during BEFORE history discovery releases coherent review custody", async () => {
+test("STDIO cancellation during BEFORE history discovery retains coherent review custody instead of starting post-cancellation cleanup", async () => {
   await withTransport("before-history", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
     const request = client.request("tools/call", {
       name: "delegate_agent",
@@ -160,8 +160,11 @@ test("STDIO cancellation during BEFORE history discovery releases coherent revie
     });
     await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), { detail: "coherent review reservation" });
     await cancelAtMarker({ client, markerDirectory, marker: "before-history", request });
-    await waitFor(async () => (await custody.getWriteAccess(repositoryKey)) === undefined, {
-      detail: "released coherent review custody"
+    await waitFor(async () => {
+      const record = await custody.getWriteAccess(repositoryKey);
+      return record !== undefined && record.state !== "RELEASED";
+    }, {
+      detail: "retained coherent review custody"
     });
   });
 });

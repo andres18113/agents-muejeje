@@ -775,7 +775,7 @@ test("an artifact stall beyond AFTER's deadline never starts receipt publication
   });
 });
 
-test("root cancellation during artifact persistence returns timeout without publishing or retaining custody", async () => {
+test("root cancellation during artifact persistence returns timeout without publishing or starting post-cancellation custody release", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
     const abortController = new AbortController();
     const artifactEntered = deferredValue();
@@ -819,12 +819,12 @@ test("root cancellation during artifact persistence returns timeout without publ
 
     assert.equal(outcome.status, "timeout");
     assert.equal(outcome.error.code, "claude_cancelled");
-    assert.equal(outcome.custodyState, "released");
+    assert.equal(outcome.custodyState, "retained");
     assert.equal(outcome.reviewBinding.publication.status, "cancelled-before-authority");
     assert.equal(receiptPreconditionReached.value, false);
 
     const repositoryKey = await coordinationKeyFor(repositoryRoot);
-    assert.equal(await custody.getWriteAccess(repositoryKey), undefined);
+    assert.notEqual(await custody.getWriteAccess(repositoryKey), undefined);
     const listed = await new ReviewReceiptStore({ stateRoot }).listForChangeSet({
       canonicalRootKey: repositoryKey,
       changeSetId: outcome.reviewBinding.beforeChangeSetId

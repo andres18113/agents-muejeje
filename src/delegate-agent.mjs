@@ -181,7 +181,13 @@ async function finalizeReviewWithinDeadline(operation, {
 } = {}) {
   const fence = createReceiptPublicationFence();
   const settled = Promise.resolve()
-    .then(() => operation(fence.publication))
+    .then(() => {
+      // `operation` begins in a microtask. Recheck the root at that actual
+      // start boundary so an abort between scheduling and execution cannot
+      // launch AFTER collection or receipt work after the caller settled.
+      requestContext?.assertActive?.("review-binding-after");
+      return operation(fence.publication);
+    })
     .then((value) => ({ value }), (error) => ({ error }));
 
   const boundedTimeoutMs = requestContext
@@ -705,22 +711,28 @@ function authorizedCustodyRelease({
     !workspacePreparationAmbiguous &&
     unstartedReleaseAllowed
   ) {
-    return () => writeCustody.releaseUnstartedWriteAccess({ executionId, canonicalRootKey });
+    return (mutationSignal) => writeCustody.releaseUnstartedWriteAccess({
+      executionId,
+      canonicalRootKey,
+      ...(mutationSignal ? { mutationSignal } : {})
+    });
   }
   // A proof without a processIdentity is supervised close evidence: this
   // coordinator spawned the exact child and saw it close before a durable
   // identity could be captured. Custody validates that claim.
   if (writerProcessStarted && terminalProof) {
     return terminalProof.supervisedByCoordinator === true
-      ? () => writeCustody.releaseWriteAccessAfterSupervisedClose({
+      ? (mutationSignal) => writeCustody.releaseWriteAccessAfterSupervisedClose({
           executionId,
           canonicalRootKey,
-          terminalProof
+          terminalProof,
+          ...(mutationSignal ? { mutationSignal } : {})
         })
-      : () => writeCustody.releaseWriteAccessAfterTerminal({
+      : (mutationSignal) => writeCustody.releaseWriteAccessAfterTerminal({
           executionId,
           canonicalRootKey,
-          terminalProof
+          terminalProof,
+          ...(mutationSignal ? { mutationSignal } : {})
         });
   }
   return undefined;
@@ -961,7 +973,7 @@ export async function delegateAgent(input, dependencies = {}) {
       let admission;
       try {
         requestContext.assertActive("coherent-admission");
-        admission = await coherentAdmission.admit({
+        admission = await requestContext.observe("coherent-admission", () => coherentAdmission.admit({
           executionId,
           agentType: profile.id,
           canonicalRoot: workspace.repositoryRoot,
@@ -969,7 +981,7 @@ export async function delegateAgent(input, dependencies = {}) {
           ...(targetRef === undefined ? {} : { targetRef }),
           requestContext,
           mutationSignal: requestContext.abortSignal
-        });
+        }));
         requestContext.assertActive("coherent-admission");
       } catch (error) {
         if (requestContext.abortSignal?.aborted) requestContext.assertActive("coherent-admission");
@@ -986,14 +998,17 @@ export async function delegateAgent(input, dependencies = {}) {
         processProvenNotStarted = true;
         try {
           requestContext.assertActive("coherent-admission-lifecycle");
-          reservation = await writeCustody.markSpawning({
-            executionId,
-            canonicalRootKey: workspace.canonicalRepositoryKey,
-            mutationSignal: requestContext.abortSignal
-          });
+          reservation = await requestContext.observe("coherent-admission-lifecycle", () =>
+            writeCustody.markSpawning({
+              executionId,
+              canonicalRootKey: workspace.canonicalRepositoryKey,
+              mutationSignal: requestContext.abortSignal
+            })
+          );
           requestContext.assertActive("coherent-admission-lifecycle");
           custodyState = reservation.state.toLowerCase();
         } catch (error) {
+          if (isRequestStop(error)) throw error;
           reviewCoherence = COHERENCE.LOST;
           reviewBindingReasons.push({
             code: "coherent_admission_lifecycle_failed",
@@ -1003,10 +1018,13 @@ export async function delegateAgent(input, dependencies = {}) {
           // chance to remove the slot before the advisory review runs. If the
           // state is ambiguous, keep the reservation and retry in finally.
           try {
-            const released = await writeCustody.releaseUnstartedWriteAccess({
-              executionId,
-              canonicalRootKey: workspace.canonicalRepositoryKey
-            });
+            const released = await requestContext.observe("coherent-admission-release", () =>
+              writeCustody.releaseUnstartedWriteAccess({
+                executionId,
+                canonicalRootKey: workspace.canonicalRepositoryKey,
+                mutationSignal: requestContext.abortSignal
+              })
+            );
             custodyState = released.state.toLowerCase();
             reservation = undefined;
           } catch (releaseError) {
@@ -1133,7 +1151,7 @@ export async function delegateAgent(input, dependencies = {}) {
         const reviewReasons = [];
 
         if (reconciliationState === "ambiguous") {
-          reviewReasons.push({ code: "review_reconcile_ambiguous" });
+          reviewReasons.push({ code: "multiple_fresh_reviews" });
         } else if (reconciliationState === "completeness-unproven") {
           reviewReasons.push(...(displayEntry?.reasons ?? []));
           reviewReasons.push({ code: "review_history_completeness_unproven" });
@@ -1254,14 +1272,14 @@ export async function delegateAgent(input, dependencies = {}) {
     if (!reconcileOnly) {
       if (custodyPlan === "write") {
         requestContext.assertActive("write-admission");
-        reservation = await writeCustody.reserveWriteAccess({
+        reservation = await requestContext.observe("write-admission", () => writeCustody.reserveWriteAccess({
           executionId,
           agentType: profile.id,
           canonicalRoot: workspace.repositoryRoot,
           canonicalRootKey: workspace.canonicalRepositoryKey,
           ...(targetRef === undefined ? {} : { targetRef }),
           mutationSignal: requestContext.abortSignal
-        });
+        }));
         requestContext.assertActive("write-admission");
         custodyState = reservation.state.toLowerCase();
         processProvenNotStarted = true;
@@ -1269,21 +1287,23 @@ export async function delegateAgent(input, dependencies = {}) {
         if (profile.id === "general-purpose") {
           const isolatedWorktrees = worktreeManager || new GitWorktreeManager({ writeCustody });
           requestContext.assertActive("worktree-preparation");
-          executionWorkspace = await isolatedWorktrees.prepare({
-            executionId,
-            canonicalRepositoryKey: workspace.canonicalRepositoryKey,
-            repositoryRoot: workspace.repositoryRoot,
-            effectiveCwd: workspace.effectiveCwd,
-            requestContext
-          });
+          executionWorkspace = await requestContext.observe("worktree-preparation", () =>
+            isolatedWorktrees.prepare({
+              executionId,
+              canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+              repositoryRoot: workspace.repositoryRoot,
+              effectiveCwd: workspace.effectiveCwd,
+              requestContext
+            })
+          );
           requestContext.assertActive("worktree-preparation");
         } else {
           requestContext.assertActive("write-mark-spawning");
-          reservation = await writeCustody.markSpawning({
+          reservation = await requestContext.observe("write-mark-spawning", () => writeCustody.markSpawning({
             executionId,
             canonicalRootKey: workspace.canonicalRepositoryKey,
             mutationSignal: requestContext.abortSignal
-          });
+          }));
           requestContext.assertActive("write-mark-spawning");
           custodyState = reservation.state.toLowerCase();
         }
@@ -1316,7 +1336,7 @@ export async function delegateAgent(input, dependencies = {}) {
           requestSettlementBudgetMs
         )
       };
-      const execution = await runAgent({
+      const execution = await requestContext.observe("claude-runner", () => runAgent({
         profile,
         agentType: profile.id,
         prompt,
@@ -1384,14 +1404,19 @@ export async function delegateAgent(input, dependencies = {}) {
               // custodyState snapshot; the durable record is authoritative.
               await custodyFinalization;
               if (typeof writeCustody.releaseOrphanedWriteAccessAfterTerminal !== "function") return;
+              // A root-stopped request cannot authorize a detached custody
+              // mutation merely because its previously supervised child later
+              // produced a close event. Reconciliation owns that record now.
+              if (!requestContext.isActive()) return;
               await writeCustody.releaseOrphanedWriteAccessAfterTerminal({
                 executionId,
                 canonicalRootKey: workspace.canonicalRepositoryKey,
-                terminalProof: lateTerminalProof
+                terminalProof: lateTerminalProof,
+                mutationSignal: requestContext.abortSignal
               });
             }
           : undefined
-      });
+      }));
       writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
       lifecycleEvidence = execution;
       writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
@@ -1448,7 +1473,7 @@ export async function delegateAgent(input, dependencies = {}) {
     // admission guards, so they run before anything releases the slot. Both are
     // fully contained: a failure here reports an unbound review and must never
     // delay or prevent the release below.
-    if (custodyPlan === "coherent-review" && reviewBinder && !reconcileOnly) {
+    if (custodyPlan === "coherent-review" && reviewBinder && !reconcileOnly && requestContext.isActive()) {
       if (reviewBeforeState?.status === "unavailable") {
         reviewBinding = {
           status: "unavailable",
@@ -1564,6 +1589,20 @@ export async function delegateAgent(input, dependencies = {}) {
           publication: reviewPublication
         };
       }
+    } else if (custodyPlan === "coherent-review" && reviewBinder && !reconcileOnly) {
+      const history = reviewBeforeState?.receiptHistory ?? {
+        status: "indeterminate",
+        receipts: reviewBeforeState?.priorReviews ?? [],
+        diagnostics: [{ code: "review_history_status_missing" }]
+      };
+      reviewBinding = {
+        status: "unavailable",
+        coherence: reviewCoherence,
+        reasons: [{ code: "review_binding_skipped_after_request_stop" }],
+        priorReviews: history.receipts,
+        receiptHistory: history,
+        publication: reviewPublication
+      };
     }
 
     // Bound to the evidence this invocation actually gathered, so the
@@ -1585,40 +1624,66 @@ export async function delegateAgent(input, dependencies = {}) {
       outcome?.status !== "completed" || custodyPlan === "coherent-review"
     );
 
+    const retainWithoutStartingAnotherMutation = (reason, { stateKnown = true } = {}) => {
+      custodyState = stateKnown ? "retained" : "retention-failed";
+      custodyReason = reason;
+      custodyReasons.push({ code: reason });
+      if (!stateKnown) reservation = undefined;
+      if (outcome) outcome.custodyState = custodyState;
+    };
+    const retainUnquiescedPublication = () => {
+      custodyState = "retained";
+      custodyReason = "review_receipt_publication_unquiesced";
+      custodyReasons.push({ code: custodyReason });
+      reviewBindingReasons.push({
+        code: "coherent_admission_retained",
+        detail: "review_receipt_publication_unquiesced"
+      });
+      lateReviewReleaseArmed = Boolean(lateReviewPublicationSettlement);
+      if (outcome) outcome.custodyState = custodyState;
+    };
+    const markOrphaned = async (reason) => await requestContext.observe("custody-retention", () =>
+      writeCustody.markOrphanedWriteAccess({
+        executionId,
+        canonicalRootKey: workspace.canonicalRepositoryKey,
+        processIdentity: writerProcessIdentity,
+        reason,
+        mutationSignal: requestContext.abortSignal
+      })
+    );
+
     try {
       if (reservation) {
-        try {
+        if (!requestContext.isActive()) {
+          // The operation that consumed the final root instant has already
+          // been told to stop. Do not start a release/orphan mutation after it;
+          // a retained record is the safe, durable answer until reconciliation.
+          if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {
+            retainUnquiescedPublication();
+          } else {
+            retainWithoutStartingAnotherMutation("custody_settlement_request_stopped");
+          }
+        } else try {
           if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {
             // A receipt write is still in flight and its quiescence was never
             // observed. Releasing the slot now could let a receipt become
             // durable after the custody it cites was gone, so the slot stays
             // retained and reconciles under the unchanged Phase 5 rules.
-            custodyState = "retained";
-            custodyReason = "review_receipt_publication_unquiesced";
-            custodyReasons.push({ code: custodyReason });
-            reviewBindingReasons.push({
-              code: "coherent_admission_retained",
-              detail: "review_receipt_publication_unquiesced"
-            });
-            lateReviewReleaseArmed = Boolean(lateReviewPublicationSettlement);
+            retainUnquiescedPublication();
           } else if (synchronousRelease) {
-            const released = await synchronousRelease();
+            const released = await requestContext.observe("custody-release", () =>
+              synchronousRelease(requestContext.abortSignal)
+            );
             custodyState = released.state.toLowerCase();
             reservation = released;
           } else {
-            const orphaned = await writeCustody.markOrphanedWriteAccess({
-              executionId,
-              canonicalRootKey: workspace.canonicalRepositoryKey,
-              processIdentity: writerProcessIdentity,
-              reason: workspacePreparationAmbiguous
-                ? "worktree-preparation-ambiguous"
-                : "terminal-proof-unavailable"
-            });
-            custodyState = orphaned.state.toLowerCase();
-            reservation = orphaned;
-            custodyReason = workspacePreparationAmbiguous
+            const orphanReason = workspacePreparationAmbiguous
               ? "worktree-preparation-ambiguous"
               : "terminal-proof-unavailable";
+            const orphaned = await markOrphaned(orphanReason);
+            custodyState = orphaned.state.toLowerCase();
+            reservation = orphaned;
+            custodyReason = orphanReason;
             custodyReasons.push({ code: custodyReason });
             if (custodyPlan === "write") {
               outcome = {
@@ -1643,49 +1708,56 @@ export async function delegateAgent(input, dependencies = {}) {
           }
           if (outcome) outcome.custodyState = custodyState;
         } catch (releaseError) {
-          try {
-            const orphaned = await writeCustody.markOrphanedWriteAccess({
-              executionId,
-              canonicalRootKey: workspace.canonicalRepositoryKey,
-              processIdentity: writerProcessIdentity,
-              reason: "custody-release-proof-failed"
-            });
-            custodyState = orphaned.state.toLowerCase();
-            reservation = orphaned;
-            custodyReason = "custody-release-proof-failed";
-            custodyReasons.push({
-              code: custodyReason,
-              ...(typeof releaseError?.code === "string" ? { detail: releaseError.code } : {})
-            });
-          } catch {
-            custodyState = "retention-failed";
-            custodyReason = "custody-retention-failed";
-            custodyReasons.push({ code: custodyReason });
-          }
-          if (custodyPlan === "write") {
-            outcome = {
-              ...baseOutcome({
-                profile,
-                runtime,
-                workspace: executionWorkspace,
-                executionId,
-                startedAt,
-                now,
-                custodyState
-              }),
-              status: outcome?.status === "timeout" ? "timeout" : "failed",
-              error: custodyRetentionError(releaseError, {
-                terminalProofAvailable: Boolean(terminalProof),
-                workspacePreparationAmbiguous
-              }),
-              stderrSummary: outcome?.stderrSummary || ""
-            };
+          if (isRequestStop(releaseError)) {
+            // `observe()` deliberately does not tell us whether an in-flight
+            // durable rename won just before the root deadline. Treat that
+            // state as unknown and leave it to the record's own reconciliation;
+            // never start a second mutation to guess at the answer.
+            retainWithoutStartingAnotherMutation("custody_settlement_unproven", { stateKnown: false });
           } else {
-            if (outcome) outcome.custodyState = custodyState;
-            reviewBindingReasons.push({
-              code: "coherent_admission_retained",
-              detail: releaseError?.code
-            });
+            try {
+              const orphaned = await markOrphaned("custody-release-proof-failed");
+              custodyState = orphaned.state.toLowerCase();
+              reservation = orphaned;
+              custodyReason = "custody-release-proof-failed";
+              custodyReasons.push({
+                code: custodyReason,
+                ...(typeof releaseError?.code === "string" ? { detail: releaseError.code } : {})
+              });
+            } catch (retentionError) {
+              if (isRequestStop(retentionError)) {
+                retainWithoutStartingAnotherMutation("custody_settlement_unproven", { stateKnown: false });
+              } else {
+                custodyState = "retention-failed";
+                custodyReason = "custody-retention-failed";
+                custodyReasons.push({ code: custodyReason });
+              }
+            }
+            if (custodyPlan === "write") {
+              outcome = {
+                ...baseOutcome({
+                  profile,
+                  runtime,
+                  workspace: executionWorkspace,
+                  executionId,
+                  startedAt,
+                  now,
+                  custodyState
+                }),
+                status: outcome?.status === "timeout" ? "timeout" : "failed",
+                error: custodyRetentionError(releaseError, {
+                  terminalProofAvailable: Boolean(terminalProof),
+                  workspacePreparationAmbiguous
+                }),
+                stderrSummary: outcome?.stderrSummary || ""
+              };
+            } else {
+              if (outcome) outcome.custodyState = custodyState;
+              reviewBindingReasons.push({
+                code: "coherent_admission_retained",
+                detail: releaseError?.code
+              });
+            }
           }
         }
       }
@@ -1703,6 +1775,11 @@ export async function delegateAgent(input, dependencies = {}) {
     const lateRelease = lateReviewPublicationSettlement.then(async (publicationSettlement) => {
       await custodyFinalization;
       if (publicationSettlement?.status !== "settled" || !reservation) return;
+      // The root request may have stopped while the authoritative receipt
+      // rename was quiescing. A late settlement proves only that rename, not
+      // authority to begin a new custody mutation after that stop. Leave the
+      // durable record for ordinary reconciliation in that case.
+      if (!requestContext.isActive()) return;
       try {
         // Exactly the release the synchronous path would have performed: this
         // is a coherent review, so the unstarted case is permitted here for
@@ -1717,25 +1794,29 @@ export async function delegateAgent(input, dependencies = {}) {
           });
           return;
         }
-        await release();
-        await dependencies.onLateReviewPublicationRelease?.({
-          status: "released",
-          executionId,
-          publication: publicationSettlement
-        });
-      } catch (error) {
-        try {
+        await release(requestContext.abortSignal);
+        if (requestContext.isActive()) {
           await dependencies.onLateReviewPublicationRelease?.({
-            status: "retained",
+            status: "released",
             executionId,
-            publication: publicationSettlement,
-            errorCode: error?.code || error?.name
+            publication: publicationSettlement
           });
-        } catch {
-          // Diagnostics cannot grant release authority or destabilize the MCP.
         }
+      } catch (error) {
+        if (requestContext.isActive()) {
+          try {
+            await dependencies.onLateReviewPublicationRelease?.({
+              status: "retained",
+              executionId,
+              publication: publicationSettlement,
+              errorCode: error?.code || error?.name
+            });
+          } catch {
+            // Diagnostics cannot grant release authority or destabilize the MCP.
+          }
         }
-      });
+      }
+    });
     // Nothing awaits this deliberately detached release, so it must never be
     // able to surface as an unhandled rejection in the MCP process.
     void lateRelease.catch(() => {});
@@ -1885,6 +1966,10 @@ export function formatDelegateAgentOutcome(outcome) {
         ? history.totalCount
         : history.receipts.length;
       lines.push("PriorReviews: " + totalHistoryCount);
+      lines.push("AuthoritativeReceiptHistoryExhaustive: " +
+        (history.authoritativeExhaustive === true));
+      lines.push("PriorReviewsTruncated: " +
+        (history.outputTruncated === true || totalHistoryCount > history.receipts.length));
       if (totalHistoryCount > history.receipts.length) {
         lines.push("PriorReviewsDisplayed: " + history.receipts.length);
       }

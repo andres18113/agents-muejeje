@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { canonicalJson, sha256Hex } from "../canonical-json.mjs";
-import { repositoryStateDirectoryIn } from "../write-custody.mjs";
+import { repositoryIdForCanonicalRootKey, repositoryStateDirectoryIn } from "../write-custody.mjs";
 import { reviewScopeKey } from "../changeset/target.mjs";
 import {
   MAX_RECEIPT_BYTES,
@@ -51,7 +51,7 @@ export const MAX_DISCOVERED_RECEIPTS = 16;
  * Bounds on the authoritative reconciliation sweep. The sc index is allowed to
  * fail, and its failure is silent by design, so its emptiness can never be
  * reported as a proven absence of evidence without asking the cs tree. That
- * question is answered under a hard bound, and hitting the bound is reported
+ * question is answered under explicit bounded scan limits, and hitting a limit is reported
  * rather than rounded down to "complete".
  */
 export const MAX_RECOVERY_CHANGE_SETS = 256;
@@ -127,6 +127,10 @@ function requestStopped(error) {
 
 function requestMayStart(requestContext) {
   return requestContext?.isActive?.() !== false;
+}
+
+function receiptMatchesRepositoryScope(receipt, canonicalRootKey) {
+  return receipt?.provenance?.repositoryId === repositoryIdForCanonicalRootKey(canonicalRootKey);
 }
 
 export class ReviewReceiptStore {
@@ -333,6 +337,11 @@ export class ReviewReceiptStore {
       if (!validated) {
         throw new ReviewReceiptError("Refusing to store an invalid review receipt.", {
           code: "review_receipt_invalid"
+        });
+      }
+      if (!receiptMatchesRepositoryScope(validated, canonicalRootKey)) {
+        throw new ReviewReceiptError("Review receipt repository provenance does not match its storage scope.", {
+          code: "review_receipt_repository_mismatch"
         });
       }
 
@@ -563,7 +572,7 @@ export class ReviewReceiptStore {
     }
   }
 
-  async #loadReceipt(receiptPath, requestContext) {
+  async #loadReceipt(receiptPath, canonicalRootKey, requestContext) {
     assertRequestActive(requestContext, "receipt-load-stat");
     const details = await lstat(receiptPath);
     if (!details.isFile() || details.isSymbolicLink()) {
@@ -582,6 +591,9 @@ export class ReviewReceiptStore {
     }
     const validated = validateReviewReceipt(parsed);
     if (!validated) return { skipped: { path: receiptPath, code: "review_receipt_corrupt" } };
+    if (!receiptMatchesRepositoryScope(validated, canonicalRootKey)) {
+      return { skipped: { path: receiptPath, code: "review_receipt_repository_mismatch" } };
+    }
     return { receipt: validated };
   }
 
@@ -601,7 +613,11 @@ export class ReviewReceiptStore {
     const skipped = [];
     for (const name of (await this.#listReceiptDirectories(changeSetDirectory, requestContext)).slice(0, limit)) {
       assertRequestActive(requestContext, "receipt-change-set-loop");
-      const outcome = await this.#loadReceipt(path.join(changeSetDirectory, name, RECEIPT_FILE_NAME), requestContext)
+      const outcome = await this.#loadReceipt(
+        path.join(changeSetDirectory, name, RECEIPT_FILE_NAME),
+        canonicalRootKey,
+        requestContext
+      )
         .catch((error) => {
           if (requestStopped(error)) throw error;
           return { skipped: { path: name, code: "review_receipt_unreadable" } };
@@ -672,7 +688,11 @@ export class ReviewReceiptStore {
         }
         loads += 1;
         const outcome = await this
-          .#loadReceipt(path.join(changeSetDirectory, receiptName, RECEIPT_FILE_NAME), requestContext)
+          .#loadReceipt(
+            path.join(changeSetDirectory, receiptName, RECEIPT_FILE_NAME),
+            canonicalRootKey,
+            requestContext
+          )
           .catch((error) => {
             if (requestStopped(error)) throw error;
             return { skipped: { code: "review_receipt_unreadable" } };
@@ -707,7 +727,7 @@ export class ReviewReceiptStore {
    * `limit` bounds returned records, not authoritative reasoning. The index is
    * deliberately non-evidentiary, so it is never allowed to decide that a
    * full output list proves history exhaustiveness. The cs sweep always runs
-   * under its own hard bounds; its result separately decides whether the
+   * under explicit scan limits; its result separately decides whether the
    * history can be called complete.
    */
   async discoverForScope({
@@ -755,7 +775,7 @@ export class ReviewReceiptStore {
         this.#receiptDirectory(canonicalRootKey, pointer.changeSetId, pointer.reviewId),
         RECEIPT_FILE_NAME
       );
-      const outcome = await this.#loadReceipt(receiptPath, requestContext)
+      const outcome = await this.#loadReceipt(receiptPath, canonicalRootKey, requestContext)
         .catch((error) => {
           if (requestStopped(error)) throw error;
           return { skipped: { path: name, code: "review_pointer_dangling" } };
