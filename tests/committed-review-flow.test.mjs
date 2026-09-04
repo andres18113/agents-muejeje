@@ -35,17 +35,28 @@ function git(cwd, args) {
   return result.stdout.trim();
 }
 
-/** Records the prompt the reviewer was given, and reports a completed review. */
+/**
+ * Records the prompt the reviewer was given, and reports a completed review.
+ *
+ * The identity is built from the arguments the runner is actually handed, the
+ * way the real runner builds it. In particular `repositoryRoot` is the
+ * canonical root that granted custody, never the path the fixture happened to
+ * create: custody records the canonical spelling, and an identity naming a
+ * different spelling of the same directory is a different repository as far as
+ * the durable record is concerned - which is exactly what the validator is
+ * there to catch.
+ */
 function capturingReviewer(captured) {
-  return async ({ prompt, executionId, onChildStarted }) => {
+  return async ({ prompt, executionId, repositoryRoot, onChildStarted }) => {
     captured.prompts.push(prompt);
+    captured.repositoryRoots.push(repositoryRoot);
     const pid = nextPid++;
     const child = new EventEmitter();
     child.pid = pid;
     const identity = Object.freeze({
       executionId,
       agentType: "code-review",
-      repositoryRoot: captured.repository,
+      repositoryRoot,
       pid,
       startTime: String(pid * 100),
       source: "committed-review-flow",
@@ -104,7 +115,7 @@ async function withCommittedRepository(callback) {
 }
 
 async function reviewCommitted({ repository, stateRoot, extra = {} }) {
-  const captured = { prompts: [], repository };
+  const captured = { prompts: [], repositoryRoots: [], repository };
   const writeCustody = new DurableWriteCustodyManager({ stateRoot });
   const receiptStore = new ReviewReceiptStore({ stateRoot });
   const outcome = await delegateAgent(
