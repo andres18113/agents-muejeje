@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { defaultDurableStateRoot } from "../src/custody/durable-store.mjs";
+import { defaultDurableStateRoot, repositoryStateDirectoryIn } from "../src/custody/durable-store.mjs";
 import { resolveRepositoryCoordinationIdentity } from "../src/worktree-manager.mjs";
 import { resolveCanonicalWorkspaceRoot } from "../src/workspace-root.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
@@ -37,10 +37,9 @@ const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
  */
 const READINESS_WATCHDOG_MS = 120_000;
 const TERMINATION_WATCHDOG_MS = 60_000;
-// The post-stop assertion is a negative one - no release mutation may start -
-// so it is checked continuously across this window rather than sampled once
-// after a sleep.
-const POST_STOP_OBSERVATION_MS = 1_500;
+// Only a watchdog over the scoped terminal settlement a cancelled execution is
+// still entitled to perform.
+const SETTLEMENT_WATCHDOG_MS = 60_000;
 const POLL_INTERVAL_MS = 50;
 
 /** Durable states from which the delegation can no longer reach ACTIVE. */
@@ -66,7 +65,7 @@ function processIsAlive(pid) {
   }
 }
 
-test("transport-level request cancellation aborts child execution and retains custody for reconciliation", async () => {
+test("transport-level request cancellation aborts child execution and settles its own custody", async () => {
   ensureFakeClaude();
 
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "mcp-cancel-hermetic-"));
@@ -291,33 +290,47 @@ test("transport-level request cancellation aborts child execution and retains cu
       diagnose("Cancellation must force-terminate the exact Claude child (pid " + claudePid + ").")
     );
 
-    // 6. A root-stopped request may not begin a new durable release mutation.
-    // The record stays retained for ordinary reconciliation rather than making
-    // post-cancellation cleanup look like an in-bound settlement. This is a
-    // negative property, so it is verified continuously across the observation
-    // window instead of sampled once.
-    const observationDeadline = Date.now() + POST_STOP_OBSERVATION_MS;
-    let retainedRecord;
-    while (Date.now() < observationDeadline) {
+    // 6. The request has lost the authority to do further work, but this
+    // invocation still owns one execution whose exact child provably closed.
+    // That is the one thing it may settle, and it must: otherwise the slot
+    // stays held by a coordinator that can no longer prove anything about a
+    // process that is already gone. The settlement is scoped to this execution
+    // and revision alone, so it can never touch anything started afterwards.
+    const settlementDeadline = Date.now() + SETTLEMENT_WATCHDOG_MS;
+    let settled = false;
+    while (Date.now() < settlementDeadline) {
       const observation = await readDurable();
       observe("post-stop", observation);
-      retainedRecord = observation.record;
-      assert.ok(retainedRecord, diagnose("Cancellation must retain durable custody for reconciliation."));
-      assert.notEqual(
-        retainedRecord.state,
-        "RELEASED",
-        diagnose("Cancellation must not start a post-stop release.")
-      );
+      if (!observation.record) {
+        settled = true;
+        break;
+      }
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
+    assert.ok(
+      settled,
+      diagnose("A cancelled execution holding exact terminal proof must return its own custody.")
+    );
 
-    // 7. The durable lifecycle reached ACTIVE before cancellation, but no
-    // post-stop release transition is allowed. A future reconciliation owns
-    // the terminal-proof and archival decision.
-    const states = retainedRecord.transitions.map((t) => t.state);
+    // 7. The returned custody is archived as history, and that history shows the
+    // whole lifecycle: it ran, it was proven terminal, and it was released.
+    const archived = JSON.parse(await readFile(
+      path.join(
+        repositoryStateDirectoryIn(durableRoot, repoKey),
+        "executions",
+        activeRecord.executionId,
+        "record.json"
+      ),
+      "utf8"
+    ));
+    const states = archived.transitions.map((t) => t.state);
+    assert.equal(archived.state, "RELEASED", diagnose("Settled custody must be archived as RELEASED"));
     assert.ok(states.includes("SPAWNING"), diagnose("Transitions must include SPAWNING"));
     assert.ok(states.includes("ACTIVE"), diagnose("Transitions must include ACTIVE"));
-    assert.ok(!states.includes("RELEASED"), diagnose("Transitions must not include a post-stop RELEASED state"));
+    assert.ok(
+      states.includes("TERMINAL_PROVEN"),
+      diagnose("Release must rest on proven termination, never on an assumption")
+    );
   } finally {
     serverChild.kill();
     await rm(fixtureRoot, { recursive: true, force: true }).catch(() => {});

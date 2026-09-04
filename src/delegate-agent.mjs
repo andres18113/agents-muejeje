@@ -17,6 +17,7 @@ import {
 import { buildClaudeEnvironment } from "./claude-environment.mjs";
 import {
   ClaudeTimeoutError,
+  PROCESS_TREE_TERMINATION_TIMEOUT_MS,
   runClaudeAgent
 } from "./claude-runner.mjs";
 import {
@@ -772,9 +773,10 @@ function authorizedCustodyRelease({
     !workspacePreparationAmbiguous &&
     unstartedReleaseAllowed
   ) {
-    return (mutationSignal) => writeCustody.releaseUnstartedWriteAccess({
+    return (mutationSignal, scope = {}) => writeCustody.releaseUnstartedWriteAccess({
       executionId,
       canonicalRootKey,
+      ...scope,
       ...(mutationSignal ? { mutationSignal } : {})
     });
   }
@@ -783,20 +785,130 @@ function authorizedCustodyRelease({
   // identity could be captured. Custody validates that claim.
   if (writerProcessStarted && terminalProof) {
     return terminalProof.supervisedByCoordinator === true
-      ? (mutationSignal) => writeCustody.releaseWriteAccessAfterSupervisedClose({
+      ? (mutationSignal, scope = {}) => writeCustody.releaseWriteAccessAfterSupervisedClose({
           executionId,
           canonicalRootKey,
           terminalProof,
+          ...scope,
           ...(mutationSignal ? { mutationSignal } : {})
         })
-      : (mutationSignal) => writeCustody.releaseWriteAccessAfterTerminal({
+      : (mutationSignal, scope = {}) => writeCustody.releaseWriteAccessAfterTerminal({
           executionId,
           canonicalRootKey,
           terminalProof,
+          ...scope,
           ...(mutationSignal ? { mutationSignal } : {})
         });
   }
   return undefined;
+}
+
+/**
+ * How long a terminal settlement that has outlived its request may run.
+ *
+ * It bounds one release: a state transition, an archive rename, and nothing
+ * else. It is not a second useful-work envelope and nothing but that release
+ * may be started under it.
+ */
+export const TERMINAL_SETTLEMENT_BUDGET_MS = 15_000;
+
+/**
+ * The authority a cancelled request keeps over the one execution it owns.
+ *
+ * A cancelled request loses the right to do further work. It does not lose the
+ * fact that it already took durable custody, and the exact child it spawned may
+ * still have closed under it. Conflating those two is what made a cancelled
+ * writer hold a repository for the entire life of the coordinator: nobody was
+ * left with standing to return custody that provably nobody was using.
+ *
+ * So the two authorities are separated. Request authority governs whether new
+ * functional work may begin, and it is gone. Settlement authority governs one
+ * release of one execution, and it exists only when this coordinator holds
+ * exact terminal proof for the exact child of that execution. It is pinned to
+ * the execution, the repository, the revision and the process identity, so it
+ * cannot touch a record that moved on or work that started afterwards, and it
+ * runs under its own bounded signal rather than the request's expired one.
+ *
+ * Deliberately absent: any release that rests on "the process never started".
+ * That is an inference, not proof, and a cancelled request keeps no authority
+ * to make it - such a record stays retained for ordinary reconciliation.
+ */
+function terminalSettlementAuthority({
+  releaseAuthorizedBy,
+  writerProcessStarted,
+  terminalProof,
+  reservation
+}) {
+  if (!writerProcessStarted || !terminalProof || !reservation) return undefined;
+  const release = releaseAuthorizedBy?.(false);
+  if (!release) return undefined;
+  const scope = Number.isSafeInteger(reservation.revision)
+    ? { expectedRevision: reservation.revision }
+    : {};
+  return { release, scope };
+}
+
+/**
+ * How long a stopped request waits for the runner it already told to stop.
+ *
+ * The runner bounds its own forced termination, so this only has to outlast
+ * that plus the close observation behind it.
+ */
+export const RUNNER_TERMINAL_EVIDENCE_TIMEOUT_MS = PROCESS_TREE_TERMINATION_TIMEOUT_MS + 10_000;
+
+/**
+ * Collects the terminal evidence a cancelled runner is already producing.
+ *
+ * `observe()` races a request stop against the runner and abandons it. For most
+ * phases that is right, but the runner's reaction to a stop is to force-
+ * terminate the exact child and observe its close - and that close proof is the
+ * only thing that can ever return this execution's custody. Abandoning it
+ * throws away the evidence and strands the repository behind a coordinator that
+ * can no longer prove anything about a process that is already gone.
+ *
+ * So the runner is waited for, bounded, purely as an observation. It starts
+ * nothing: the runner is already terminating, and what comes back is used only
+ * as lifecycle evidence. The reported outcome remains the cancellation.
+ */
+async function settleRunnerAfterRequestStop(attempt, {
+  timeoutMs = RUNNER_TERMINAL_EVIDENCE_TIMEOUT_MS,
+  schedule,
+  cancel
+} = {}) {
+  const scheduleAt = schedule || setTimeout;
+  const cancelAt = cancel || clearTimeout;
+  if (!attempt) return undefined;
+  let timer;
+  const quiescence = new Promise((resolve) => {
+    timer = scheduleAt(() => resolve(undefined), Math.max(0, timeoutMs));
+  });
+  try {
+    return await Promise.race([
+      attempt.then((value) => value, (error) => error),
+      quiescence
+    ]);
+  } finally {
+    cancelAt(timer);
+  }
+}
+
+/**
+ * A bounded signal for exactly one terminal settlement. The request's own
+ * signal is already aborted and would refuse the mutation outright, so the
+ * settlement needs its own - and that signal must expire on its own so a
+ * settlement can never outlive the response it belongs to.
+ */
+function createTerminalSettlementSignal({ schedule, cancelSchedule, budgetMs }) {
+  // Wall-clock by default: the request's own clock has already expired and is
+  // no longer being advanced, so a bound taken from it could never fire.
+  const scheduleAt = schedule || setTimeout;
+  const cancelAt = cancelSchedule || clearTimeout;
+  const controller = new AbortController();
+  const timer = scheduleAt(() => controller.abort(), budgetMs);
+  return {
+    signal: controller.signal,
+    dispose: () => cancelAt(timer)
+  };
 }
 
 function buildTerminationDiagnostics({
@@ -987,6 +1099,9 @@ export async function delegateAgent(input, dependencies = {}) {
   // on the repository could not be observed. Custody must then be retained.
   let workspacePreparationAmbiguous = false;
   let runnerInvoked = false;
+  // Held so a cancelled request can still observe the terminal proof the runner
+  // is already producing, which is the only evidence that can release custody.
+  let runnerAttemptForEvidence;
   let outcome;
   // Everything the review path needs to hand from admission, through the
   // prompt, to the after-collection inside the release window.
@@ -1455,7 +1570,7 @@ export async function delegateAgent(input, dependencies = {}) {
           requestSettlementBudgetMs
         )
       };
-      const execution = await requestContext.observe("claude-runner", () => runAgent({
+      const execution = await requestContext.observe("claude-runner", () => (runnerAttemptForEvidence = runAgent({
         profile,
         agentType: profile.id,
         prompt,
@@ -1535,7 +1650,7 @@ export async function delegateAgent(input, dependencies = {}) {
               });
             }
           : undefined
-      }));
+      })));
       writerProcessStarted = writerProcessStarted || execution?.processStarted === true || Boolean(execution?.processIdentity);
       lifecycleEvidence = execution;
       writerProcessIdentity = writerProcessIdentity || execution?.processIdentity;
@@ -1560,14 +1675,31 @@ export async function delegateAgent(input, dependencies = {}) {
       };
     }
   } catch (error) {
+    // A request stop abandons the runner, but the runner's reaction to that
+    // stop is to terminate the exact child and observe its close. That proof is
+    // the only thing that can return this execution's custody, so it is
+    // collected here rather than discarded. The reported outcome stays the
+    // cancellation; only the lifecycle evidence is taken from the runner.
+    const runnerEvidence = isRequestStop(error) && runnerInvoked
+      ? await settleRunnerAfterRequestStop(runnerAttemptForEvidence, {
+          timeoutMs: dependencies.runnerTerminalEvidenceTimeoutMs,
+          // Deliberately wall-clock. These waits happen after the request's own
+          // clock has stopped being advanced, so borrowing it would mean a
+          // bound that can never expire.
+          schedule: dependencies.scheduleTerminalSettlement,
+          cancel: dependencies.cancelTerminalSettlement
+        })
+      : undefined;
     lifecycleEvidence = error;
     lateTerminalRecoveryAllowed = error?.lateRecoveryAllowed === true;
     if (!executionWorkspace.workspaceRoot && typeof error?.worktreeRoot === "string") {
       retainedWorktreeRoot = error.worktreeRoot;
     }
-    writerProcessStarted = writerProcessStarted || error?.processStarted === true || Boolean(error?.processIdentity);
-    writerProcessIdentity = writerProcessIdentity || error?.processIdentity;
-    terminalProof = error?.terminalProof;
+    writerProcessStarted = writerProcessStarted ||
+      error?.processStarted === true || Boolean(error?.processIdentity) ||
+      runnerEvidence?.processStarted === true || Boolean(runnerEvidence?.processIdentity);
+    writerProcessIdentity = writerProcessIdentity || error?.processIdentity || runnerEvidence?.processIdentity;
+    terminalProof = error?.terminalProof ?? runnerEvidence?.terminalProof;
     processProvenNotStarted = !runnerInvoked || error?.processStarted === false;
     workspacePreparationAmbiguous = error?.sideEffectsUnproven === true;
     outcome = {
@@ -1782,13 +1914,51 @@ export async function delegateAgent(input, dependencies = {}) {
         });
       } else if (reservation) {
         if (!requestContext.isActive()) {
-          // The operation that consumed the final root instant has already
-          // been told to stop. Do not start a release/orphan mutation after it;
-          // a retained record is the safe, durable answer until reconciliation.
-          if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {
-            retainUnquiescedPublication();
+          // The request has been told to stop, so no new functional work may
+          // begin. What this invocation already owns is a different question:
+          // if the exact child it spawned provably closed, it still holds the
+          // one authority nobody else has - returning that exact custody.
+          const settlement = custodyPlan === "coherent-review" && reviewPublicationUnquiesced
+            ? undefined
+            : terminalSettlementAuthority({
+                releaseAuthorizedBy,
+                writerProcessStarted,
+                terminalProof,
+                reservation
+              });
+          if (!settlement) {
+            // No exact proof, so nothing here has standing to release. A
+            // retained record is the safe, durable answer until reconciliation.
+            if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {
+              retainUnquiescedPublication();
+            } else {
+              retainWithoutStartingAnotherMutation("custody_settlement_request_stopped");
+            }
           } else {
-            retainWithoutStartingAnotherMutation("custody_settlement_request_stopped");
+            const settlementSignal = createTerminalSettlementSignal({
+              schedule: dependencies.scheduleTerminalSettlement,
+              cancelSchedule: dependencies.cancelTerminalSettlement,
+              budgetMs: dependencies.terminalSettlementBudgetMs ?? TERMINAL_SETTLEMENT_BUDGET_MS
+            });
+            try {
+              const released = await settlement.release(settlementSignal.signal, settlement.scope);
+              custodyState = released.state.toLowerCase();
+              reservation = released;
+              custodyReason = "custody_settled_after_request_stop";
+              custodyReasons.push({ code: custodyReason });
+              if (outcome) outcome.custodyState = custodyState;
+            } catch (settlementError) {
+              // The settlement is the last thing this invocation may do. A
+              // failure here starts nothing else: the record stays exactly as
+              // it is and reconciliation owns it.
+              retainWithoutStartingAnotherMutation("custody_settlement_unproven", { stateKnown: false });
+              custodyReasons.push({
+                code: "custody_settlement_failed",
+                ...(typeof settlementError?.code === "string" ? { detail: settlementError.code } : {})
+              });
+            } finally {
+              settlementSignal.dispose();
+            }
           }
         } else try {
           if (custodyPlan === "coherent-review" && reviewPublicationUnquiesced) {

@@ -390,9 +390,16 @@ export class DurableWriteCustodyManager {
     }, { mutationSignal });
   }
 
-  async releaseWriteAccessAfterTerminal({ executionId, canonicalRootKey, terminalProof, mutationSignal }) {
+  async releaseWriteAccessAfterTerminal({
+    executionId,
+    canonicalRootKey,
+    terminalProof,
+    expectedRevision,
+    mutationSignal
+  }) {
     return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+      this.#requireSettlementScope(record, expectedRevision);
       if (!["SPAWNING", "ACTIVE", "TERMINATING"].includes(record.state)) {
         throw new WriteCustodyError("Write custody cannot return from its current state.", {
           code: "write_custody_state_invalid"
@@ -428,9 +435,16 @@ export class DurableWriteCustodyManager {
    * other or later coordinator. No fake durable identity is ever fabricated or
    * persisted.
    */
-  async releaseWriteAccessAfterSupervisedClose({ executionId, canonicalRootKey, terminalProof, mutationSignal }) {
+  async releaseWriteAccessAfterSupervisedClose({
+    executionId,
+    canonicalRootKey,
+    terminalProof,
+    expectedRevision,
+    mutationSignal
+  }) {
     return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
+      this.#requireSettlementScope(record, expectedRevision);
       if (record.state !== "SPAWNING") {
         throw new WriteCustodyError(
           "A supervised close may only terminalize a spawning reservation.",
@@ -783,6 +797,24 @@ export class DurableWriteCustodyManager {
     } finally {
       mutationSignal?.removeEventListener?.("abort", releaseCancelledPrepublicationTurn);
       releaseQueue();
+    }
+  }
+
+  /**
+   * Pins a settlement to the exact revision its caller observed.
+   *
+   * A release that runs after its request has already stopped carries no
+   * request authority, only authority over the one execution it owns. Naming
+   * the revision is what makes that scope checkable: anything that advanced the
+   * record in the meantime is a different durable fact, and this settlement has
+   * no standing to act on it.
+   */
+  #requireSettlementScope(record, expectedRevision) {
+    if (expectedRevision === undefined) return;
+    if (!Number.isSafeInteger(expectedRevision) || record.revision !== expectedRevision) {
+      throw new WriteCustodyError("Durable custody moved before its scoped settlement could run.", {
+        code: "write_custody_settlement_scope_lost"
+      });
     }
   }
 

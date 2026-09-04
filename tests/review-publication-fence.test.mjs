@@ -542,7 +542,11 @@ test("root cancellation between AFTER scheduling and its microtask starts no bin
   assert.equal(outcome.status, "timeout");
   assert.equal(outcome.error.code, "claude_cancelled");
   assert.equal(afterStarted, false);
-  assert.equal(outcome.custodyState, "retained");
+  // No binder work began, so no receipt can still land, and the reviewer's exact
+  // child is proven closed. The cancelled request has no authority to start new
+  // work and starts none - but it does still own this execution, and returning
+  // that custody is the one settlement it is entitled to perform.
+  assert.equal(outcome.custodyState, "released");
 });
 
 test("settled authoritative publication is enough to release even if later housekeeping stalls", async () => {
