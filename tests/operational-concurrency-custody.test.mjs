@@ -74,6 +74,10 @@ async function withTestRepository(callback) {
   }
 }
 
+// Only a watchdog against a hung fixture; progress is decided by the barrier
+// file and by Writer A's own settlement, never by this number.
+const BARRIER_WATCHDOG_MS = 120_000;
+
 test("Area 4 - Writer A vs Writer B competing processes fail closed", async () => {
   ensureFakeClaude();
   await withTestRepository(async ({ fixtureRoot, repositoryRoot, writeCustody, scenarioFile, env }) => {
@@ -89,6 +93,7 @@ test("Area 4 - Writer A vs Writer B competing processes fail closed", async () =
       "utf8"
     );
 
+    let writerASettlement;
     const writerAPromise = delegateAgent(
       {
         agentType: "general-purpose",
@@ -97,13 +102,32 @@ test("Area 4 - Writer A vs Writer B competing processes fail closed", async () =
       },
       { env, writeCustody }
     );
+    void writerAPromise.then(
+      (outcome) => { writerASettlement = { outcome }; },
+      (error) => { writerASettlement = { error }; }
+    );
 
-    // Wait until Writer A has spawned and reached the barrier
-    for (let i = 0; i < 100; i += 1) {
-      if (existsSync(readyFile)) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    // Wait until Writer A has actually reached the barrier. Getting there runs
+    // through workspace resolution, a worktree preparation and a spawn, so its
+    // duration belongs to machine load rather than to the exclusion this test
+    // is about. The wait therefore ends on the barrier itself, or as soon as
+    // Writer A settles and can no longer reach it, and the remaining bound is
+    // a watchdog an order of magnitude above the slowest healthy readiness.
+    const barrierDeadline = Date.now() + BARRIER_WATCHDOG_MS;
+    while (Date.now() < barrierDeadline && !existsSync(readyFile) && !writerASettlement) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    assert.ok(existsSync(readyFile), "Writer A must reach ready barrier");
+    assert.ok(
+      existsSync(readyFile),
+      writerASettlement
+        ? "Writer A settled before holding the barrier, so Writer B never contended with it: " +
+          JSON.stringify({
+            status: writerASettlement.outcome?.status,
+            error: writerASettlement.outcome?.error?.code ?? writerASettlement.error?.code,
+            custody: writerASettlement.outcome?.custodyState
+          })
+        : "Writer A did not reach the ready barrier within the " + BARRIER_WATCHDOG_MS + "ms watchdog"
+    );
 
     // Writer B attempts delegation while Writer A is actively holding custody
     const outcomeB = await delegateAgent(

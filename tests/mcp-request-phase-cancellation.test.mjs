@@ -22,13 +22,41 @@ async function delay(milliseconds) {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function waitFor(condition, { timeoutMs = 8_000, intervalMs = 25, detail = "condition" } = {}) {
+/**
+ * Waits for a real condition, not for an interval.
+ *
+ * Readiness here runs through a spawned MCP server, several git subprocesses
+ * and a Windows process-identity query, so its duration is a property of
+ * machine load rather than of the behaviour under test, and a fixed budget
+ * measures the machine. This ends on the condition, or as soon as the scenario
+ * becomes unreachable, and its remaining bound is a watchdog set an order of
+ * magnitude above the slowest observed healthy readiness so only a genuinely
+ * hung run fails on time.
+ */
+const READINESS_WATCHDOG_MS = 120_000;
+
+async function waitFor(condition, {
+  timeoutMs = READINESS_WATCHDOG_MS,
+  intervalMs = 25,
+  detail = "condition",
+  unreachable,
+  diagnose
+} = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await condition()) return;
+    const blocked = await unreachable?.();
+    if (blocked) {
+      assert.fail(
+        `Cannot reach ${detail}: ${blocked}. The scenario was never entered, so this run proves nothing about it.` +
+          (diagnose ? "; " + (await diagnose()) : "")
+      );
+    }
     await delay(intervalMs);
   }
-  assert.fail(`Timed out waiting for ${detail}`);
+  assert.fail(
+    `Timed out waiting for ${detail} after ${timeoutMs}ms` + (diagnose ? "; " + (await diagnose()) : "")
+  );
 }
 
 function startClient(serverChild) {
@@ -60,9 +88,16 @@ function startClient(serverChild) {
     get stderr() { return stderr; },
     request(method, params = {}) {
       const id = nextId++;
+      const call = { id, settled: false };
       const response = new Promise((resolve) => pending.set(id, resolve));
       serverChild.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-      return { id, response };
+      // A request that has answered can no longer reach a phase marker, so a
+      // readiness wait can stop at once instead of running out its watchdog.
+      call.response = response.then((message) => {
+        call.settled = true;
+        return message;
+      });
+      return call;
     },
     notify(method, params = {}) {
       serverChild.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
@@ -130,7 +165,11 @@ async function withTransport(phase, callback) {
 
 async function cancelAtMarker({ client, markerDirectory, marker, request }) {
   const markerPath = path.join(markerDirectory, marker + ".ready");
-  await waitFor(() => existsSync(markerPath), { detail: marker + " marker" });
+  await waitFor(() => existsSync(markerPath), {
+    detail: marker + " marker",
+    unreachable: () => (request.settled ? "the request answered before reaching the marker" : undefined),
+    diagnose: () => "stderr=" + JSON.stringify(String(client.stderr).slice(-1200))
+  });
   client.notify("notifications/cancelled", { requestId: request.id, reason: "transport cancellation test" });
   // MCP cancellation may intentionally suppress the original response. The
   // durable custody state, rather than an optional late response, proves that
@@ -144,7 +183,11 @@ test("STDIO cancellation during worktree preparation retains unstarted custody i
       name: "delegate_agent",
       arguments: { agent_type: "general-purpose", task: "stall worktree preparation", cwd: repositoryRoot }
     });
-    await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), { detail: "worktree reservation" });
+    await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), {
+      detail: "worktree reservation",
+      unreachable: () => (request.settled ? "the delegation answered before taking custody" : undefined),
+      diagnose: () => "stderr=" + JSON.stringify(String(client.stderr).slice(-1200))
+    });
     await cancelAtMarker({ client, markerDirectory, marker: "worktree-preparation", request });
     await waitFor(async () => (await custody.getWriteAccess(repositoryKey))?.state === "RESERVED", {
       detail: "retained worktree custody"
@@ -158,7 +201,11 @@ test("STDIO cancellation during BEFORE history discovery retains coherent review
       name: "delegate_agent",
       arguments: { agent_type: "code-review", task: "stall before history", cwd: repositoryRoot }
     });
-    await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), { detail: "coherent review reservation" });
+    await waitFor(async () => Boolean(await custody.getWriteAccess(repositoryKey)), {
+      detail: "coherent review reservation",
+      unreachable: () => (request.settled ? "the delegation answered before taking custody" : undefined),
+      diagnose: () => "stderr=" + JSON.stringify(String(client.stderr).slice(-1200))
+    });
     await cancelAtMarker({ client, markerDirectory, marker: "before-history", request });
     await waitFor(async () => {
       const record = await custody.getWriteAccess(repositoryKey);
