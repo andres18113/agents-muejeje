@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { hardDeniedBashRules } from "./shell-policy.mjs";
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultHookPath = path.resolve(moduleDirectory, "..", "hooks", "claude-pretool-policy.mjs");
@@ -37,6 +38,14 @@ export function buildRuntimeSettingsPayload({ shellPolicy, hookPath = defaultHoo
   ].join(" ");
 
   return Object.freeze({
+    // The hook is one policy layer, not the boundary. A PreToolUse hook runs as
+    // a separate process: it can time out, and a timeout is not a denial. So
+    // everything that can be stated as a rule is denied by the runtime that
+    // owns the tool call, and the hook only adds the judgements a static rule
+    // cannot express - Git subcommand shape, wrapper resolution, publication.
+    permissions: {
+      deny: hardDeniedBashRules()
+    },
     hooks: {
       PreToolUse: [
         {

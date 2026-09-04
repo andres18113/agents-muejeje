@@ -370,3 +370,83 @@ test("the PreToolUse hook process allows safe commands and exits 2 for denied co
   });
   assert.equal(malformed.status, 2, malformed.stderr);
 });
+
+/**
+ * The Bash guard is a policy layer, not an operating-system boundary.
+ *
+ * Two things follow from that, and both are pinned here. The first is that
+ * anything statable as a rule must be denied by the runtime that owns the tool
+ * call, so a hook that never runs - it is a separate process and can time out,
+ * and a timeout is not a denial - cannot be the only thing standing between an
+ * agent and a prohibited command. The second is that the guard must classify
+ * what actually runs: on Windows the same program answers to several suffixes,
+ * and a wrapper puts the real executable in a later token.
+ */
+test("prohibited commands are denied by permission rules, not only by the hook", () => {
+  const payload = buildRuntimeSettingsPayload({ shellPolicy: "worker" });
+  const deny = payload.permissions.deny;
+  assert.ok(Array.isArray(deny) && deny.length > 0);
+  // Denied by the runtime itself, in every spelling Windows resolves.
+  for (const command of ["rm", "curl", "claude", "taskkill", "powershell", "cmd", "sudo"]) {
+    for (const suffix of ["", ".exe", ".cmd", ".bat", ".com"]) {
+      assert.ok(
+        deny.includes("Bash(" + command + suffix + ":*)"),
+        "missing hard deny for " + command + suffix
+      );
+    }
+  }
+  // The hook remains, as an additional layer with the judgements a static rule
+  // cannot express.
+  assert.equal(payload.hooks.PreToolUse[0].matcher, "Bash");
+  assert.equal(buildRuntimeSettingsPayload({ shellPolicy: "none" }).permissions, undefined);
+});
+
+test("the shell guard classifies wrappers and Windows suffixes by their effective executable", () => {
+  const denied = (command) => {
+    const decision = evaluateShellPolicy("worker", command);
+    assert.equal(decision.allowed, false, "expected denial: " + command);
+    return decision.reason;
+  };
+
+  // Windows executable suffixes reach exactly what the bare name reaches.
+  assert.match(denied("claude.cmd --dangerously-skip-permissions"), /'claude' is denied/u);
+  assert.match(denied("npm.cmd publish"), /Package publication is denied/u);
+  assert.match(denied("git.exe push origin main"), /push/u);
+  assert.match(denied("taskkill.exe /F /IM node.exe"), /'taskkill' is denied/u);
+  assert.match(denied("rm.bat -rf ."), /'rm' is denied/u);
+  assert.match(denied("curl.com http://example.invalid"), /'curl' is denied/u);
+
+  // A wrapper is classified by what it wraps, never by itself.
+  assert.match(denied("command rm -rf ."), /'rm' is denied/u);
+  assert.match(denied("builtin rm -rf ."), /'rm' is denied/u);
+  assert.match(denied("env rm -rf ."), /'rm' is denied/u);
+  assert.match(denied("env curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("env FOO=bar BAZ=qux rm -rf ."), /'rm' is denied/u);
+  assert.match(denied("timeout 5 curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("timeout --signal=KILL 5 curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("nice curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("nice -n 10 curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("nohup curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("stdbuf -o0 curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("time curl http://example.invalid"), /'curl' is denied/u);
+  assert.match(denied("exec rm -rf ."), /'rm' is denied/u);
+  assert.match(denied("xargs rm"), /'rm' is denied/u);
+  // Nested wrappers resolve through to the same executable.
+  assert.match(denied("env nohup timeout 5 rm -rf ."), /'rm' is denied/u);
+  // Wrappers reach the Git policy too, rather than sidestepping it.
+  assert.match(denied("env git.exe push"), /push/u);
+
+  // A wrapper that names no program, or nests absurdly, is refused rather than
+  // classified as the wrapper itself.
+  assert.match(denied("env"), /does not name a program/u);
+  assert.match(denied("timeout 5"), /does not name a program/u);
+  assert.match(denied("env command builtin exec nohup env rm"), /nested too deeply/u);
+
+  // Ordinary work is unaffected.
+  for (const command of ["npm run build", "node build.mjs", "git status", "ls -la", "timeout 5 node build.mjs"]) {
+    assert.equal(evaluateShellPolicy("worker", command).allowed, true, command);
+  }
+  // The read-only role still admits only its allowlist, wrappers included.
+  assert.equal(evaluateShellPolicy("git-readonly", "env git status").allowed, true);
+  assert.equal(evaluateShellPolicy("git-readonly", "env rm -rf .").allowed, false);
+});
