@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { canonicalJson, sha256Hex } from "../canonical-json.mjs";
+import {
+  DEFAULT_PUBLICATION_RETRY_POLICY,
+  withBoundedPublicationRetry
+} from "../custody/publication-retry.mjs";
 import { repositoryIdForCanonicalRootKey, repositoryStateDirectoryIn } from "../write-custody.mjs";
 import { reviewScopeKey } from "../changeset/target.mjs";
 import {
@@ -142,6 +146,7 @@ export class ReviewReceiptStore {
   #beforeScopeIndex;
   #writeFileDurably;
   #readFile;
+  #retryPolicy;
 
   constructor({
     stateRoot,
@@ -151,7 +156,8 @@ export class ReviewReceiptStore {
     readFileFn = readFile,
     beforeAuthoritativeRename,
     afterAuthoritativeRenameIssued,
-    beforeScopeIndex
+    beforeScopeIndex,
+    retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
   } = {}) {
     if (typeof stateRoot !== "string" || stateRoot.length === 0) {
       throw new ReviewReceiptError("A durable state root is required for the review receipt store.", {
@@ -166,6 +172,27 @@ export class ReviewReceiptStore {
     this.#beforeAuthoritativeRename = beforeAuthoritativeRename;
     this.#afterAuthoritativeRenameIssued = afterAuthoritativeRenameIssued;
     this.#beforeScopeIndex = beforeScopeIndex;
+    this.#retryPolicy = retryPolicy;
+  }
+
+  /**
+   * The one thing a durable publication may never do is repeat a rename on
+   * faith. A Windows host can reject an issued rename with a sharing violation
+   * that moved nothing, and the completed review behind it should not be thrown
+   * away for that - but an errno is not evidence about the destination, so the
+   * destination is always read before deciding.
+   *
+   *   the exact expected content is there  -> already published, idempotent;
+   *   nothing is there                     -> nothing landed, may retry;
+   *   something else is there              -> a real collision, fail closed.
+   */
+  #retryOptions(requestContext, cancelledError) {
+    return {
+      policy: this.#retryPolicy,
+      mutationSignal: requestContext?.abortSignal,
+      cancelled: (signal) => signal?.aborted === true || requestMayStart(requestContext) === false,
+      cancelledError
+    };
   }
 
   reviewsDirectory(canonicalRootKey) {
@@ -289,20 +316,30 @@ export class ReviewReceiptStore {
     try {
       assertRequestActive(requestContext, "result-artifact-write");
       await this.#writeFileDurably(artifactStaging, resultText);
-      try {
+      const published = await withBoundedPublicationRetry(async () => {
         assertRequestActive(requestContext, "result-artifact-rename");
-        await this.#rename(artifactStaging, targetArtifactPath);
-      } catch (error) {
-        if (!conflictError(error)) throw error;
-        const present = await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
-        if (present.status !== "verified") {
+        try {
+          await this.#rename(artifactStaging, targetArtifactPath);
+        } catch (error) {
+          if (!conflictError(error)) throw error;
+          const present = await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
+          if (present.status === "verified") return "identical";
+          if (present.status === "missing" && this.#retryPolicy.isTransientPublicationFailure(error)) {
+            // The host refused and nothing landed. Only then may this be tried
+            // again, and the next attempt reads the destination again first.
+            throw error;
+          }
           throw new ReviewReceiptError(
             "Result artifact destination could not be verified after rename conflict.",
             { code: "review_result_artifact_conflict", cause: error }
           );
         }
-        return "identical";
-      }
+        return "created";
+      }, this.#retryOptions(requestContext, () => new ReviewReceiptError(
+        "Result artifact publication was cancelled before rename.",
+        { code: "review_result_artifact_publication_cancelled" }
+      )));
+      if (published === "identical") return "identical";
 
       const verified = await this.#readAndVerifyResultArtifact({ canonicalRootKey, receipt, requestContext });
       if (verified.status !== "verified") {
@@ -415,63 +452,60 @@ export class ReviewReceiptStore {
           });
         }
 
+        // The fence is crossed exactly once for the whole bounded sequence:
+        // authority cannot be re-taken, and a settled-failed attempt does not
+        // retire it while another attempt may still be authorized.
+        const settleWith = (result) => settleReceiptPublication(publication, {
+          reviewId: validated.reviewId,
+          changeSetId: validated.binding.changeSetId,
+          ...result
+        });
         try {
-          renameIssued = this.#rename(staging, finalDirectory);
-        } catch (error) {
-          settleReceiptPublication(publication, {
-            status: "settled",
-            disposition: "failed",
-            reviewId: validated.reviewId,
-            changeSetId: validated.binding.changeSetId,
-            errorCode: error?.code || "rename_failed"
-          });
-          throw error;
-        }
-        const authoritative = Promise.resolve(renameIssued).then(
-          () => {
-            settleReceiptPublication(publication, {
-              status: "settled",
-              disposition: "published",
-              reviewId: validated.reviewId,
-              changeSetId: validated.binding.changeSetId
-            });
-            return { published: true };
-          },
-          (error) => {
-            settleReceiptPublication(publication, {
-              status: "settled",
-              disposition: conflictError(error) ? "conflict" : "failed",
-              reviewId: validated.reviewId,
-              changeSetId: validated.binding.changeSetId,
-              errorCode: error?.code || "rename_failed"
-            });
-            return { error };
-          }
-        );
-        void authoritative.catch(() => {});
-        if (typeof this.#afterAuthoritativeRenameIssued === "function") {
-          await this.#afterAuthoritativeRenameIssued({
-            receipt: validated,
-            finalPath,
-            authoritative
-          });
-        }
-
-        const renameOutcome = await authoritative;
-        if (!renameOutcome.error) {
-          stored = "created";
-        } else {
-          const error = renameOutcome.error;
-          if (!conflictError(error)) throw error;
-          assertRequestActive(requestContext, "receipt-conflict-read");
-          const present = await this.#readFile(finalPath, "utf8").catch(() => undefined);
-          if (present === serialized) {
-            stored = "identical";
-          } else {
+          stored = await withBoundedPublicationRetry(async ({ isRetry }) => {
+            assertRequestActive(requestContext, "receipt-authoritative-rename");
+            renameIssued = this.#rename(staging, finalDirectory);
+            const attempt = Promise.resolve(renameIssued).then(
+              () => ({ published: true }),
+              (error) => ({ error })
+            );
+            void attempt.catch(() => {});
+            if (!isRetry && typeof this.#afterAuthoritativeRenameIssued === "function") {
+              await this.#afterAuthoritativeRenameIssued({
+                receipt: validated,
+                finalPath,
+                authoritative: attempt
+              });
+            }
+            const renameOutcome = await attempt;
+            if (!renameOutcome.error) return "created";
+            const error = renameOutcome.error;
+            if (!conflictError(error)) throw error;
+            // An errno never establishes what is at the destination. Read it.
+            assertRequestActive(requestContext, "receipt-conflict-read");
+            const present = await this.#readFile(finalPath, "utf8").catch(() => undefined);
+            if (present === serialized) return "identical";
+            if (present === undefined && this.#retryPolicy.isTransientPublicationFailure(error)) {
+              // Nothing landed and the host condition is the transient kind, so
+              // a further attempt is allowed - and it starts from scratch.
+              throw error;
+            }
             throw new ReviewReceiptError("A different receipt already occupies this digest prefix.", {
               code: "review_receipt_prefix_collision"
             });
-          }
+          }, this.#retryOptions(requestContext, () => new ReviewReceiptError(
+            "Receipt publication authority was cancelled before rename.",
+            { code: "review_receipt_publication_cancelled" }
+          )));
+          settleWith({ status: "settled", disposition: "published" });
+        } catch (error) {
+          settleWith({
+            status: "settled",
+            disposition: conflictError(error) || error?.code === "review_receipt_prefix_collision"
+              ? "conflict"
+              : "failed",
+            errorCode: error?.code || "rename_failed"
+          });
+          throw error;
         }
       } finally {
         if (requestMayStart(requestContext) && await pathExists(staging)) {
