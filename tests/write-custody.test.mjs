@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { PROCESS_IDENTITY_STATUS } from "../src/process-identity.mjs";
 import {
   DurableWriteCustodyManager,
-  WriteCustodyError
+  WriteCustodyError,
+  createAdmissionPublicationFence
 } from "../src/write-custody.mjs";
 
 const rootA = "C:\\workspace\\root-a";
@@ -1210,6 +1211,142 @@ test("post-publication cancellation lets an issued transition quiesce before rel
     assert.equal(admittedRecord.executionId, "execution-b");
     const authoritative = await custody.getWriteAccess(rootAKey);
     assert.equal(authoritative.executionId, "execution-b");
+    assert.equal(authoritative.state, "RESERVED");
+  });
+});
+
+/**
+ * The initial reservation publishes through exactly one rename, the same way
+ * every later transition does, so it is bound by the same two rules: before the
+ * rename is issued a cancellation permanently removes publication authority,
+ * and once it is issued nothing - including a root cancellation - may conclude
+ * anything about durable state until it settles.
+ *
+ * The two tests below pin one rule each, on either side of that boundary.
+ */
+test("cancellation before the initial admission rename publishes no ownership at all", async () => {
+  await withState(async (stateRoot) => {
+    const inspectionReached = deferred();
+    const resumeInspection = deferred();
+    const custody = new DurableWriteCustodyManager({
+      stateRoot,
+      currentPid: 100,
+      now: () => 1_000,
+      inspectProcess: async (pid) => {
+        inspectionReached.resolve();
+        await resumeInspection.promise;
+        return live(pid, "10000");
+      }
+    });
+
+    const controller = new AbortController();
+    const reserving = custody.reserveWriteAccess({
+      executionId: "execution-a",
+      agentType: "task",
+      canonicalRoot: rootA,
+      canonicalRootKey: rootAKey,
+      mutationSignal: controller.signal
+    });
+    await inspectionReached.promise;
+    controller.abort();
+    resumeInspection.resolve();
+
+    await assert.rejects(
+      reserving,
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_mutation_cancelled"
+    );
+    assert.equal(await custody.getWriteAccess(rootAKey), undefined);
+  });
+});
+
+test("post-publication cancellation of the initial reservation quiesces before a second admission", async () => {
+  await withState(async (stateRoot) => {
+    const publicationIssued = deferred();
+    const resumePublication = deferred();
+    const observations = new Map([[100, live(100, "10000")]]);
+    // Every reservation stamps its record from this clock inside the repository
+    // mutation, and nowhere else in this test, so the call count is exactly the
+    // number of admissions that have been let into the queue.
+    let admissionsEntered = 0;
+    const custody = manager(stateRoot, observations, 100, {
+      now: () => {
+        admissionsEntered += 1;
+        return 1_000;
+      },
+      afterPublicationIssued: async ({ nextRecord }) => {
+        if (nextRecord.executionId === "execution-a" && nextRecord.state === "RESERVED") {
+          publicationIssued.resolve();
+          await resumePublication.promise;
+        }
+      }
+    });
+
+    const controller = new AbortController();
+    const admissionFence = createAdmissionPublicationFence();
+    let reservationSettled = false;
+    const reserving = custody.reserveWriteAccess({
+      executionId: "execution-a",
+      agentType: "task",
+      canonicalRoot: rootA,
+      canonicalRootKey: rootAKey,
+      admissionFence,
+      mutationSignal: controller.signal
+    }).then((record) => {
+      reservationSettled = true;
+      return record;
+    });
+    await publicationIssued.promise;
+    assert.equal(admissionFence.publicationStarted(), true);
+    assert.equal(admissionsEntered, 1);
+
+    // Cancellation arrives after the admission rename was issued. It can no
+    // longer unmake ownership, so it must neither be reported as
+    // pre-publication invalidation nor let a second admission overtake it.
+    controller.abort();
+    let contenderSettled = false;
+    const contenderFence = createAdmissionPublicationFence();
+    const contender = custody.reserveWriteAccess({
+      executionId: "execution-b",
+      agentType: "task",
+      canonicalRoot: rootA,
+      canonicalRootKey: rootAKey,
+      admissionFence: contenderFence
+    }).then(
+      (record) => {
+        contenderSettled = "reserved";
+        return record;
+      },
+      (error) => {
+        contenderSettled = "refused";
+        return error;
+      }
+    );
+    // Long enough for a contender that was wrongly released into the queue to
+    // complete its own directory work; a correctly blocked one can never enter,
+    // however long this waits.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(reservationSettled, false);
+    assert.equal(contenderSettled, false);
+    // The decisive check: the cancelled admission still occupies the queue
+    // because its publication has not settled, so no second admission has begun
+    // building a record for the same ownership slot.
+    assert.equal(admissionsEntered, 1);
+
+    resumePublication.resolve();
+    const reserved = await reserving;
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(reserved.executionId, "execution-a");
+    assert.equal(reserved.state, "RESERVED");
+    assert.equal(admissionFence.disposition(), "published");
+    assert.equal(admissionFence.publishedRecord()?.executionId, "execution-a");
+
+    const refused = await contender;
+    assert.equal(contenderSettled, "refused");
+    assert.equal(refused.code, "write_custody_conflict");
+    // It observed an occupied slot rather than racing the first rename for it.
+    assert.equal(contenderFence.publicationStarted(), false);
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.executionId, "execution-a");
     assert.equal(authoritative.state, "RESERVED");
   });
 });

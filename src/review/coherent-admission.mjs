@@ -41,7 +41,15 @@ export function createCoherentAdmission({ writeCustody } = {}) {
   }
 
   return Object.freeze({
-    async admit({ executionId, agentType, canonicalRoot, canonicalRootKey, targetRef, mutationSignal }) {
+    async admit({
+      executionId,
+      agentType,
+      canonicalRoot,
+      canonicalRootKey,
+      targetRef,
+      admissionFence,
+      mutationSignal
+    }) {
       try {
         const record = await writeCustody.reserveWriteAccess({
           executionId,
@@ -50,6 +58,7 @@ export function createCoherentAdmission({ writeCustody } = {}) {
           canonicalRootKey,
           custodyKind: CUSTODY_KINDS.COHERENT_REVIEW,
           ...(targetRef === undefined ? {} : { targetRef }),
+          ...(admissionFence === undefined ? {} : { admissionFence }),
           mutationSignal
         });
         return Object.freeze({ coherence: COHERENCE.HELD, record });

@@ -132,6 +132,14 @@ export class DurableWriteCustodyManager {
    *
    * A write reservation omits the field entirely rather than writing "write",
    * so its on-disk record stays byte-identical to what Phase 5 produced.
+   *
+   * The rename that creates ownership/ is a publication like any other, so it
+   * holds the repository's mutation queue until it settles even when this
+   * mutation has been cancelled, and it reports through admissionFence which
+   * side of that boundary it reached. Without both, a cancellation racing the
+   * initial rename could admit a second mutation while ownership was still
+   * being created, and could leave a live RESERVED record behind a caller that
+   * had already concluded custody was never acquired.
    */
   async reserveWriteAccess({
     executionId,
@@ -140,6 +148,7 @@ export class DurableWriteCustodyManager {
     canonicalRootKey,
     custodyKind = CUSTODY_KINDS.WRITE,
     targetRef,
+    admissionFence,
     mutationSignal
   }) {
     const validId = validExecutionId(executionId);
@@ -176,7 +185,7 @@ export class DurableWriteCustodyManager {
 
     for (let attempt = 0; attempt < 4; attempt += 1) {
       if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-      const reserved = await this.#withRepositoryMutation(validRootKey, async () => {
+      const reserved = await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
         const repositoryState = this.repositoryStateDirectory(validRootKey);
         await ensureRepositoryLayout(repositoryState, { mutationSignal });
         if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
@@ -209,7 +218,10 @@ export class DurableWriteCustodyManager {
           repositoryState,
           record,
           createNonce: this.#createNonce,
-          mutationSignal
+          mutationSignal,
+          publicationGuard,
+          admissionFence,
+          afterPublicationIssued: this.#afterPublicationIssued
         });
         return created ? recordSnapshot(record) : undefined;
       }, { mutationSignal });
