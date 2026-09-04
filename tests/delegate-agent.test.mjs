@@ -267,6 +267,38 @@ function afterRunnerStarts() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/**
+ * Settles a delegation that runs on a manual clock.
+ *
+ * A wall-clock execution budget measures delegation-entry-to-deadline, so the
+ * real preamble (working-directory resolution, contract loading) consumes the
+ * same budget the runner needs to start. Under full-suite contention that
+ * preamble can exceed a tight budget and clipUsefulWorkTimeout throws before
+ * the runner is ever invoked, which is an honest never-started release - but
+ * it is not the post-spawn timeout the ORPHANED tests mean to exercise. The
+ * manual clock freezes that budget until the test advances it past gates the
+ * runner has provably reached, so spawn-before-deadline is established rather
+ * than assumed. The bounded advance loop fails loudly instead of hanging the
+ * file if production ever stops settling.
+ */
+async function settleManualClockDelegation(clock, pending) {
+  let settled = false;
+  pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+  for (let i = 0; i < 10 && !settled; i++) {
+    clock.advanceTo(clock.now() + 1_000);
+    await afterRunnerStarts();
+  }
+  assert.equal(settled, true, "delegation must settle under the manual clock");
+  return await pending;
+}
+
 function manualClock(initialTime = 1_000) {
   let time = initialTime;
   let nextId = 1;
@@ -2961,19 +2993,35 @@ test("hanging settings cleanup is bounded and preserves exact terminal evidence"
 });
 
 test("a later exact close releases same-coordinator ORPHANED custody", async () => {
+  const clock = manualClock();
   const custody = new WriteCustodyManager();
   const child = createFakeChild({ closeOnKill: false });
   const runtime = writerRuntime(10);
-  const outcome = await delegateAgent(
+  let writerStarted;
+  const writerStartedPromise = new Promise((resolve) => {
+    writerStarted = resolve;
+  });
+  const pending = delegateAgent(
     { agentType: "task", task: "late exact close", cwd: projectRoot },
     {
       writeCustody: custody,
+      now: clock.now,
+      scheduleRequestDeadline: clock.schedule,
+      cancelRequestDeadline: clock.cancelSchedule,
       createExecutionId: () => "late-close-recovery",
       resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
       resolveRuntime: () => runtime,
       runAgent: (argumentsForRunner) => runClaudeAgent({
         ...argumentsForRunner,
         runtime,
+        now: clock.now,
+        schedule: clock.schedule,
+        cancelSchedule: clock.cancelSchedule,
+        async onChildStarted(processIdentity) {
+          // Production awaits this; the wrapper must not drop the promise.
+          await argumentsForRunner.onChildStarted(processIdentity);
+          writerStarted();
+        },
         createSettings: fakeSettings(),
         spawnProcess: () => child,
         terminationTimeoutMs: 10,
@@ -2981,6 +3029,11 @@ test("a later exact close releases same-coordinator ORPHANED custody", async () 
       })
     }
   );
+  // The child must provably exist before the execution budget expires;
+  // otherwise the timeout is a never-started release, not this test's premise.
+  await writerStartedPromise;
+  await afterRunnerStarts();
+  const outcome = await settleManualClockDelegation(clock, pending);
   const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
   assert.equal(outcome.custodyState, "orphaned");
   assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
@@ -3005,6 +3058,7 @@ test("a later exact close releases same-coordinator ORPHANED custody", async () 
 });
 
 test("a failed late ORPHANED recovery stays fail-closed and reports its persistence error", async () => {
+  const clock = manualClock();
   const custody = new WriteCustodyManager();
   const child = createFakeChild({ closeOnKill: false });
   const runtime = writerRuntime(10);
@@ -3020,16 +3074,31 @@ test("a failed late ORPHANED recovery stays fail-closed and reports its persiste
   };
   process.on("unhandledRejection", recordUnhandledRejection);
   try {
-    const outcome = await delegateAgent(
+    let writerStarted;
+    const writerStartedPromise = new Promise((resolve) => {
+      writerStarted = resolve;
+    });
+    const pending = delegateAgent(
       { agentType: "task", task: "late recovery persistence failure", cwd: projectRoot },
       {
         writeCustody: custody,
+        now: clock.now,
+        scheduleRequestDeadline: clock.schedule,
+        cancelRequestDeadline: clock.cancelSchedule,
         createExecutionId: () => "late-close-recovery-failure",
         resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
         resolveRuntime: () => runtime,
         runAgent: (argumentsForRunner) => runClaudeAgent({
           ...argumentsForRunner,
           runtime,
+          now: clock.now,
+          schedule: clock.schedule,
+          cancelSchedule: clock.cancelSchedule,
+          async onChildStarted(processIdentity) {
+            // Production awaits this; the wrapper must not drop the promise.
+            await argumentsForRunner.onChildStarted(processIdentity);
+            writerStarted();
+          },
           createSettings: fakeSettings(),
           spawnProcess: () => child,
           terminationTimeoutMs: 10,
@@ -3041,6 +3110,11 @@ test("a failed late ORPHANED recovery stays fail-closed and reports its persiste
         })
       }
     );
+    // The child must provably exist before the execution budget expires;
+    // otherwise the timeout is a never-started release, not this test's premise.
+    await writerStartedPromise;
+    await afterRunnerStarts();
+    const outcome = await settleManualClockDelegation(clock, pending);
     assert.equal(outcome.custodyState, "orphaned");
     assert.equal(custody.getWriteAccess(rootKey).state, "ORPHANED");
 
@@ -3056,4 +3130,72 @@ test("a failed late ORPHANED recovery stays fail-closed and reports its persiste
   } finally {
     process.removeListener("unhandledRejection", recordUnhandledRejection);
   }
+});
+
+test("a late exact close after the request stopped starts no recovery mutation", async () => {
+  const clock = manualClock();
+  const controller = new AbortController();
+  const custody = new WriteCustodyManager();
+  const child = createFakeChild({ closeOnKill: false });
+  const runtime = writerRuntime(10);
+  const diagnostics = [];
+  const rootKey = workspaceForTest(projectRoot).canonicalRepositoryKey;
+  let recoveryAttempts = 0;
+  const release = custody.releaseOrphanedWriteAccessAfterTerminal.bind(custody);
+  custody.releaseOrphanedWriteAccessAfterTerminal = (...args) => {
+    recoveryAttempts += 1;
+    return release(...args);
+  };
+  let writerStarted;
+  const writerStartedPromise = new Promise((resolve) => {
+    writerStarted = resolve;
+  });
+  const pending = delegateAgent(
+    { agentType: "task", task: "late close after stop", cwd: projectRoot, abortSignal: controller.signal },
+    {
+      writeCustody: custody,
+      now: clock.now,
+      scheduleRequestDeadline: clock.schedule,
+      cancelRequestDeadline: clock.cancelSchedule,
+      createExecutionId: () => "late-close-after-stop",
+      resolveWorkspaceRoot: async (cwd) => workspaceForTest(cwd),
+      resolveRuntime: () => runtime,
+      runAgent: (argumentsForRunner) => runClaudeAgent({
+        ...argumentsForRunner,
+        runtime,
+        now: clock.now,
+        schedule: clock.schedule,
+        cancelSchedule: clock.cancelSchedule,
+        async onChildStarted(processIdentity) {
+          // Production awaits this; the wrapper must not drop the promise.
+          await argumentsForRunner.onChildStarted(processIdentity);
+          writerStarted();
+        },
+        createSettings: fakeSettings(),
+        spawnProcess: () => child,
+        terminationTimeoutMs: 10,
+        terminateChild: terminateFakeChild,
+        async onLateRecoveryFailure(error, context) {
+          diagnostics.push({ error, context });
+        }
+      })
+    }
+  );
+  await writerStartedPromise;
+  await afterRunnerStarts();
+  // The request stops while the runner is still supervised: termination goes
+  // unproven, late recovery arms, but the stopped request retains instead of
+  // orphaning, so the later close must not authorize a new mutation.
+  controller.abort();
+  const outcome = await settleManualClockDelegation(clock, pending);
+  assert.equal(outcome.custodyState, "retained");
+  assert.equal(custody.getWriteAccess(rootKey).state, "ACTIVE");
+
+  child.emit("close", null, "SIGTERM");
+  await afterRunnerStarts();
+  await afterRunnerStarts();
+  assert.equal(recoveryAttempts, 0);
+  assert.equal(diagnostics.length, 0);
+  assert.equal(custody.getWriteAccess(rootKey).state, "ACTIVE");
+  assert.equal(outcome.custodyState, "retained", "late recovery never mutates returned outcomes");
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,7 +51,8 @@ function manager(stateRoot, observations, currentPid, options = {}) {
     now: options.now || (() => 1_000),
     createNonce: options.createNonce,
     beforePublish: options.beforePublish,
-    afterPublicationIssued: options.afterPublicationIssued
+    afterPublicationIssued: options.afterPublicationIssued,
+    renamePath: options.renamePath
   });
 }
 
@@ -1536,5 +1537,61 @@ test("a scoped terminal settlement refuses a record that moved since it was obse
       terminalProof: terminalProof(identity, 1_300)
     });
     assert.equal(released.state, "RELEASED");
+  });
+});
+
+test("a late recovery that publishes RELEASED keeps it when the later archive step fails", async () => {
+  await withState(async (stateRoot) => {
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    let archiveFaults = 1;
+    const custody = manager(stateRoot, observations, 100, {
+      renamePath: async (source, destination) => {
+        // Fault only the non-authoritative archive rename (ownership/ into
+        // executions/...), never the authoritative record publications.
+        const intoHistory = String(destination).split(path.sep).includes("executions");
+        if (archiveFaults > 0 && intoHistory) {
+          archiveFaults -= 1;
+          throw Object.assign(new Error("injected archive failure"), {
+            code: "EROFS",
+            syscall: "rename"
+          });
+        }
+        return await rename(source, destination);
+      }
+    });
+    const identity = childIdentity();
+    await reserve(custody);
+    await activate(custody, identity);
+    await custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "termination-grace-expired"
+    });
+
+    // The RELEASED publication lands, then the later archive rename fails. The
+    // failure is reported truthfully: EROFS is outside the transient rename
+    // domain on every platform, so it is fatal at once with no retry wait.
+    await assert.rejects(
+      custody.releaseOrphanedWriteAccessAfterTerminal({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        terminalProof: terminalProof(identity, 1_300)
+      }),
+      (error) => {
+        assert.equal(error.code, "write_custody_release_failed");
+        assert.equal(error.cause?.code, "EROFS");
+        return true;
+      }
+    );
+    // The authoritative durable state is RELEASED despite the later failure...
+    const authoritative = await custody.getWriteAccess(rootAKey);
+    assert.equal(authoritative.state, "RELEASED");
+    assert.equal(authoritative.executionId, "execution-a");
+    // ...and the next writer is admitted on exactly that truth: reconciliation
+    // retries the archive step and frees the slot.
+    const next = await reserve(custody, { executionId: "execution-b" });
+    assert.equal(next.executionId, "execution-b");
+    assert.equal(next.state, "RESERVED");
   });
 });
