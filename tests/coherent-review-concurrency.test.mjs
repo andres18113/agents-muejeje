@@ -230,6 +230,9 @@ test("a real writer is excluded throughout a real review and succeeds after rele
   skip: process.platform !== "win32"
 }, async () => {
   await withRepository(async ({ repositoryRoot, stateRoot, workspace }) => {
+    // The review needs a subject: a clean worktree without a declared base
+    // names no delta and stays unbound by rule.
+    await writeFile(path.join(repositoryRoot, "tracked.txt"), "base\nunder review\n", "utf8");
     const entered = deferred();
     const resume = deferred();
     const review = delegateAgent(

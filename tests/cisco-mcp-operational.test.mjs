@@ -257,17 +257,31 @@ test("ChangeSet and review integrity: Cisco-MCP collections, mutations, restorat
     }, collectorDeps);
     assert.equal(cs1Reproduced.changeSetId, cs1.changeSetId, "Clean collection must be bit-for-bit reproducible");
 
-    // 3. Delegate code-review to bind an authoritative ReviewReceipt on the clean state
+    // The reviews below need a constant subject of their own: a clean
+    // worktree without a declared base names no delta and stays unbound by
+    // rule. The subject file is never mutated or restored, so the
+    // clean -> mutate -> restore cycle keeps proving exactly what it did.
+    await writeFile(path.join(repoCopy, "OPERATIONAL-SUBJECT.md"), "# operational subject\n", "utf8");
+    const cs1s = await collectChangeSet({
+      effectiveCwd: workspace.effectiveCwd,
+      rootSource: workspace.rootSource,
+      canonicalRepositoryKey: workspace.canonicalRepositoryKey,
+      targetSpec: NO_REVIEW_TARGET
+    }, collectorDeps);
+    assert.ok(cs1s.changeSetId.startsWith("cs1:"));
+    assert.equal(cs1s.status, "exact");
+
+    // 3. Delegate code-review to bind an authoritative ReviewReceipt on the subject state
     const reviewOutcome1 = await delegateAgent({
       agentType: "code-review",
-      task: "Review clean Cisco-MCP codebase",
+      task: "Review Cisco-MCP codebase with subject",
       cwd: repoCopy
     }, { env });
 
     assert.equal(reviewOutcome1.status, "completed");
     assert.equal(reviewOutcome1.reviewBinding.status, "bound");
     assert.ok(reviewOutcome1.reviewBinding.reviewId);
-    assert.equal(reviewOutcome1.reviewBinding.changeSetId, cs1.changeSetId);
+    assert.equal(reviewOutcome1.reviewBinding.changeSetId, cs1s.changeSetId);
 
     // 4. Mutate a tracked file in Cisco-MCP (e.g. README.md)
     const readmePath = path.join(repoCopy, "README.md");
@@ -314,7 +328,7 @@ test("ChangeSet and review integrity: Cisco-MCP collections, mutations, restorat
       targetSpec: NO_REVIEW_TARGET
     }, collectorDeps);
 
-    assert.equal(cs3.changeSetId, cs1.changeSetId, "Byte restoration must restore identical changeSetId");
+    assert.equal(cs3.changeSetId, cs1s.changeSetId, "Byte restoration must restore the subject-state changeSetId");
 
     // 9. Delegate third code-review: restored state reports the first review as FRESH again
     const reviewOutcome3 = await delegateAgent({
