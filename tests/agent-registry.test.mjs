@@ -489,9 +489,9 @@ test("package metadata and Windows CI provide clean deterministic validation", a
   const packageJson = JSON.parse(packageText);
   const packageLock = JSON.parse(lockText);
 
-  assert.equal(packageJson.version, "0.2.1");
-  assert.equal(packageLock.version, "0.2.1");
-  assert.equal(packageLock.packages[""].version, "0.2.1");
+  assert.equal(packageJson.version, "0.2.3");
+  assert.equal(packageLock.version, "0.2.3");
+  assert.equal(packageLock.packages[""].version, "0.2.3");
   assert.equal(packageLock.packages[""].name, packageJson.name);
   assert.deepEqual(packageLock.packages[""].dependencies, packageJson.dependencies);
   assert.match(packageJson.scripts.test, /node --test/);

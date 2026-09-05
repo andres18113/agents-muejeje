@@ -708,6 +708,22 @@ function failedStatus(error) {
     : "failed";
 }
 
+/**
+ * Carries taskkill-helper evidence from a termination result into the orphan
+ * record, so same-session reclaim can later observe the helper's quiescence
+ * instead of assuming it. Absent unless a helper was actually launched; the
+ * custody manager treats absent as never-launched and a launched-but-unproven
+ * helper without an observable identity as fail-closed.
+ */
+function destructiveHelperEvidenceFromTermination(terminationResult) {
+  if (terminationResult?.taskkillLaunched !== true) return undefined;
+  return {
+    launched: true,
+    closeProven: terminationResult.taskkillHelperQuiescenceProven === true,
+    ...(terminationResult.taskkillHelperIdentity ? { helper: terminationResult.taskkillHelperIdentity } : {})
+  };
+}
+
 function custodyRetentionError(
   existingError,
   { terminalProofAvailable = false, workspacePreparationAmbiguous = false } = {}
@@ -1955,6 +1971,7 @@ export async function delegateAgent(input, dependencies = {}) {
         canonicalRootKey: workspace.canonicalRepositoryKey,
         processIdentity: writerProcessIdentity,
         reason,
+        destructiveHelper: destructiveHelperEvidenceFromTermination(lifecycleEvidence?.terminationResult),
         mutationSignal: requestContext.abortSignal
       })
     );

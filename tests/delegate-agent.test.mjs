@@ -1360,6 +1360,86 @@ test("a taskkill helper that errors again while being stopped stays bounded and 
   assert.doesNotThrow(() => terminator.emit("error", new Error("late error")));
 });
 
+test("an unproven taskkill termination records the helper identity for later quiescence", async () => {
+  // The helper outlives the termination bound without closing. Same-session
+  // reclaim must later be able to observe that exact helper - PID plus start
+  // time - so the unproven result carries its durable identity.
+  const child = stalledChildForTermination();
+  const helperPid = 48_001;
+  const terminator = new EventEmitter();
+  terminator.pid = helperPid;
+  terminator.kill = () => true;
+  const processIdentity = {
+    executionId: "helper-identity-writer",
+    agentType: "task",
+    repositoryRoot: projectRoot,
+    pid: child.pid,
+    startTime: String(child.pid * 100),
+    source: "test-process-start",
+    child,
+    startedAt: 1
+  };
+
+  const result = await terminateClaudeChild(child, {
+    platform: "win32",
+    terminationTimeoutMs: 20,
+    processIdentity,
+    inspectProcess: async (pid) => {
+      if (pid === helperPid) {
+        return {
+          status: "alive",
+          identity: { pid: helperPid, startTime: String(helperPid * 100), source: "test-process-start" }
+        };
+      }
+      return inspectFakeProcess(pid);
+    },
+    spawnTerminator: () => terminator
+  });
+
+  assert.equal(result.status, "termination-unproven");
+  assert.equal(result.method, "taskkill");
+  assert.equal(result.taskkillLaunched, true);
+  assert.equal(result.taskkillHelperQuiescenceProven, false);
+  assert.deepEqual(result.taskkillHelperIdentity, {
+    pid: helperPid,
+    startTime: String(helperPid * 100),
+    source: "test-process-start"
+  });
+});
+
+test("an unproven taskkill termination without a helper PID degrades to absent identity", async () => {
+  // A helper the coordinator cannot even name (no PID on the handle) leaves
+  // no durable identity to re-observe. The launch is still reported honestly;
+  // reclaim then stays fail-closed via evidence-unknown.
+  const child = stalledChildForTermination();
+  const terminator = new EventEmitter();
+  terminator.kill = () => true;
+  const processIdentity = {
+    executionId: "helper-no-pid-writer",
+    agentType: "task",
+    repositoryRoot: projectRoot,
+    pid: child.pid,
+    startTime: String(child.pid * 100),
+    source: "test-process-start",
+    child,
+    startedAt: 1
+  };
+
+  const result = await terminateClaudeChild(child, {
+    platform: "win32",
+    terminationTimeoutMs: 20,
+    processIdentity,
+    inspectProcess: async (pid) => inspectFakeProcess(pid),
+    spawnTerminator: () => terminator
+  });
+
+  assert.equal(result.status, "termination-unproven");
+  assert.equal(result.method, "taskkill");
+  assert.equal(result.taskkillLaunched, true);
+  assert.equal(result.taskkillHelperQuiescenceProven, false);
+  assert.equal(result.taskkillHelperIdentity, undefined);
+});
+
 test("lifecycle waits keep the runtime alive until the bounded decision resolves", () => {
   // Runs each bounded wait in a Node process that holds no other event-loop
   // handle. With an unref'd deadline the runtime drains and the Promise is

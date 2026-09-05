@@ -41,8 +41,10 @@ export function buildRuntimeSettingsPayload({ shellPolicy, hookPath = defaultHoo
     // The hook is one policy layer, not the boundary. A PreToolUse hook runs as
     // a separate process: it can time out, and a timeout is not a denial. So
     // everything that can be stated as a rule is denied by the runtime that
-    // owns the tool call, and the hook only adds the judgements a static rule
-    // cannot express - Git subcommand shape, wrapper resolution, publication.
+    // owns the tool call - prohibited commands, dangerous first-position Git
+    // operations, and canonical publication - while the hook only adds the
+    // judgements a static rule cannot express: wrapper resolution, case
+    // variants, non-first-position matches, and arbitrary absolute paths.
     permissions: {
       deny: hardDeniedBashRules()
     },

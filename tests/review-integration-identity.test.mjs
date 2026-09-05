@@ -50,6 +50,9 @@ async function withRepository(callback) {
     await writeFile(path.join(repositoryRoot, "subject.txt"), "base\n", "utf8");
     git(repositoryRoot, ["add", "subject.txt"]);
     git(repositoryRoot, ["commit", "-m", "base"]);
+    // A committed review needs a declared base. This branch never moves, so
+    // the delta it anchors stays comparable across the integration below.
+    git(repositoryRoot, ["branch", "base"]);
     await callback({
       repositoryRoot,
       writeCustody: new DurableWriteCustodyManager({ stateRoot, inspectProcess })
@@ -87,14 +90,25 @@ function reviewRunner() {
 
 async function review(repositoryRoot, writeCustody) {
   return await delegateAgent(
-    { agentType: "code-review", task: "bind this exact integration subject", cwd: repositoryRoot },
+    {
+      agentType: "code-review",
+      task: "bind this exact integration subject",
+      cwd: repositoryRoot,
+      targetRef: "refs/heads/base"
+    },
     { writeCustody, runAgent: reviewRunner(), env: {} }
   );
 }
 
 async function reconcile(repositoryRoot, writeCustody) {
   return await delegateAgent(
-    { agentType: "code-review", task: "check review identity", reconcileOnly: true, cwd: repositoryRoot },
+    {
+      agentType: "code-review",
+      task: "check review identity",
+      reconcileOnly: true,
+      cwd: repositoryRoot,
+      targetRef: "refs/heads/base"
+    },
     {
       writeCustody,
       env: {},

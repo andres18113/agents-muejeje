@@ -1,8 +1,8 @@
-# Handoff: claude-agents-mcp 0.2.1 current state
+# Handoff: claude-agents-mcp 0.2.3 current state
 
 ## Candidate Scope
 
-- `0.2.1` is a candidate version, not a release declaration.
+- `0.2.3` is a candidate version, not a release declaration.
 - `delegate_agent` owns one root request context: `{ deadlineAt, abortSignal, now }`.
 - The supported maximum useful-work timeout is 30 minutes; the root MCP response envelope is useful work plus the 615-second settlement reserve. It bounds response settlement, not preemption of already-issued kernel I/O or escaped process trees.
 - `reconcile_only` is finite, read-only, and custody-free. It supports optional `review_id: rr1:<sha256>` only in reconciliation mode.
@@ -38,3 +38,9 @@
 
 - Required release gates are `npm.cmd run check`, `npm.cmd run check:text`, `npm.cmd test`, `npm.cmd run ci`, `git diff --check`, and `npm.cmd run diagnose`.
 - No real Claude invocation, push, tag, or history rewrite is part of this candidate state.
+
+## Release Procedure
+
+- Bump the internal version to `X.Y.Z` in `src/version.mjs`, `package.json`, `package-lock.json`, `README.md`, `handoff.md`, and the pinned test expectations, then run the release gates above on the candidate tree.
+- Commit the candidate first; only then create the annotated tag `vX.Y.Z` on that exact commit. Never tag a commit whose internal version differs (v0.2.2 was tagged on a 0.2.1 tree).
+- Verify `git describe --tags --exact-match HEAD` prints `vX.Y.Z` and re-run `npm test`: the tag gate pins internal == tag on tagged commits and refuses a candidate tag already claimed by another commit.

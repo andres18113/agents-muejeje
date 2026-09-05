@@ -407,8 +407,16 @@ async function review(repositoryRoot, stateRoot, options = {}) {
   );
 }
 
+async function dirtyWorktree(repositoryRoot) {
+  // These mechanics tests review worktree changes. A clean worktree without
+  // a declared base names no delta and stays unbound by rule, so the subject
+  // under test is always an uncommitted change.
+  await writeFile(path.join(repositoryRoot, "tracked.txt"), "under review\n", "utf8");
+}
+
 test("a stable review binds a receipt that validates on disk", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const outcome = await review(repositoryRoot, stateRoot);
 
     assert.equal(outcome.status, "completed");
@@ -435,6 +443,7 @@ test("a stable review binds a receipt that validates on disk", async () => {
 
 test("an unchanged repository reports its prior review as FRESH", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const first = await review(repositoryRoot, stateRoot);
     const second = await review(repositoryRoot, stateRoot);
 
@@ -447,6 +456,7 @@ test("an unchanged repository reports its prior review as FRESH", async () => {
 
 test("after the repository changes, the earlier review is discovered and reported STALE", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const first = await review(repositoryRoot, stateRoot);
     assert.equal(first.reviewBinding.status, "bound");
 
@@ -713,6 +723,7 @@ async function writeTextDurably(pathname, text) {
 
 test("an artifact stall beyond AFTER's deadline never starts receipt publication", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const artifactEntered = deferredValue();
     const artifactFinished = deferredValue();
     const allowArtifact = deferredValue();
@@ -777,6 +788,7 @@ test("an artifact stall beyond AFTER's deadline never starts receipt publication
 
 test("root cancellation during artifact persistence returns timeout without publishing or starting post-cancellation custody release", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const abortController = new AbortController();
     const artifactEntered = deferredValue();
     const artifactFinished = deferredValue();
@@ -841,6 +853,7 @@ test("root cancellation during artifact persistence returns timeout without publ
 
 test("a receipt settling after quiescence releases real custody under the same guard", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const allowRename = deferredValue();
     const renameEntered = deferredValue();
     const lateRelease = deferredValue();
@@ -912,6 +925,7 @@ test("a late release is refused when the durable record no longer authorizes it"
   // the publication settles. The late callback must be refused by the real
   // manager and must report retention rather than releasing anything.
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const allowRename = deferredValue();
     const renameEntered = deferredValue();
     const lateRelease = deferredValue();
@@ -967,6 +981,7 @@ test("the real custody manager refuses a second release of the same execution", 
   // Even if both somehow ran, the durable record is what decides, and it
   // refuses a release it has already performed rather than releasing twice.
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     const custody = custodyFor(stateRoot);
     const outcome = await delegateAgent(
       { agentType: "code-review", task: "review the change set", cwd: repositoryRoot },
@@ -1001,6 +1016,7 @@ test("the real custody manager refuses a second release of the same execution", 
 
 test("a publication that settles in time releases synchronously and arms nothing late", async () => {
   await withRepository(async ({ repositoryRoot, stateRoot }) => {
+    await dirtyWorktree(repositoryRoot);
     let lateCalls = 0;
     const custody = custodyFor(stateRoot);
     const outcome = await delegateAgent(

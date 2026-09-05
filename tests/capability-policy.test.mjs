@@ -28,6 +28,7 @@ import {
 import { resolveAgentRuntime } from "../src/delegate-agent.mjs";
 import {
   evaluateShellPolicy,
+  hardDeniedBashRules,
   parsePreToolUseInput,
   ShellPolicyError
 } from "../src/shell-policy.mjs";
@@ -449,4 +450,132 @@ test("the shell guard classifies wrappers and Windows suffixes by their effectiv
   // The read-only role still admits only its allowlist, wrappers included.
   assert.equal(evaluateShellPolicy("git-readonly", "env git status").allowed, true);
   assert.equal(evaluateShellPolicy("git-readonly", "env rm -rf .").allowed, false);
+});
+
+// The operations the hook refuses in `git <operation>` position, pinned here
+// so the independent deny layer cannot silently drop one.
+const EXPECTED_DENIED_GIT_OPERATIONS = Object.freeze([
+  "add",
+  "am",
+  "apply",
+  "checkout",
+  "cherry-pick",
+  "clean",
+  "commit",
+  "fetch",
+  "merge",
+  "pull",
+  "push",
+  "rebase",
+  "reset",
+  "restore",
+  "stash",
+  "switch",
+  "tag",
+  "config",
+  "remote",
+  "clone",
+  "init",
+  "worktree"
+]);
+
+/**
+ * A hook timeout is absence, not denial, and a hook that never starts denies
+ * nothing either. The independent layer must therefore carry every
+ * first-position prohibition on its own: settings with no hook block, or with
+ * a hook command that cannot run, still deny `git push` and every other
+ * prohibited command without consulting any hook process.
+ */
+test("settings without a working hook still deny git push and prohibited commands", () => {
+  const policies = ["git-readonly", "task", "worker"];
+  const denyByPolicy = new Map();
+  for (const shellPolicy of policies) {
+    // A hook command pointing at nothing: at runtime the hook fails to start,
+    // which is exactly the absence the independent layer must survive.
+    const brokenHook = buildRuntimeSettingsPayload({
+      shellPolicy,
+      hookPath: path.join(projectRoot, "hooks", "does-not-exist.mjs")
+    });
+    const deny = brokenHook.permissions.deny;
+    assert.ok(Array.isArray(deny) && deny.length > 0, shellPolicy);
+    denyByPolicy.set(shellPolicy, deny);
+
+    for (const operation of EXPECTED_DENIED_GIT_OPERATIONS) {
+      assert.ok(
+        deny.includes("Bash(git " + operation + ":*)"),
+        shellPolicy + " is missing a hook-independent deny for git " + operation
+      );
+      assert.ok(
+        deny.includes("Bash(git.exe " + operation + ":*)"),
+        shellPolicy + " is missing a hook-independent deny for git.exe " + operation
+      );
+    }
+    assert.ok(deny.includes("Bash(git -:*)"), shellPolicy + " is missing a hook-independent deny for git -<option>");
+    for (const publication of ["npm publish", "pnpm publish", "yarn npm publish"]) {
+      assert.ok(
+        deny.includes("Bash(" + publication + ":*)"),
+        shellPolicy + " is missing a hook-independent deny for " + publication
+      );
+    }
+    assert.ok(deny.includes("Bash(rm.exe:*)"), shellPolicy);
+    assert.ok(deny.includes("Bash(taskkill.exe:*)"), shellPolicy);
+
+    // Structural absence: dropping the hooks block leaves the deny set behind.
+    const { hooks: dropped, ...hookless } = buildRuntimeSettingsPayload({ shellPolicy });
+    assert.ok(dropped, shellPolicy + " payload carries a hook to drop");
+    assert.equal(hookless.hooks, undefined);
+    assert.deepEqual(hookless.permissions.deny, deny);
+  }
+  // The independent layer does not vary with the hook policy it outlives.
+  assert.deepEqual(denyByPolicy.get("task"), denyByPolicy.get("worker"));
+  assert.deepEqual(denyByPolicy.get("git-readonly"), denyByPolicy.get("worker"));
+  assert.deepEqual(hardDeniedBashRules(), denyByPolicy.get("worker"));
+});
+
+/**
+ * Every canonical first-position command the hook refuses must have a matching
+ * static prefix rule, so a dead hook changes nothing for those commands. The
+ * shapes a prefix cannot see - wrappers, case variants, non-first-position
+ * tokens - stay hook-side and are pinned as such below.
+ */
+test("every canonical first-position hook denial has a matching static rule", () => {
+  const deny = hardDeniedBashRules();
+  const coveredByRule = (command) =>
+    deny.some((rule) => {
+      const match = /^Bash\((.+):\*\)$/u.exec(rule);
+      return match !== null && command.startsWith(match[1]);
+    });
+
+  const canonical = [];
+  for (const operation of EXPECTED_DENIED_GIT_OPERATIONS) {
+    canonical.push("git " + operation, "git.exe " + operation);
+  }
+  canonical.push(
+    "git -c protocol.ext.allow=always fetch",
+    "git --exec-path=/tmp/x status",
+    "npm publish",
+    "npm.cmd publish --access public",
+    "pnpm publish",
+    "yarn npm publish",
+    "rm -rf build",
+    "taskkill /IM node.exe",
+    "curl http://example.invalid"
+  );
+  for (const command of canonical) {
+    assert.equal(evaluateShellPolicy("worker", command).allowed, false, "hook must deny: " + command);
+    assert.equal(coveredByRule(command), true, "static rule must cover: " + command);
+  }
+
+  // Legitimate work keeps no static rule and stays hook-allowed.
+  for (const command of ["git status", "git log --oneline", "npm test", "node build.mjs"]) {
+    assert.equal(coveredByRule(command), false, "static rule must not cover: " + command);
+    assert.equal(evaluateShellPolicy("worker", command).allowed, true, "hook must allow: " + command);
+  }
+
+  // The documented hook-side remainder: denied by the hook, invisible to a
+  // prefix rule, which is why the hook stays configured alongside the rules.
+  for (const command of ["env git push", "env FOO=1 rm -rf .", "GIT PUSH", "npm run publish"]) {
+    assert.equal(evaluateShellPolicy("worker", command).allowed, false, "hook must deny: " + command);
+    assert.equal(coveredByRule(command), false, "static rule cannot cover: " + command);
+  }
 });

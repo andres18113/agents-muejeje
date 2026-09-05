@@ -3,7 +3,12 @@ import {
   ClaudeTerminationUnprovenError,
   attachLifecycle
 } from "./claude-errors.mjs";
-import { PROCESS_IDENTITY_MATCH, inspectProcessIdentity } from "./process-identity.mjs";
+import {
+  PROCESS_IDENTITY_MATCH,
+  PROCESS_IDENTITY_STATUS,
+  inspectProcessIdentity,
+  validateDurableProcessIdentity
+} from "./process-identity.mjs";
 import {
   deadlineWithReserve,
   isSchedulableTimeout,
@@ -347,10 +352,34 @@ export async function terminateClaudeChild(
     taskkill.promise
   ]);
   const helperQuiescenceProven = taskkillResult?.closeProven === true;
+  // A helper that outlived termination can still quiesce later, and same-
+  // session reclaim must be able to observe that - but only through the same
+  // durable identity (PID plus start time) every other process conclusion
+  // uses. Only an ALIVE observation establishes one. Anything else leaves the
+  // helper unobservable, and reclaim then stays fail-closed. Evidence capture
+  // must never break termination itself, so every failure here degrades to
+  // absent identity rather than throwing.
+  let taskkillHelperIdentity;
+  const helperPid = launch.helper?.pid;
+  if (!helperQuiescenceProven && Number.isSafeInteger(helperPid) && helperPid > 0) {
+    try {
+      const helperObservation = await inspectProcess(helperPid, { abortSignal: terminationSignal });
+      if (
+        helperObservation?.status === PROCESS_IDENTITY_STATUS.ALIVE &&
+        helperObservation.identity?.pid === helperPid
+      ) {
+        taskkillHelperIdentity = validateDurableProcessIdentity(helperObservation.identity, "taskkill helper identity");
+      }
+    } catch {
+      taskkillHelperIdentity = undefined;
+    }
+  }
   const helperEvidence = {
+    taskkillLaunched: true,
     taskkillStatus: taskkillResult?.status || "close-unproven",
     taskkillHelper: taskkillResult,
-    taskkillHelperQuiescenceProven: helperQuiescenceProven
+    taskkillHelperQuiescenceProven: helperQuiescenceProven,
+    ...(taskkillHelperIdentity ? { taskkillHelperIdentity } : {})
   };
   if (proof && helperQuiescenceProven) {
     return terminalResult(

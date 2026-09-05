@@ -327,6 +327,9 @@ test("manual-clock 300/536 causal ordering abandons old delivery, completes supp
 // 4. Positive reconciliation: missing or corrupt result artifact fails closed (Test D)
 test("reconcile_only fails closed when result artifact is missing or corrupt (Test D)", async () => {
   await withDisposableRepo(async ({ repoDir, stateRoot, writeCustody }) => {
+    // The setup review needs a subject: a clean worktree without a declared
+    // base names no delta and stays unbound by rule.
+    await writeFile(path.join(repoDir, "README.md"), "# Test Repository\nUnder review\n", "utf8");
     const outcome = await delegateAgent(
       {
         agentType: "code-review",
@@ -480,6 +483,9 @@ test("reconcile_only reports INDETERMINATE and fails closed on collector or hist
 // 6. Positive reconciliation scope isolation: repo, targetRef, and agentType mismatch (Tests E, F, G)
 test("reconcile_only enforces strict scope isolation across repo, targetRef, and agentType (Tests E, F, G)", async () => {
   await withDisposableRepo(async ({ repoDir, writeCustody }) => {
+    // The setup review needs a subject: a clean worktree without a declared
+    // base names no delta and stays unbound by rule.
+    await writeFile(path.join(repoDir, "README.md"), "# Test Repository\nUnder review\n", "utf8");
     // Initial code-review on repoDir HEAD
     const initialOutcome = await delegateAgent(
       {

@@ -62,6 +62,24 @@ function committedReviewIsApplicable(targetSpec, current) {
     counts.untracked === 0;
 }
 
+/**
+ * The mirror image: a clean worktree with no declared base has no subject at
+ * all. The change set is empty by definition and no committed delta can be
+ * constructed, so a receipt would assert coverage of nothing. A dirty
+ * worktree without a target still has its own changes as a subject and is
+ * unaffected.
+ */
+function cleanReviewWithoutTarget(targetSpec, current) {
+  if (targetSpec?.kind === "ref") return false;
+  if (current?.status !== "exact") return false;
+  const counts = current.descriptor?.summary?.counts;
+  if (!counts) return false;
+  return counts.index === 0 &&
+    counts.worktree === 0 &&
+    counts.unmerged === 0 &&
+    counts.untracked === 0;
+}
+
 export function profileParticipatesInReviewBinding(profile) {
   return Boolean(profile?.declaredCapabilities?.includes(REVIEW_BINDING_CAPABILITY));
 }
@@ -518,6 +536,22 @@ export function createReviewBinder({
               ? [{ code: "committed_evidence_truncated" }]
               : (beforeState.committedEvidence.reasons ?? []).map((reason) => ({ ...reason })))
           ]),
+          beforeChangeSetId: beforeState.current.changeSetId,
+          afterChangeSetId: afterState.changeSetId,
+          priorReviews,
+          receiptHistory: history
+        });
+      }
+
+      // A clean committed worktree with no declared base names no delta the
+      // reviewer could have covered: the change set is empty and there is no
+      // target to construct one from. The review itself ran and its findings
+      // are returned; only the durable claim is refused.
+      if (cleanReviewWithoutTarget(beforeState.targetSpec, beforeState.current)) {
+        return Object.freeze({
+          status: "unbound",
+          coherence: beforeState.coherence,
+          reasons: Object.freeze([{ code: "insufficient_review_scope" }]),
           beforeChangeSetId: beforeState.current.changeSetId,
           afterChangeSetId: afterState.changeSetId,
           priorReviews,

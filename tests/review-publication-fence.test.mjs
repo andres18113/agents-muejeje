@@ -857,7 +857,14 @@ test("a real binder cancelled at its gate leaves no receipt and still releases c
   };
 
   const outcome = await delegateAgent(
-    { agentType: "code-review", task: "review", cwd: WORKSPACE.effectiveCwd },
+    {
+      agentType: "code-review",
+      task: "review",
+      cwd: WORKSPACE.effectiveCwd,
+      // The fixture is a committed review: the binder is handed that delta,
+      // and only a declared base lets the publication path be reached.
+      targetRef: "refs/heads/base"
+    },
     {
       env: {},
       createExecutionId: () => "fence-execution",

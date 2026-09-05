@@ -3,6 +3,7 @@ import test from "node:test";
 import { AGENT_REGISTRY, getAgentProfile } from "../src/agent-registry.mjs";
 import { resolveCapabilityPolicy } from "../src/capability-policy.mjs";
 import { SECTION_NAMES, buildChangeSetDescriptor, changeSetIdFor } from "../src/changeset/descriptor.mjs";
+import { encodePath } from "../src/changeset/porcelain-parser.mjs";
 import { NO_REVIEW_TARGET, reviewTargetSpec } from "../src/changeset/target.mjs";
 import { COHERENCE } from "../src/review/coherent-admission.mjs";
 import { validateReviewReceipt } from "../src/review/receipt-schema.mjs";
@@ -500,7 +501,7 @@ test("the target spec travels unchanged from before into the receipt", async () 
   assert.deepEqual({ ...stored.binding.target.spec }, { ...TARGET });
 });
 
-test("an absent target is recorded as absent, never invented", async () => {
+test("a clean worktree without a target is unbound: no base, no subject, no receipt", async () => {
   const noTarget = buildChangeSetDescriptor({
     objectFormat: "sha1",
     head: { commit: "1".repeat(40), unborn: false },
@@ -518,8 +519,47 @@ test("an absent target is recorded as absent, never invented", async () => {
   };
   const context = binderWith({ collections: [collection, collection] });
   const before = await runBefore(context, { targetSpec: NO_REVIEW_TARGET });
-  await runAfter(context, before);
+  assert.equal(before.status, "collected", "the review itself still runs");
 
+  const after = await runAfter(context, before);
+  assert.equal(after.status, "unbound");
+  assert.deepEqual(after.reasons.map((r) => r.code), ["insufficient_review_scope"]);
+  assert.equal(after.beforeChangeSetId, after.afterChangeSetId);
+  assert.equal(context.store.puts.length, 0, "an empty subject with no base binds no receipt");
+});
+
+test("a dirty worktree without a target still binds its own changes", async () => {
+  const dirty = buildChangeSetDescriptor({
+    objectFormat: "sha1",
+    head: { commit: "1".repeat(40), unborn: false },
+    target: { spec: NO_REVIEW_TARGET, resolution: "none", commit: null },
+    index: [],
+    worktree: [{
+      path: encodePath(Buffer.from("src/b.mjs", "utf8")),
+      y: "M",
+      modeWorktree: "100644",
+      content: "c".repeat(64),
+      submoduleHead: null
+    }],
+    unmerged: [],
+    untracked: [],
+    submodules: [],
+    summary: { branch: "main", detached: false, mergeBase: null }
+  });
+  const identity = changeSetIdFor(dirty);
+  const collection = {
+    status: "exact",
+    descriptor: dirty,
+    changeSetId: identity.changeSetId,
+    sections: identity.sections,
+    summary: dirty.summary
+  };
+  const context = binderWith({ collections: [collection, collection] });
+  const before = await runBefore(context, { targetSpec: NO_REVIEW_TARGET });
+  const after = await runAfter(context, before);
+
+  assert.equal(after.status, "bound");
+  assert.equal(context.store.puts.length, 1);
   const stored = context.store.puts[0].receipt;
   assert.equal(stored.binding.target.spec.kind, "none");
   assert.equal(stored.binding.target.commit, null);

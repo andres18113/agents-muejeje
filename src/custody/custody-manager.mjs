@@ -543,8 +543,16 @@ export class DurableWriteCustodyManager {
     }, { mutationSignal });
   }
 
-  async markOrphanedWriteAccess({ executionId, canonicalRootKey, processIdentity, reason, mutationSignal }) {
+  async markOrphanedWriteAccess({
+    executionId,
+    canonicalRootKey,
+    processIdentity,
+    reason,
+    destructiveHelper,
+    mutationSignal
+  }) {
     const validReason = validIdentityString("orphan reason", reason);
+    const validHelper = destructiveHelper === undefined ? undefined : this.#normalizeDestructiveHelper(destructiveHelper);
     return await this.#withRepositoryMutation(canonicalRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId, canonicalRootKey });
       if (record.state === "ORPHANED") return recordSnapshot(record);
@@ -558,9 +566,26 @@ export class DurableWriteCustodyManager {
       }
       return await this.#transitionRecord(record, "ORPHANED", {
         ...(claudeProcess ? { claudeProcess } : {}),
-        orphanReason: validReason
+        orphanReason: validReason,
+        ...(validHelper ? { destructiveHelper: validHelper } : {})
       }, { mutationSignal, publicationGuard });
     }, { mutationSignal });
+  }
+
+  #normalizeDestructiveHelper(evidence) {
+    if (!evidence || typeof evidence !== "object" || evidence.launched !== true) {
+      throw new WriteCustodyError("Destructive helper evidence must state that a helper was launched.", {
+        code: "write_custody_terminal_proof_invalid"
+      });
+    }
+    const normalized = {
+      launched: true,
+      closeProven: evidence.closeProven === true
+    };
+    if (evidence.helper !== undefined) {
+      normalized.helper = durableProcessIdentity(evidence.helper);
+    }
+    return Object.freeze(normalized);
   }
 
   /**
@@ -576,16 +601,51 @@ export class DurableWriteCustodyManager {
    * produced by nothing more than the passage of the moment the proof was due.
    *
    * This is the narrow answer, and it releases on evidence rather than on time.
-   * Three things must all hold. This coordinator must still hold the in-memory
+   * Four things must all hold. This coordinator must still hold the in-memory
    * evidence that it supervised that exact spawn, which no restarted or foreign
    * coordinator can fabricate. The record must name the child it activated. And
    * the exact durable identity - PID together with start time - must be
    * observed gone, so a reused PID reads as reuse rather than as survival; an
-   * ambiguous observation proves nothing and is refused.
+   * ambiguous observation proves nothing and is refused. Finally, no launched
+   * destructive helper may remain unproven: either none was ever launched, its
+   * close was proven before the orphan was recorded, or its own durable
+   * identity is observed gone now.
    *
    * The release is pinned to the execution, repository and revision it was
    * asked about, so it can never reach work that started afterwards.
    */
+  /**
+   * Refuses a reclaim while a launched destructive helper may still be
+   * acting. Custody may release only when the exact Claude child is proven
+   * terminated AND no launched taskkill helper remains unproven: either none
+   * was ever launched, its close was proven before the orphan was recorded,
+   * or its durable identity is observed gone now. A launched helper without
+   * an observable identity, or one still alive or ambiguous, keeps the
+   * orphan. Returns undefined when no helper blocks the reclaim.
+   */
+  async #refuseUnquiescedHelper(evidence, mutationSignal) {
+    if (!evidence || evidence.launched !== true || evidence.closeProven === true) return undefined;
+    if (!evidence.helper) {
+      return Object.freeze({ released: false, reason: "destructive-helper-evidence-unknown" });
+    }
+    const helper = await compareProcessIdentity(evidence.helper, {
+      inspectProcess: this.#inspectProcess,
+      abortSignal: mutationSignal
+    });
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    if (
+      helper.status === PROCESS_IDENTITY_MATCH.SAME_PROCESS ||
+      helper.status === PROCESS_IDENTITY_MATCH.AMBIGUOUS
+    ) {
+      return Object.freeze({
+        released: false,
+        reason: "destructive-helper-quiescence-unproven",
+        helper: helper.status
+      });
+    }
+    return undefined;
+  }
+
   async reclaimOwnOrphanedWriteAccess({
     executionId,
     canonicalRootKey,
@@ -624,6 +684,8 @@ export class DurableWriteCustodyManager {
       // Still running, or unknowable. Neither is proof, so the orphan stays.
       return Object.freeze({ released: false, reason: "claude-not-proven-gone", claude: claude.status });
     }
+    const helperRefusal = await this.#refuseUnquiescedHelper(snapshot.destructiveHelper, mutationSignal);
+    if (helperRefusal) return helperRefusal;
 
     return await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
       const record = await this.#ownedRecord({ executionId: validId, canonicalRootKey: validRootKey });

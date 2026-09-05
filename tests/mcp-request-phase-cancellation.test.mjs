@@ -238,6 +238,10 @@ test("STDIO cancellation during BEFORE history discovery returns the coherent re
 
 test("STDIO cancellation during authoritative recovery remains custody-free", async () => {
   await withTransport("authoritative-recovery", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
+    // The seed review needs a subject: a clean worktree without a declared
+    // base names no delta and stays unbound by rule, so no receipt would exist
+    // for the reconcile_only request to recover.
+    await writeFile(path.join(repositoryRoot, "README.md"), "# transport fixture\nUnder review\n", "utf8");
     const seed = client.request("tools/call", {
       name: "delegate_agent",
       arguments: { agent_type: "code-review", task: "seed durable receipt", cwd: repositoryRoot }
@@ -255,6 +259,10 @@ test("STDIO cancellation during authoritative recovery remains custody-free", as
 
 test("STDIO cancellation during reconcile artifact recovery remains custody-free", async () => {
   await withTransport("reconcile-artifact", async ({ client, repositoryRoot, markerDirectory, custody, repositoryKey }) => {
+    // The seed review needs a subject: a clean worktree without a declared
+    // base names no delta and stays unbound by rule, so no receipt would exist
+    // for the reconcile_only request to recover.
+    await writeFile(path.join(repositoryRoot, "README.md"), "# transport fixture\nUnder review\n", "utf8");
     const seed = client.request("tools/call", {
       name: "delegate_agent",
       arguments: { agent_type: "code-review", task: "seed durable receipt", cwd: repositoryRoot }

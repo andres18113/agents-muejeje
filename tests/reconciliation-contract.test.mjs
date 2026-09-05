@@ -105,6 +105,10 @@ function completedReviewRunner(result) {
 
 test("reconcile_only never silently selects among multiple FRESH receipts and review_id selects exactly one", async () => {
   await withRepository(async ({ repositoryRoot, writeCustody }) => {
+    // Both seed reviews need one shared subject: a clean worktree without a
+    // declared base names no delta and stays unbound by rule, while identical
+    // dirt keeps both receipts FRESH with distinct findings-bound reviewIds.
+    await writeFile(path.join(repositoryRoot, "README.md"), "# reconciliation fixture\nUnder review\n", "utf8");
     const first = await delegateAgent(
       { agentType: "code-review", task: "review purpose alpha", cwd: repositoryRoot },
       { writeCustody, runAgent: completedReviewRunner("ALPHA FINDINGS"), env: {} }
@@ -269,6 +273,9 @@ test("reconcile_only never silently selects among multiple FRESH receipts and re
 
 test("review binding disabled for future reviews does not make durable reconciliation undefined", async () => {
   await withRepository(async ({ repositoryRoot, writeCustody }) => {
+    // The seed review needs a subject: a clean worktree without a declared
+    // base names no delta and stays unbound by rule.
+    await writeFile(path.join(repositoryRoot, "README.md"), "# reconciliation fixture\nUnder review\n", "utf8");
     const created = await delegateAgent(
       { agentType: "code-review", task: "create durable review", cwd: repositoryRoot },
       { writeCustody, runAgent: completedReviewRunner("DURABLE FINDINGS"), env: {} }

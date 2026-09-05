@@ -177,6 +177,24 @@ function validatePersistedProcessIdentity(identity) {
   return true;
 }
 
+/**
+ * Evidence about a destructive taskkill helper launched while stopping the
+ * child. `launched` is always stated; `closeProven` reports whether the
+ * helper's own close was observed before the record was written; `helper`
+ * carries the durable identity to re-observe when it was not. Absent evidence
+ * means no helper was ever launched; a launched helper without a proven close
+ * and without an observable identity can never quiesce, so it fails closed.
+ */
+function validateDestructiveHelperEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;
+  if (evidence.launched !== true && evidence.launched !== false) return false;
+  if (Object.hasOwn(evidence, "closeProven") && evidence.closeProven !== true && evidence.closeProven !== false) {
+    return false;
+  }
+  if (Object.hasOwn(evidence, "helper") && !validatePersistedProcessIdentity(evidence.helper)) return false;
+  return Object.keys(evidence).every((key) => ["launched", "closeProven", "helper"].includes(key));
+}
+
 function expectedRecordKeys(record) {
   const keys = [
     "schemaVersion",
@@ -202,7 +220,8 @@ function expectedRecordKeys(record) {
     "orphanReason",
     "terminalProof",
     "custodyKind",
-    "targetRef"
+    "targetRef",
+    "destructiveHelper"
   ]) {
     if (Object.hasOwn(record, optional)) keys.push(optional);
   }
@@ -306,6 +325,9 @@ export function validateDurableOwnershipRecord(record) {
       if (record.transitions.some((entry) => entry?.state === "PREPARING_WORKTREE")) return undefined;
     }
     if (Object.hasOwn(record, "targetRef") && !isFullyQualifiedRef(record.targetRef)) return undefined;
+    if (Object.hasOwn(record, "destructiveHelper") && !validateDestructiveHelperEvidence(record.destructiveHelper)) {
+      return undefined;
+    }
     if (
       !validTimestamp(record.createdAt) ||
       !validTimestamp(record.reservedAt) ||

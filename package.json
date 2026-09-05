@@ -1,6 +1,6 @@
 {
   "name": "claude-agents-mcp",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "Local MCP server that exposes profile-driven fresh Claude Code specialists to Codex CLI.",

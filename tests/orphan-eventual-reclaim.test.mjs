@@ -46,6 +46,7 @@ const WORKSPACE = Object.freeze({
 
 const COORDINATOR_PID = 100;
 const CLAUDE_PID = 61_000;
+const HELPER_PID = 62_000;
 
 /**
  * One observable process table. The Claude child starts alive, which is what
@@ -55,7 +56,8 @@ const CLAUDE_PID = 61_000;
 function processWorld() {
   const alive = new Map([
     [COORDINATOR_PID, String(COORDINATOR_PID * 100)],
-    [CLAUDE_PID, String(CLAUDE_PID * 100)]
+    [CLAUDE_PID, String(CLAUDE_PID * 100)],
+    [HELPER_PID, String(HELPER_PID * 100)]
   ]);
   return {
     alive,
@@ -323,5 +325,161 @@ test("a restarted or foreign coordinator cannot reclaim someone else's orphan th
     assert.equal(refused.released, false);
     assert.equal(refused.reason, "not-supervised-by-this-coordinator");
     assert.equal((await restarted.getWriteAccess(REPOSITORY_KEY)).state, "TERMINATING");
+  });
+});
+
+/**
+ * Writer A whose forced termination launched a destructive taskkill helper
+ * that outlived the termination bound. The request stays active so the
+ * outcome orphans with the helper evidence attached - exactly what the real
+ * unproven error carries.
+ */
+async function runUnprovenTaskkillTermination(writeCustody, executionId, { helperCloseProven }) {
+  const helperIdentity = Object.freeze({
+    pid: HELPER_PID,
+    startTime: String(HELPER_PID * 100),
+    source: "eventual-reclaim"
+  });
+  const outcome = await delegateAgent(
+    {
+      agentType: "task",
+      task: "writer A whose taskkill helper outlived termination",
+      cwd: WORKSPACE.effectiveCwd
+    },
+    dependencies(writeCustody, {
+      executionId,
+      runAgent: async ({ onChildStarted, onTerminationStarted }) => {
+        const identity = claudeIdentity(executionId);
+        await onChildStarted?.(identity, {});
+        await onTerminationStarted?.(identity, {});
+        throw Object.assign(new Error("forced termination could not be proven"), {
+          code: "claude_termination_unproven",
+          processStarted: true,
+          processIdentity: identity,
+          lateRecoveryAllowed: helperCloseProven,
+          terminationResult: Object.freeze({
+            status: "termination-unproven",
+            method: "taskkill",
+            taskkillLaunched: true,
+            taskkillHelperQuiescenceProven: helperCloseProven,
+            ...(helperCloseProven ? {} : { taskkillHelperIdentity: helperIdentity })
+          })
+        });
+      }
+    })
+  );
+  return { outcome, helperIdentity };
+}
+
+test("a launched taskkill helper keeps writer B blocked until the helper itself is proven gone", async () => {
+  await withCoordinator(async ({ world, writeCustody }) => {
+    const { outcome, helperIdentity } = await runUnprovenTaskkillTermination(writeCustody, "execution-a", {
+      helperCloseProven: false
+    });
+    assert.equal(outcome.custodyState, "orphaned");
+
+    // The orphan record names the launched helper and its durable identity so
+    // a later observation - not elapsed time - can decide quiescence.
+    const orphaned = await writeCustody.getWriteAccess(REPOSITORY_KEY);
+    assert.equal(orphaned.state, "ORPHANED");
+    assert.equal(orphaned.destructiveHelper?.launched, true);
+    assert.equal(orphaned.destructiveHelper?.closeProven, false);
+    assert.deepEqual(orphaned.destructiveHelper?.helper, { ...helperIdentity });
+
+    // Claude dies but the helper is still running: a dead target alone must
+    // never release custody while a destructive helper may still be acting.
+    world.kill(CLAUDE_PID);
+    const blocked = await writerB(writeCustody, "execution-b");
+    assert.equal(blocked.status, "failed");
+    assert.equal(blocked.error.code, "write_custody_conflict");
+    assert.equal((await writeCustody.getWriteAccess(REPOSITORY_KEY)).state, "ORPHANED");
+    const refused = await writeCustody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: REPOSITORY_KEY
+    });
+    assert.equal(refused.released, false);
+    assert.equal(refused.reason, "destructive-helper-quiescence-unproven");
+
+    // The helper itself dies: its durable identity is observed gone, so the
+    // same session reclaims and writer B is admitted.
+    world.kill(HELPER_PID);
+    const admitted = await writerB(writeCustody, "execution-b");
+    assert.equal(admitted.status, "completed", JSON.stringify(admitted.error ?? null));
+    assert.ok(world.inspections.includes(HELPER_PID), "the helper identity must be re-observed, never assumed");
+    assert.equal(await writeCustody.getWriteAccess(REPOSITORY_KEY), undefined);
+  });
+});
+
+test("a launched helper without an observable identity can never quiesce", async () => {
+  await withCoordinator(async ({ world, writeCustody }) => {
+    const identity = claudeIdentity("execution-a");
+    await delegateAgent(
+      {
+        agentType: "task",
+        task: "writer A whose helper evidence was lost",
+        cwd: WORKSPACE.effectiveCwd
+      },
+      dependencies(writeCustody, {
+        executionId: "execution-a",
+        runAgent: async ({ onChildStarted, onTerminationStarted }) => {
+          await onChildStarted?.(identity, {});
+          await onTerminationStarted?.(identity, {});
+          throw Object.assign(new Error("forced termination could not be proven"), {
+            code: "claude_termination_unproven",
+            processStarted: true,
+            processIdentity: identity,
+            lateRecoveryAllowed: false,
+            // Launched, unproven, and no durable identity to re-observe: the
+            // evidence a reclaim would need does not exist.
+            terminationResult: Object.freeze({
+              status: "termination-unproven",
+              method: "taskkill",
+              taskkillLaunched: true,
+              taskkillHelperQuiescenceProven: false
+            })
+          });
+        }
+      })
+    );
+
+    world.kill(CLAUDE_PID);
+    const refused = await writeCustody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: REPOSITORY_KEY
+    });
+    assert.equal(refused.released, false);
+    assert.equal(refused.reason, "destructive-helper-evidence-unknown");
+    const blocked = await writerB(writeCustody, "execution-b");
+    assert.equal(blocked.status, "failed");
+    assert.equal(blocked.error.code, "write_custody_conflict");
+    assert.equal((await writeCustody.getWriteAccess(REPOSITORY_KEY)).state, "ORPHANED");
+  });
+});
+
+test("a helper proven closed before the orphan needs no later observation", async () => {
+  await withCoordinator(async ({ world, writeCustody }) => {
+    const { outcome } = await runUnprovenTaskkillTermination(writeCustody, "execution-a", {
+      helperCloseProven: true
+    });
+    assert.equal(outcome.custodyState, "orphaned");
+
+    // Even if the helper PID later becomes unobservable, the proven close
+    // stands: quiescence was established, not inferred.
+    world.inspect = async (pid) => {
+      if (pid === HELPER_PID) {
+        return Object.freeze({ status: PROCESS_IDENTITY_STATUS.AMBIGUOUS, reason: "query-failed" });
+      }
+      const startTime = world.alive.get(pid);
+      return Object.freeze(startTime === undefined
+        ? { status: PROCESS_IDENTITY_STATUS.DEAD }
+        : {
+          status: PROCESS_IDENTITY_STATUS.ALIVE,
+          identity: Object.freeze({ pid, startTime, source: "eventual-reclaim" })
+        });
+    };
+    world.kill(CLAUDE_PID);
+    const admitted = await writerB(writeCustody, "execution-b");
+    assert.equal(admitted.status, "completed", JSON.stringify(admitted.error ?? null));
+    assert.equal(await writeCustody.getWriteAccess(REPOSITORY_KEY), undefined);
   });
 });

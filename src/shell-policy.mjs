@@ -32,6 +32,10 @@ const DANGEROUS_GIT_SUBCOMMANDS = new Set([
   "switch",
   "tag"
 ]);
+// Configuration-scale Git operations the hook refuses alongside the dangerous
+// subcommands above. Shared with the static deny rules so the two layers
+// cannot skew on which operations are prohibited.
+const GIT_CONFIGURATION_OPERATIONS = Object.freeze(["config", "remote", "clone", "init", "worktree"]);
 const BLOCKED_COMMANDS = new Set([
   "ssh",
   "scp",
@@ -93,6 +97,15 @@ const BLOCKED_COMMANDS = new Set([
  * deny rules. The hook is an additional policy layer, never the only gate, so
  * everything representable here is denied twice - once by the runtime that
  * owns the tool call, and again by the hook if it runs at all.
+ *
+ * Representable means a first-position prefix: the bare command in every
+ * Windows suffix spelling, plus at most a fixed second token. That covers
+ * every prohibited bare command, every dangerous Git operation in
+ * `git <operation>` position, every `git -<option>` global-option shape the
+ * Git policy refuses, and the canonical package publication commands. It
+ * cannot cover wrapper resolution (assignments, value flags, and positionals
+ * reorder the tokens), non-first-position matches, case variants, or arbitrary
+ * absolute paths, so those stay hook-enforced and the hook stays configured.
  */
 export function hardDeniedBashRules() {
   const rules = [];
@@ -101,6 +114,23 @@ export function hardDeniedBashRules() {
     for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
       rules.push("Bash(" + command + suffix + ":*)");
     }
+  }
+  // Dangerous Git operations the hook refuses in `git <operation>` position,
+  // denied here in every spelling Windows resolves for the git executable.
+  // The "-" entry mirrors the Git policy's refusal of any `git -<option>`
+  // global-option shape with a single prefix.
+  const gitOperations = [...DANGEROUS_GIT_SUBCOMMANDS, ...GIT_CONFIGURATION_OPERATIONS, "-"];
+  for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
+    for (const operation of gitOperations) {
+      rules.push("Bash(git" + suffix + " " + operation + ":*)");
+    }
+  }
+  // Canonical package publication commands. A non-first-position `publish`
+  // token (`npm run publish`) is hook-side: a prefix rule cannot see it.
+  for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
+    rules.push("Bash(npm" + suffix + " publish:*)");
+    rules.push("Bash(pnpm" + suffix + " publish:*)");
+    rules.push("Bash(yarn" + suffix + " npm publish:*)");
   }
   return Object.freeze(rules);
 }
@@ -248,7 +278,7 @@ function rejectDangerousGit(tokens) {
   if (dangerousSubcommand) {
     return "Git operation '" + dangerousSubcommand + "' is not allowed by the runtime shell guard.";
   }
-  if (argumentsLowercase.some((token) => ["config", "remote", "clone", "init", "worktree"].includes(token))) {
+  if (argumentsLowercase.some((token) => GIT_CONFIGURATION_OPERATIONS.includes(token))) {
     return "Git configuration, remote, clone, init, and worktree operations are not allowed by the runtime shell guard.";
   }
   if (tokens.slice(1).some((token) => /^(?:-c|--config-env|--exec-path|--git-dir|--work-tree|--paginate|--ext-diff|-o|--output(?:=.+)?)$/iu.test(token))) {
