@@ -128,6 +128,16 @@ function parseNumstatBinaries(text) {
 /**
  * Collects the committed delta between a resolved base and HEAD.
  *
+ * The two OIDs come from `frozen`: HEAD's commit and the target's commit as
+ * the BEFORE collection captured them. They are never re-resolved here. Refs
+ * are mutable, so a fresh resolution could observe a commit the BEFORE
+ * subject never contained - the ref moves A->B between BEFORE's resolution
+ * and this derivation, moves back B->A before AFTER, and the AFTER comparison
+ * then reports a false FRESH over evidence collected from B. Frozen OIDs
+ * close that ABA by construction: merge-base and diff become pure functions
+ * of immutable commits, so the evidence always describes exactly the subject
+ * the receipt binds.
+ *
  * Every failure to establish an exact fact returns `unavailable` with a stable
  * reason rather than a partial answer, because the caller's only safe reading
  * of "partial" would be to refuse the review anyway.
@@ -136,6 +146,7 @@ export async function collectCommittedReviewEvidence({
   repositoryRoot,
   repositoryId,
   target,
+  frozen,
   env,
   runProcess,
   maxPatchBytes = MAX_EVIDENCE_PATCH_BYTES,
@@ -147,11 +158,11 @@ export async function collectCommittedReviewEvidence({
   if (!ref) return unavailable([{ code: "review_target_not_declared" }]);
 
   requestContext?.assertActive?.("committed-evidence-head");
-  const head = (await readGit(["rev-parse", "--verify", "HEAD^{commit}"], options))?.trim();
+  const head = typeof frozen?.headCommit === "string" ? frozen.headCommit.trim() : null;
   if (!OBJECT_ID.test(head ?? "")) return unavailable([{ code: "head_unresolved" }]);
 
   requestContext?.assertActive?.("committed-evidence-base");
-  const base = (await readGit(["rev-parse", "--verify", ref + "^{commit}"], options))?.trim();
+  const base = typeof frozen?.baseCommit === "string" ? frozen.baseCommit.trim() : null;
   if (!OBJECT_ID.test(base ?? "")) return unavailable([{ code: "review_target_unresolved" }]);
 
   requestContext?.assertActive?.("committed-evidence-merge-base");

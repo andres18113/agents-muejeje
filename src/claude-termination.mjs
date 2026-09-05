@@ -143,6 +143,84 @@ async function terminateWithExactHandle(
 }
 
 /**
+ * Captures one taskkill helper's durable PID+StartTime identity, starting the
+ * observation immediately after spawn rather than after the close wait.
+ *
+ * The returned promise resolves with the validated identity or with undefined;
+ * it never rejects. Only an ALIVE observation for exactly the spawned PID
+ * establishes an identity. An invalid PID, a dead or ambiguous observation, a
+ * PID mismatch, a malformed identity, a throwing inspector, or cancellation
+ * all degrade to undefined, which downstream reclaim treats as unobservable
+ * (fail-closed) rather than as quiescence.
+ *
+ * `getResolved()` exposes whatever has already settled without waiting, so an
+ * outer bounded observer that timed out can still take an identity the query
+ * established before the timeout, instead of losing it to the race between
+ * its own timer and the inner termination's settlement.
+ */
+function startHelperIdentityCapture(inspectProcess, helperPid, terminationSignal) {
+  const noCapture = Object.freeze({
+    promise: Promise.resolve(undefined),
+    getResolved: () => undefined,
+    cancel: () => {}
+  });
+  if (!Number.isSafeInteger(helperPid) || helperPid <= 0) return noCapture;
+
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (terminationSignal?.aborted) {
+    controller.abort();
+  } else {
+    terminationSignal?.addEventListener?.("abort", forwardAbort, { once: true });
+  }
+  const settled = { identity: undefined };
+  const promise = Promise.resolve()
+    .then(() => inspectProcess(helperPid, { abortSignal: controller.signal }))
+    .then(
+      (observation) => {
+        if (
+          observation?.status !== PROCESS_IDENTITY_STATUS.ALIVE ||
+          observation.identity?.pid !== helperPid
+        ) return undefined;
+        return validateDurableProcessIdentity(observation.identity, "taskkill helper identity");
+      },
+      () => undefined
+    )
+    .then(
+      (identity) => {
+        settled.identity = identity;
+        return identity;
+      },
+      () => undefined
+    )
+    .finally(() => terminationSignal?.removeEventListener?.("abort", forwardAbort));
+  return Object.freeze({
+    promise,
+    getResolved: () => settled.identity,
+    cancel: () => {
+      controller.abort();
+      terminationSignal?.removeEventListener?.("abort", forwardAbort);
+    }
+  });
+}
+
+/**
+ * Reads an already-settled helper identity capture without waiting. Used only
+ * by the outer bounded observer after its own deadline expired. Anything that
+ * is not a well-formed durable identity - including a capture a foreign
+ * adapter placed on the context - reads as absent, never as evidence.
+ */
+function resolvedHelperIdentity(capture) {
+  try {
+    const identity = capture?.getResolved?.();
+    if (!identity) return undefined;
+    return validateDurableProcessIdentity(identity, "taskkill helper identity");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Requests termination of exactly the supplied ChildProcess and waits for
  * bounded terminal evidence.
  *
@@ -318,9 +396,27 @@ export async function terminateClaudeChild(
     });
   }
 
+  // The helper's durable identity is captured immediately after spawn, before
+  // the termination deadline is consumed waiting for its close. A query
+  // started only after that wait observes whatever holds the PID seconds
+  // later - possibly a reused PID - or nothing at all when the helper died
+  // just past the bound; either way the exact identity a later reclaim needs
+  // is lost. An early observation can still be ambiguous or fail, and every
+  // such outcome degrades to absent identity (fail-closed), never to a guess.
+  const helperIdentityCapture = startHelperIdentityCapture(
+    inspectProcess,
+    launch.helper?.pid,
+    terminationSignal
+  );
+
   if (terminationContext) {
     terminationContext.taskkillLaunched = true;
     terminationContext.taskkillHelperCloseProven = false;
+    // An outer bounded observer may time out while this inner termination is
+    // still settling. It reads this capture synchronously - never waiting -
+    // so an identity that already resolved is not lost to the timeout race,
+    // while a still-pending one stays fail-closed unknown.
+    terminationContext.taskkillHelperIdentityCapture = helperIdentityCapture;
   }
 
   const taskkill = superviseTaskkillHelper(launch.helper, {
@@ -355,24 +451,16 @@ export async function terminateClaudeChild(
   // A helper that outlived termination can still quiesce later, and same-
   // session reclaim must be able to observe that - but only through the same
   // durable identity (PID plus start time) every other process conclusion
-  // uses. Only an ALIVE observation establishes one. Anything else leaves the
-  // helper unobservable, and reclaim then stays fail-closed. Evidence capture
-  // must never break termination itself, so every failure here degrades to
-  // absent identity rather than throwing.
+  // uses. That identity was captured at spawn, before the close wait consumed
+  // the deadline; only an ALIVE observation established one. Anything else
+  // leaves the helper unobservable, and reclaim then stays fail-closed. When
+  // quiescence was proven the capture is simply no longer needed and its
+  // read-only query is asked to stop.
   let taskkillHelperIdentity;
-  const helperPid = launch.helper?.pid;
-  if (!helperQuiescenceProven && Number.isSafeInteger(helperPid) && helperPid > 0) {
-    try {
-      const helperObservation = await inspectProcess(helperPid, { abortSignal: terminationSignal });
-      if (
-        helperObservation?.status === PROCESS_IDENTITY_STATUS.ALIVE &&
-        helperObservation.identity?.pid === helperPid
-      ) {
-        taskkillHelperIdentity = validateDurableProcessIdentity(helperObservation.identity, "taskkill helper identity");
-      }
-    } catch {
-      taskkillHelperIdentity = undefined;
-    }
+  if (!helperQuiescenceProven) {
+    taskkillHelperIdentity = await helperIdentityCapture.promise;
+  } else {
+    helperIdentityCapture.cancel();
   }
   const helperEvidence = {
     taskkillLaunched: true,
@@ -531,13 +619,22 @@ export async function terminateStartedChild({
     cancelSchedule
   });
   let terminationResult;
+  // When the bounded observer wins the race against an inner termination that
+  // launched a helper, the launch fact comes from the shared context - and so
+  // does an already-resolved spawn-time identity capture, read synchronously
+  // without extending the expired deadline. A still-pending capture stays
+  // unknown, which downstream reclaim treats as fail-closed.
+  const timeoutHelperIdentity = terminationContext.taskkillLaunched
+    ? resolvedHelperIdentity(terminationContext.taskkillHelperIdentityCapture)
+    : undefined;
   const helperTimeoutEvidence = terminationContext.taskkillLaunched
     ? {
         taskkillLaunched: true,
         taskkillHelper: terminationContext.taskkillHelper,
         taskkillHelperQuiescenceProven:
           terminationContext.taskkillHelperCloseProven === true,
-        helperQuiescenceUnproven: terminationContext.taskkillHelperCloseProven !== true
+        helperQuiescenceUnproven: terminationContext.taskkillHelperCloseProven !== true,
+        ...(timeoutHelperIdentity ? { taskkillHelperIdentity: timeoutHelperIdentity } : {})
       }
     : {};
   if (terminationOutcome.timedOut) {

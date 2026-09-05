@@ -32,6 +32,7 @@ import {
   parsePreToolUseInput,
   ShellPolicyError
 } from "../src/shell-policy.mjs";
+import { bashCommandDeniedByRules } from "./fixtures/claude-permission-matching.mjs";
 import {
   canonicalRepositoryKey,
   resolveCanonicalWorkspaceRoot
@@ -391,7 +392,7 @@ test("prohibited commands are denied by permission rules, not only by the hook",
   for (const command of ["rm", "curl", "claude", "taskkill", "powershell", "cmd", "sudo"]) {
     for (const suffix of ["", ".exe", ".cmd", ".bat", ".com"]) {
       assert.ok(
-        deny.includes("Bash(" + command + suffix + ":*)"),
+        deny.includes("Bash(" + command + suffix + " *)"),
         "missing hard deny for " + command + suffix
       );
     }
@@ -502,23 +503,23 @@ test("settings without a working hook still deny git push and prohibited command
 
     for (const operation of EXPECTED_DENIED_GIT_OPERATIONS) {
       assert.ok(
-        deny.includes("Bash(git " + operation + ":*)"),
+        deny.includes("Bash(git " + operation + " *)"),
         shellPolicy + " is missing a hook-independent deny for git " + operation
       );
       assert.ok(
-        deny.includes("Bash(git.exe " + operation + ":*)"),
+        deny.includes("Bash(git.exe " + operation + " *)"),
         shellPolicy + " is missing a hook-independent deny for git.exe " + operation
       );
     }
-    assert.ok(deny.includes("Bash(git -:*)"), shellPolicy + " is missing a hook-independent deny for git -<option>");
+    assert.ok(deny.includes("Bash(git -*)"), shellPolicy + " is missing a hook-independent deny for git -<option>");
     for (const publication of ["npm publish", "pnpm publish", "yarn npm publish"]) {
       assert.ok(
-        deny.includes("Bash(" + publication + ":*)"),
+        deny.includes("Bash(" + publication + " *)"),
         shellPolicy + " is missing a hook-independent deny for " + publication
       );
     }
-    assert.ok(deny.includes("Bash(rm.exe:*)"), shellPolicy);
-    assert.ok(deny.includes("Bash(taskkill.exe:*)"), shellPolicy);
+    assert.ok(deny.includes("Bash(rm.exe *)"), shellPolicy);
+    assert.ok(deny.includes("Bash(taskkill.exe *)"), shellPolicy);
 
     // Structural absence: dropping the hooks block leaves the deny set behind.
     const { hooks: dropped, ...hookless } = buildRuntimeSettingsPayload({ shellPolicy });
@@ -533,18 +534,15 @@ test("settings without a working hook still deny git push and prohibited command
 });
 
 /**
- * Every canonical first-position command the hook refuses must have a matching
- * static prefix rule, so a dead hook changes nothing for those commands. The
- * shapes a prefix cannot see - wrappers, case variants, non-first-position
- * tokens - stay hook-side and are pinned as such below.
+ * Every command the hook refuses for its prohibited core must have a matching
+ * static rule, so a dead hook changes nothing for those commands - wrappers,
+ * absolute paths, and nesting included. The shapes no rule can express -
+ * case variants and quoted or non-first-position tokens - stay hook-side and
+ * are pinned as such below.
  */
-test("every canonical first-position hook denial has a matching static rule", () => {
+test("every hook denial for a prohibited core has a matching static rule", () => {
   const deny = hardDeniedBashRules();
-  const coveredByRule = (command) =>
-    deny.some((rule) => {
-      const match = /^Bash\((.+):\*\)$/u.exec(rule);
-      return match !== null && command.startsWith(match[1]);
-    });
+  const coveredByRule = (command) => bashCommandDeniedByRules(deny, command);
 
   const canonical = [];
   for (const operation of EXPECTED_DENIED_GIT_OPERATIONS) {
@@ -559,7 +557,13 @@ test("every canonical first-position hook denial has a matching static rule", ()
     "yarn npm publish",
     "rm -rf build",
     "taskkill /IM node.exe",
-    "curl http://example.invalid"
+    "curl http://example.invalid",
+    "env git push",
+    "env FOO=1 rm -rf .",
+    "timeout 5 env git push",
+    "/usr/bin/git push",
+    "C:\\tools\\git.exe push",
+    "FOO=1 git push"
   );
   for (const command of canonical) {
     assert.equal(evaluateShellPolicy("worker", command).allowed, false, "hook must deny: " + command);
@@ -572,9 +576,9 @@ test("every canonical first-position hook denial has a matching static rule", ()
     assert.equal(evaluateShellPolicy("worker", command).allowed, true, "hook must allow: " + command);
   }
 
-  // The documented hook-side remainder: denied by the hook, invisible to a
-  // prefix rule, which is why the hook stays configured alongside the rules.
-  for (const command of ["env git push", "env FOO=1 rm -rf .", "GIT PUSH", "npm run publish"]) {
+  // The documented hook-side remainder: denied by the hook, invisible to any
+  // rule shape, which is why the hook stays configured alongside the rules.
+  for (const command of ["GIT PUSH", "npm run publish", "git \"push\""]) {
     assert.equal(evaluateShellPolicy("worker", command).allowed, false, "hook must deny: " + command);
     assert.equal(coveredByRule(command), false, "static rule cannot cover: " + command);
   }

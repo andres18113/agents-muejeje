@@ -1595,3 +1595,187 @@ test("a late recovery that publishes RELEASED keeps it when the later archive st
     assert.equal(next.state, "RESERVED");
   });
 });
+
+/**
+ * P1-1: the in-memory helper-evidence channel. A cancelled request whose
+ * record stays TERMINATING can no longer mutate, so the termination launch
+ * fact reaches a later same-session reclaim only through this note. The note
+ * is a union - a launch is never un-reported - and it is total: malformed
+ * input is ignored rather than breaking retention, because absence of a note
+ * fails closed downstream.
+ */
+test("helper notes are total and accumulate as a fail-closed union", async () => {
+  await withState(async (stateRoot) => {
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")]]), 100);
+    const helperA = { pid: 700, startTime: "70000", source };
+    const helperB = { pid: 701, startTime: "70100", source };
+
+    assert.equal(
+      custody.noteDestructiveHelperEvidence({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        destructiveHelper: { launched: true, closeProven: false, helper: helperA }
+      }),
+      true
+    );
+    // A later report for the same execution accumulates: the launch sticks
+    // and both identities are retained.
+    assert.equal(
+      custody.noteDestructiveHelperEvidence({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        destructiveHelper: { launched: true, closeProven: true, helper: helperB }
+      }),
+      true
+    );
+    // A never-launched report can never un-report a launch.
+    assert.equal(
+      custody.noteDestructiveHelperEvidence({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        destructiveHelper: { launched: false }
+      }),
+      true
+    );
+
+    // Malformed notes are ignored, never thrown: retention must not break.
+    for (const bad of [
+      {},
+      { executionId: "!!!", canonicalRootKey: rootAKey, destructiveHelper: { launched: false } },
+      { executionId: "execution-a", canonicalRootKey: "", destructiveHelper: { launched: false } },
+      { executionId: "execution-a", canonicalRootKey: rootAKey, destructiveHelper: undefined },
+      { executionId: "execution-a", canonicalRootKey: rootAKey, destructiveHelper: { launched: "yes" } },
+      { executionId: "execution-a", canonicalRootKey: rootAKey, destructiveHelper: { launched: false, closeProven: true } },
+      { executionId: "execution-a", canonicalRootKey: rootAKey, destructiveHelper: { launched: true, helper: { pid: -1 } } }
+    ]) {
+      assert.equal(custody.noteDestructiveHelperEvidence(bad), false);
+    }
+  });
+});
+
+test("markOrphanedWriteAccess stores positive never-launched evidence and refuses contradictions", async () => {
+  await withState(async (stateRoot) => {
+    const identity = childIdentity();
+    const custody = manager(stateRoot, new Map([[100, live(100, "10000")], [200, live(200, "20000")]]), 100);
+    await reserve(custody);
+    await activate(custody, identity);
+    await custody.beginTermination({ executionId: "execution-a", canonicalRootKey: rootAKey, processIdentity: identity });
+
+    const orphaned = await custody.markOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      processIdentity: identity,
+      reason: "exact-handle-unproven",
+      destructiveHelper: { launched: false }
+    });
+    assert.deepEqual(orphaned.destructiveHelper, { launched: false });
+
+    await assert.rejects(
+      custody.markOrphanedWriteAccess({
+        executionId: "execution-a",
+        canonicalRootKey: rootAKey,
+        processIdentity: identity,
+        reason: "contradiction",
+        destructiveHelper: { launched: false, closeProven: true }
+      }),
+      (error) => error instanceof WriteCustodyError && error.code === "write_custody_terminal_proof_invalid"
+    );
+  });
+});
+
+test("a self-contradictory durable helper record refuses the reclaim", async () => {
+  await withState(async (stateRoot) => {
+    const identity = childIdentity();
+    const observations = new Map([[100, live(100, "10000")], [200, live(200, "20000")]]);
+    const custody = manager(stateRoot, observations, 100);
+    await reserve(custody);
+    await activate(custody, identity);
+    await custody.beginTermination({ executionId: "execution-a", canonicalRootKey: rootAKey, processIdentity: identity });
+
+    // A record that claims never-launched while carrying quiescence proof is
+    // ambiguous: hand-written here because no API path produces one.
+    const recordPath = path.join(custody.repositoryStateDirectory(rootAKey), "ownership", "record.json");
+    const current = JSON.parse(await readFile(recordPath, "utf8"));
+    await writeFile(
+      recordPath,
+      JSON.stringify({
+        ...current,
+        destructiveHelper: { launched: false, closeProven: true }
+      }, null, 2) + "\n",
+      "utf8"
+    );
+
+    observations.set(200, dead());
+    const refused = await custody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    assert.equal(refused.released, false);
+    assert.equal(refused.reason, "destructive-helper-evidence-contradictory");
+  });
+});
+
+test("helper-note union: a launch sticks and every noted identity must be proven gone", async () => {
+  await withState(async (stateRoot) => {
+    const identity = childIdentity();
+    const observations = new Map([
+      [100, live(100, "10000")],
+      [200, live(200, "20000")],
+      [700, live(700, "70000")],
+      [701, live(701, "70100")]
+    ]);
+    const custody = new DurableWriteCustodyManager({
+      stateRoot,
+      platform: "win32",
+      inspectProcess: inspector(observations),
+      currentPid: 100,
+      now: () => 1_000
+    });
+    await reserve(custody);
+    await activate(custody, identity);
+    await custody.beginTermination({ executionId: "execution-a", canonicalRootKey: rootAKey, processIdentity: identity });
+
+    custody.noteDestructiveHelperEvidence({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      destructiveHelper: { launched: true, closeProven: false, helper: { pid: 700, startTime: "70000", source } }
+    });
+    // A never-launched report after a launch report changes nothing: the
+    // launch sticks and the first identity is retained.
+    custody.noteDestructiveHelperEvidence({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      destructiveHelper: { launched: false }
+    });
+    observations.set(200, dead());
+
+    const stillBlocked = await custody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    assert.equal(stillBlocked.released, false);
+    assert.equal(stillBlocked.reason, "destructive-helper-quiescence-unproven");
+
+    // The first helper dies but a second noted identity is still alive: the
+    // notes accumulated rather than overwrote, so the reclaim still refuses.
+    observations.set(700, dead());
+    custody.noteDestructiveHelperEvidence({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey,
+      destructiveHelper: { launched: true, closeProven: false, helper: { pid: 701, startTime: "70100", source } }
+    });
+    const secondBlocked = await custody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    assert.equal(secondBlocked.released, false);
+    assert.equal(secondBlocked.reason, "destructive-helper-quiescence-unproven");
+
+    observations.set(701, dead());
+    const reclaimed = await custody.reclaimOwnOrphanedWriteAccess({
+      executionId: "execution-a",
+      canonicalRootKey: rootAKey
+    });
+    assert.equal(reclaimed.released, true);
+  });
+});

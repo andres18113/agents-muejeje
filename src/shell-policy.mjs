@@ -1,4 +1,4 @@
-const COMPOSITION_PATTERN = /[\r\n;&|<>`]/u;
+const COMPOSITION_PATTERN = /[\r\n;&|<>`()]/u;
 const COMMAND_SUBSTITUTION_PATTERN = /\$\(|\$\{/u;
 const VARIABLE_EXPANSION_PATTERN = /\$/u;
 const QUOTING_PATTERN = /["']/u;
@@ -36,6 +36,8 @@ const DANGEROUS_GIT_SUBCOMMANDS = new Set([
 // subcommands above. Shared with the static deny rules so the two layers
 // cannot skew on which operations are prohibited.
 const GIT_CONFIGURATION_OPERATIONS = Object.freeze(["config", "remote", "clone", "init", "worktree"]);
+export { GIT_CONFIGURATION_OPERATIONS };
+export const DANGEROUS_GIT_OPERATION_NAMES = Object.freeze([...DANGEROUS_GIT_SUBCOMMANDS]);
 const BLOCKED_COMMANDS = new Set([
   "ssh",
   "scp",
@@ -66,6 +68,14 @@ const BLOCKED_COMMANDS = new Set([
   "stop-process",
   "sudo",
   "runas",
+  "su",
+  "runuser",
+  "batch",
+  "crontab",
+  "coproc",
+  "eval",
+  "source",
+  ".",
   "rm",
   "rmdir",
   "del",
@@ -91,46 +101,103 @@ const BLOCKED_COMMANDS = new Set([
   "sh",
   "zsh"
 ]);
+// Frozen read-only views for the coverage tests: the deny-rule generator and
+// the hook classify from these same sets, so the tests pin that every entry
+// is denied in every spelling rather than re-listing the entries by hand.
+export const BLOCKED_COMMAND_NAMES = Object.freeze(
+  [...BLOCKED_COMMANDS].filter((command) => command === "." || !command.includes("."))
+);
 
 /**
- * The subset of the policy that Claude Code can enforce itself, as permission
- * deny rules. The hook is an additional policy layer, never the only gate, so
- * everything representable here is denied twice - once by the runtime that
- * owns the tool call, and again by the hook if it runs at all.
+ * The subset of the policy that Claude Code enforces itself, as permission
+ * deny rules. These rules are evaluated by the runtime that owns the tool
+ * call whether the hook runs or not: a timed-out or failed PreToolUse hook
+ * does not block the call, so anything that must hold without the hook must
+ * be denied here. The hook stays configured as defense in depth and for the
+ * judgements below that no rule can express.
  *
- * Representable means a first-position prefix: the bare command in every
- * Windows suffix spelling, plus at most a fixed second token. That covers
- * every prohibited bare command, every dangerous Git operation in
- * `git <operation>` position, every `git -<option>` global-option shape the
- * Git policy refuses, and the canonical package publication commands. It
- * cannot cover wrapper resolution (assignments, value flags, and positionals
- * reorder the tokens), non-first-position matches, case variants, or arbitrary
- * absolute paths, so those stay hook-enforced and the hook stays configured.
+ * A `*` in a Bash rule matches any text at any position, and a deny rule
+ * fires when any subcommand of a compound matches it. Each prohibited
+ * program is therefore denied in seven anchored shapes per Windows suffix
+ * spelling: bare first-position, space-separated (which sees through every
+ * wrapper chain - `env`, `timeout 5 env`, nested wrappers at any depth,
+ * absolute wrapper paths, `find -exec` - without enumerating combinations),
+ * slash-pathed, and backslash-pathed, each with and without trailing
+ * arguments. Anchoring on a space or a slash keeps `cat` from matching an
+ * `at` rule and `legit` from matching a `git` rule; unanchored substring
+ * rules would deny legitimate tools.
+ *
+ * Three judgements stay hook-side because no rule shape expresses them.
+ * Case variants (`GIT push`) cannot be enumerated - Bash rule matching is
+ * documented nowhere as case-insensitive, so it is assumed sensitive - and
+ * the hook classifies case-insensitively instead; on POSIX systems a
+ * case-variant external command fails to resolve on its own, which narrows
+ * the hook-only residue to Windows. A non-first-position `publish` token
+ * (`npm run publish`, a local script under the same authority as `npm test`)
+ * would need an unanchored substring that also matches `grep publish`. Shell
+ * composition, quoting, and globs are refused wholesale by the hook while
+ * the rules judge each subcommand on its own, which is the safe direction in
+ * both layers: a compound is denied when any part of it is prohibited.
  */
 export function hardDeniedBashRules() {
   const rules = [];
+  const suffixes = ["", ...EXECUTABLE_SUFFIXES];
+  // Every prohibited bare command in every spelling the OS resolves. Dotted
+  // entries (`cmd.exe`) are skipped: the bare name plus the suffix expansion
+  // already covers them, and `cmd.exe.exe` would be a nonsense rule. The `.`
+  // builtin takes no suffix for the same reason. Every shape uses the
+  // documented `*` spelling, including first position: a sole trailing ` *`
+  // also matches the bare command.
   for (const command of BLOCKED_COMMANDS) {
-    if (command.includes(".")) continue;
-    for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
-      rules.push("Bash(" + command + suffix + ":*)");
+    if (command.includes(".") && command !== ".") continue;
+    for (const suffix of (command === "." ? [""] : suffixes)) {
+      const program = command + suffix;
+      rules.push("Bash(" + program + " *)");
+      rules.push("Bash(* " + program + " *)");
+      rules.push("Bash(* " + program + ")");
+      rules.push("Bash(*/" + program + " *)");
+      rules.push("Bash(*/" + program + ")");
+      rules.push("Bash(*\\" + program + " *)");
+      rules.push("Bash(*\\" + program + ")");
     }
   }
   // Dangerous Git operations the hook refuses in `git <operation>` position,
   // denied here in every spelling Windows resolves for the git executable.
-  // The "-" entry mirrors the Git policy's refusal of any `git -<option>`
-  // global-option shape with a single prefix.
-  const gitOperations = [...DANGEROUS_GIT_SUBCOMMANDS, ...GIT_CONFIGURATION_OPERATIONS, "-"];
-  for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
+  // The "-" shapes mirror the Git policy's refusal of any `git -<option>`
+  // global-option shape; the wildcard sits immediately after the dash so
+  // `git -c`, `git --version`, and every other option spelling match.
+  const gitOperations = [...DANGEROUS_GIT_SUBCOMMANDS, ...GIT_CONFIGURATION_OPERATIONS];
+  for (const suffix of suffixes) {
+    const git = "git" + suffix;
     for (const operation of gitOperations) {
-      rules.push("Bash(git" + suffix + " " + operation + ":*)");
+      rules.push("Bash(" + git + " " + operation + " *)");
+      rules.push("Bash(* " + git + " " + operation + " *)");
+      rules.push("Bash(* " + git + " " + operation + ")");
+      rules.push("Bash(*/" + git + " " + operation + " *)");
+      rules.push("Bash(*/" + git + " " + operation + ")");
+      rules.push("Bash(*\\" + git + " " + operation + " *)");
+      rules.push("Bash(*\\" + git + " " + operation + ")");
     }
+    rules.push("Bash(" + git + " -*)");
+    rules.push("Bash(* " + git + " -*)");
+    rules.push("Bash(*/" + git + " -*)");
+    rules.push("Bash(*\\" + git + " -*)");
   }
   // Canonical package publication commands. A non-first-position `publish`
-  // token (`npm run publish`) is hook-side: a prefix rule cannot see it.
-  for (const suffix of ["", ...EXECUTABLE_SUFFIXES]) {
-    rules.push("Bash(npm" + suffix + " publish:*)");
-    rules.push("Bash(pnpm" + suffix + " publish:*)");
-    rules.push("Bash(yarn" + suffix + " npm publish:*)");
+  // token (`npm run publish`) is hook-side: an unanchored rule would also
+  // match `grep publish`.
+  const publications = [["npm", "publish"], ["pnpm", "publish"], ["yarn", "npm publish"]];
+  for (const suffix of suffixes) {
+    for (const [tool, tail] of publications) {
+      const head = tool + suffix + " " + tail;
+      rules.push("Bash(" + head + " *)");
+      rules.push("Bash(* " + head + " *)");
+      rules.push("Bash(* " + head + ")");
+      rules.push("Bash(*/" + head + " *)");
+      rules.push("Bash(*/" + head + ")");
+      rules.push("Bash(*\\" + head + " *)");
+      rules.push("Bash(*\\" + head + ")");
+    }
   }
   return Object.freeze(rules);
 }
@@ -182,6 +249,7 @@ function tokenizeSimpleCommand(command) {
  * claude.bat all reach exactly what their bare name reaches.
  */
 const EXECUTABLE_SUFFIXES = Object.freeze([".exe", ".cmd", ".bat", ".com"]);
+export { EXECUTABLE_SUFFIXES };
 
 function commandBasename(token) {
   const basename = token.split(/[\\/]/u).pop().toLowerCase();
@@ -198,6 +266,9 @@ function commandBasename(token) {
  * consumes - the duration in `timeout 5 curl ...`.
  */
 const COMMAND_WRAPPERS = new Map([
+  // `!` negates a pipeline's exit status and runs what follows it; without
+  // this entry `! git push` would classify as the program `!`.
+  ["!", { assignments: false, skipPositional: 0, skipValueFlags: [] }],
   ["command", { assignments: false, skipPositional: 0, skipValueFlags: [] }],
   ["builtin", { assignments: false, skipPositional: 0, skipValueFlags: [] }],
   ["exec", { assignments: false, skipPositional: 0, skipValueFlags: [] }],
@@ -225,6 +296,12 @@ const ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 function resolveEffectiveCommand(tokens) {
   let remaining = tokens;
   for (let depth = 0; depth <= MAX_WRAPPER_DEPTH; depth += 1) {
+    // Leading `VAR=value` assignments are stripped at every level: the shell
+    // runs what follows them, so classifying `FOO=1 git push` as the program
+    // `FOO=1` would allow exactly what the policy prohibits.
+    while (remaining.length > 0 && ASSIGNMENT_PATTERN.test(remaining[0])) {
+      remaining = remaining.slice(1);
+    }
     if (remaining.length === 0) {
       return { error: "A shell command must name a program to run." };
     }

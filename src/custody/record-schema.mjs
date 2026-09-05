@@ -181,9 +181,12 @@ function validatePersistedProcessIdentity(identity) {
  * Evidence about a destructive taskkill helper launched while stopping the
  * child. `launched` is always stated; `closeProven` reports whether the
  * helper's own close was observed before the record was written; `helper`
- * carries the durable identity to re-observe when it was not. Absent evidence
- * means no helper was ever launched; a launched helper without a proven close
- * and without an observable identity can never quiesce, so it fails closed.
+ * carries the durable identity to re-observe when it was not. Explicit
+ * `launched: false` is the positive never-launched report; absent evidence
+ * means unknown, never "never launched", because a helper may have been
+ * launched while its record stayed TERMINATING with the evidence lost. A
+ * launched helper without a proven close and without an observable identity
+ * can never quiesce, so it fails closed.
  */
 function validateDestructiveHelperEvidence(evidence) {
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;

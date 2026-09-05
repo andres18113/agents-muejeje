@@ -124,10 +124,13 @@ export function decideReconciliation({ record, coordinator, gitOperation, claude
     // Claude is proven gone - but that is not enough when the dead coordinator
     // had already begun forced termination. Beginning termination is exactly
     // what may have launched a destructive taskkill helper, and that helper's
-    // lifecycle was only ever known in the crashed coordinator's memory: it has
-    // no durable identity, so no live coordinator can observe whether it
-    // finished. A dead target therefore proves the target died, not that the
-    // repository is quiet. Fail closed and hand ownership to nobody.
+    // quiescence is knowable, if at all, only through evidence the crashed
+    // coordinator left behind. Its memory is gone, and durable helper evidence
+    // is spent only by the same live coordinator that wrote it (see
+    // reclaimOwnOrphanedWriteAccess), never across coordinators - so no live
+    // coordinator concludes quiescence here. A dead target therefore proves
+    // the target died, not that the repository is quiet. Fail closed and hand
+    // ownership to nobody.
     if (FORCED_TERMINATION_STATES.has(record.state)) {
       return orphan("forced-termination-helper-quiescence-unproven", {
         released: false,

@@ -602,3 +602,62 @@ test("recovered and unprovable histories reach the binding with their own codes"
     { code: "review_history_recovery_failed" }
   ]);
 });
+
+/**
+ * P1-2: the binder freezes BEFORE's exact OIDs into the evidence call, so a
+ * ref that moves between BEFORE's resolution and evidence collection cannot
+ * corrupt the bound subject (A->B->A would otherwise bind evidence from B
+ * under a false FRESH).
+ */
+test("committed evidence receives BEFORE's exact frozen OIDs", async () => {
+  const before = exactCollection(7);
+  let received;
+  const binder = createReviewBinder({
+    collectChangeSet: async () => before,
+    coherentAdmission: { verifyStillHeld: async () => ({ held: true, reasons: [] }) },
+    receiptStore: recordingStore(),
+    collectCommittedEvidenceFn: async (args) => {
+      received = args;
+      return completeCommittedEvidence();
+    },
+    now: () => 1_000
+  });
+  const context = { binder, coherence: COHERENCE.HELD };
+  const beforeState = await runBefore(context);
+  assert.equal(beforeState.status, "collected");
+  assert.deepEqual(received.frozen, {
+    headCommit: before.descriptor.head.commit,
+    baseCommit: before.descriptor.target.commit
+  });
+  assert.equal(received.target.spec, TARGET);
+});
+
+test("committed evidence freezes nulls when BEFORE captured no base commit", async () => {
+  const descriptor = buildChangeSetDescriptor({
+    objectFormat: "sha1",
+    head: { commit: "1".repeat(40), unborn: false },
+    target: { spec: TARGET, resolution: "unresolved", commit: null },
+    index: [], worktree: [], unmerged: [], untracked: [], submodules: [],
+    summary: { branch: "main", detached: false, mergeBase: null }
+  });
+  const { changeSetId } = changeSetIdFor(descriptor);
+  const before = { status: "exact", descriptor, changeSetId, summary: descriptor.summary };
+  let received;
+  const binder = createReviewBinder({
+    collectChangeSet: async () => before,
+    coherentAdmission: { verifyStillHeld: async () => ({ held: true, reasons: [] }) },
+    receiptStore: recordingStore(),
+    collectCommittedEvidenceFn: async (args) => {
+      received = args;
+      return completeCommittedEvidence({
+        completeness: "unavailable",
+        reasons: [{ code: "review_target_unresolved" }]
+      });
+    },
+    now: () => 1_000
+  });
+  const context = { binder, coherence: COHERENCE.HELD };
+  const beforeState = await runBefore(context);
+  assert.equal(beforeState.status, "collected");
+  assert.deepEqual(received.frozen, { headCommit: "1".repeat(40), baseCommit: null });
+});

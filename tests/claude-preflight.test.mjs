@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  FLAG_PROBE_STATUS,
   MINIMUM_RESTRICTED_CLAUDE_VERSION,
   PREFLIGHT_STATUS,
   REQUIRED_RESTRICTED_FLAG,
   claudeVersionSatisfies,
   compareClaudeVersions,
   evaluateClaudePreflight,
+  evaluateFlagProbe,
   parseClaudeVersion
 } from "../src/claude-preflight.mjs";
+import { buildClaudeArgs } from "../src/claude-invocation.mjs";
 
 /**
  * Readiness is a claim that the first request will work, and presence of an
@@ -18,10 +21,14 @@ import {
  * the diagnostic had checked.
  *
  * Four outcomes are kept distinct because they call for different actions:
- * install Claude Code, upgrade it, investigate a build that does not advertise
- * what its version implies, or investigate one whose version cannot be read at
- * all. Collapsing them into a boolean would tell an operator nothing about what
+ * install Claude Code, upgrade it, investigate a build that positively rejects
+ * the required flag, or investigate one whose version cannot be read at all.
+ * Collapsing them into a boolean would tell an operator nothing about what
  * to do next.
+ *
+ * Help text is deliberately not one of the refuting signals: it is not a
+ * capability API, so its silence about the flag is inconclusive. Only the
+ * binary itself rejecting the flag probe reports a missing capability.
  *
  * Every case here is decided from observed text, so the whole matrix runs
  * without invoking a model, spending a token, or needing a credential.
@@ -105,15 +112,97 @@ test("a malformed version is unreadable, never treated as old or as new", () => 
   assert.equal(result.reason, "claude_version_unparsable");
 });
 
-test("a build whose help lacks the required flag is not ready, whatever its version says", () => {
+test("help text that omits the flag is inconclusive, never a missing capability", () => {
+  // The P2 regression: absence from `--help` used to report the capability
+  // missing. Help output is not a capability API, so a version-satisfying
+  // build with silent help is ready-but-unverified.
   const result = evaluateClaudePreflight({
     versionText: "9.9.9 (Claude Code)",
     helpText: HELP_WITHOUT_FLAG
   });
+  assert.equal(result.status, PREFLIGHT_STATUS.READY);
+  assert.equal(result.ready, true);
+  assert.equal(result.capabilityVerified, false);
+  assert.match(result.message, /neither the flag probe nor the help text confirmed/u);
+});
+
+test("a clean flag probe verifies the capability even when help is silent", () => {
+  const result = evaluateClaudePreflight({
+    versionText: "9.9.9 (Claude Code)",
+    helpText: HELP_WITHOUT_FLAG,
+    flagProbe: { status: 0, output: "Usage: claude [options]\n" }
+  });
+  assert.equal(result.status, PREFLIGHT_STATUS.READY);
+  assert.equal(result.ready, true);
+  assert.equal(result.capabilityVerified, true);
+});
+
+test("only the binary rejecting the flag probe reports a missing capability", () => {
+  const result = evaluateClaudePreflight({
+    versionText: "9.9.9 (Claude Code)",
+    helpText: HELP_WITH_FLAG,
+    flagProbe: { status: 1, output: "error: unknown option '--restricted'\n" }
+  });
   assert.equal(result.status, PREFLIGHT_STATUS.MISSING_REQUIRED_CAPABILITY);
   assert.equal(result.ready, false);
-  assert.equal(result.reason, "claude_required_flag_absent");
+  assert.equal(result.reason, "claude_required_flag_rejected");
   assert.equal(result.requiredFlag, REQUIRED_RESTRICTED_FLAG);
+});
+
+test("an inconclusive probe leaves a version-satisfying build ready-but-unverified", () => {
+  const inconclusive = [
+    undefined,
+    { status: null, output: undefined },
+    { status: 1, output: "" },
+    { status: 1, output: "some crash without diagnostics\n" },
+    // A rejection naming a different token is not a verdict about this flag.
+    { status: 1, output: "error: unknown option '--frobnicate'\nUsage: claude [options]\n" }
+  ];
+  for (const flagProbe of inconclusive) {
+    const result = evaluateClaudePreflight({
+      versionText: "9.9.9 (Claude Code)",
+      helpText: HELP_WITHOUT_FLAG,
+      flagProbe
+    });
+    assert.equal(result.status, PREFLIGHT_STATUS.READY, JSON.stringify(flagProbe));
+    assert.equal(result.ready, true, JSON.stringify(flagProbe));
+    assert.equal(result.capabilityVerified, false, JSON.stringify(flagProbe));
+  }
+});
+
+test("the flag probe needs a non-zero exit, a diagnostic, and the flag's name", () => {
+  assert.equal(
+    evaluateFlagProbe({ status: 0, output: "Usage: claude [options]\n" }),
+    FLAG_PROBE_STATUS.RECOGNIZED
+  );
+  // Commander-style rejection.
+  assert.equal(
+    evaluateFlagProbe({ status: 1, output: "error: unknown option '--restricted'\n" }),
+    FLAG_PROBE_STATUS.REJECTED
+  );
+  // Yargs-style rejection, without dashes.
+  assert.equal(
+    evaluateFlagProbe({ status: 1, output: "Unrecognized argument: restricted\n" }),
+    FLAG_PROBE_STATUS.REJECTED
+  );
+  // A non-zero exit alone is a crash, not a verdict.
+  assert.equal(
+    evaluateFlagProbe({ status: 1, output: "Usage: claude [options]\n" }),
+    FLAG_PROBE_STATUS.UNKNOWN
+  );
+  // A diagnostic about another token is not a verdict about this flag, even
+  // when a usage dump nearby happens to list it.
+  assert.equal(
+    evaluateFlagProbe({
+      status: 1,
+      output: "error: unknown option '--frobnicate'\n" + HELP_WITH_FLAG + "\n"
+    }),
+    FLAG_PROBE_STATUS.UNKNOWN
+  );
+  // No observation at all: timeouts and spawn failures stay unknown.
+  for (const observation of [undefined, null, {}, { status: null }, { status: 1 }]) {
+    assert.equal(evaluateFlagProbe(observation), FLAG_PROBE_STATUS.UNKNOWN, JSON.stringify(observation));
+  }
 });
 
 test("an absent executable is unavailable, and is not confused with an old one", () => {
@@ -131,6 +220,22 @@ test("readiness that rested only on a version says so rather than implying more"
   assert.equal(result.status, PREFLIGHT_STATUS.READY);
   assert.equal(result.ready, true);
   assert.equal(result.capabilityVerified, false, "an unverified capability must not read as verified");
+});
+
+test("the runtime launches exactly the flag the preflight probes for", () => {
+  // Import-based, not literal-based: production cannot skew onto a different
+  // flag string than the readiness check verifies.
+  const args = buildClaudeArgs(
+    {
+      model: "opus",
+      reasoningEffort: "high",
+      permissionMode: "default",
+      toolNames: ["Bash"],
+      disallowedTools: ["mcp__*"]
+    },
+    "settings.json"
+  );
+  assert.ok(args.includes(REQUIRED_RESTRICTED_FLAG));
 });
 
 test("when the flag is not required, the version floor does not apply", () => {

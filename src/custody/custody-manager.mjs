@@ -18,7 +18,7 @@ import {
   ownershipDirectoryIn,
   pathIsAtOrWithin,
   publishRecord,
-  readAuthoritativeRecord,
+  readOwnershipSlot,
   readOwnershipSnapshot,
   repositoryStateDirectoryIn,
   worktreeDirectoryIn
@@ -63,13 +63,15 @@ import {
  *
  * Two kinds of evidence are deliberately kept apart. Durable evidence
  * (PID + StartTime written to the record) survives a restart and can be checked
- * by any later coordinator. Live evidence (#liveIdentities, #supervisedSpawns)
- * is in-memory only: it lets this coordinator terminalize a child it actually
- * spawned and watched, and it vanishes on restart, which is exactly why a
- * restarted coordinator stays fail-closed instead of inheriting a claim.
+ * by any later coordinator. Live evidence (#liveIdentities, #supervisedSpawns,
+ * #helperNotes) is in-memory only: it lets this coordinator terminalize a
+ * child it actually spawned and watched, and it vanishes on restart, which is
+ * exactly why a restarted coordinator stays fail-closed instead of inheriting
+ * a claim.
  */
 export class DurableWriteCustodyManager {
   #stateRoot;
+  #platform;
   #inspectProcess;
   #currentPid;
   #now;
@@ -78,6 +80,8 @@ export class DurableWriteCustodyManager {
   #afterPublicationIssued;
   #renamePath;
   #retryPolicy;
+  #lstatFn;
+  #readFileFn;
   // Each manager represents one live coordinator. A repository's authoritative
   // read/validate/publish/archive transaction is serialized here, but external
   // process observation is deliberately performed before entering this queue.
@@ -87,6 +91,15 @@ export class DurableWriteCustodyManager {
   // in-memory: after a restart it is empty, so a SPAWNING record without a
   // durable child identity stays fail-closed exactly as before.
   #supervisedSpawns = new Map();
+  // What this live coordinator's termination flow reported about a destructive
+  // taskkill helper it may have launched for one supervised execution, keyed
+  // by repository. Purely in-memory, like #liveIdentities: a cancelled request
+  // may no longer mutate durable state, so the launch fact of a termination
+  // whose record stays TERMINATING can only travel in memory. Entries are
+  // {#executionId, launched, closeProven, helpers} unions - a launch, once
+  // reported, is never un-reported - and a stale entry for a previous
+  // execution is ignored by executionId match, exactly like #supervisedSpawns.
+  #helperNotes = new Map();
 
   constructor({
     stateRoot,
@@ -108,9 +121,15 @@ export class DurableWriteCustodyManager {
     renamePath,
     // Overrides the bounded publication-retry policy. Production uses the
     // default, which is a single attempt off Windows.
-    retryPolicy
+    retryPolicy,
+    // Test seams for the filesystem reads behind every authoritative slot
+    // observation, so a concurrent rename/archive interleaving can be
+    // exercised deterministically. Production leaves them undefined.
+    lstatFn,
+    readFileFn
   } = {}) {
     this.#stateRoot = path.resolve(stateRoot || defaultDurableStateRoot({ env, platform }));
+    this.#platform = platform;
     this.#inspectProcess = inspectProcess;
     this.#currentPid = currentPid;
     this.#now = now;
@@ -119,6 +138,8 @@ export class DurableWriteCustodyManager {
     this.#afterPublicationIssued = afterPublicationIssued;
     this.#renamePath = renamePath;
     this.#retryPolicy = retryPolicy;
+    this.#lstatFn = lstatFn;
+    this.#readFileFn = readFileFn;
   }
 
   /**
@@ -129,6 +150,18 @@ export class DurableWriteCustodyManager {
     return {
       ...(this.#renamePath ? { renamePath: this.#renamePath } : {}),
       ...(this.#retryPolicy ? { retryPolicy: this.#retryPolicy } : {})
+    };
+  }
+
+  /**
+   * The read seams every authoritative slot observation in this manager
+   * shares. Undefined entries fall back to the store's own production
+   * defaults.
+   */
+  #readSeams() {
+    return {
+      ...(this.#lstatFn ? { lstatFn: this.#lstatFn } : {}),
+      ...(this.#readFileFn ? { readFileFn: this.#readFileFn } : {})
     };
   }
 
@@ -573,8 +606,25 @@ export class DurableWriteCustodyManager {
   }
 
   #normalizeDestructiveHelper(evidence) {
-    if (!evidence || typeof evidence !== "object" || evidence.launched !== true) {
-      throw new WriteCustodyError("Destructive helper evidence must state that a helper was launched.", {
+    if (!evidence || typeof evidence !== "object") {
+      throw new WriteCustodyError("Destructive helper evidence must be an object.", {
+        code: "write_custody_terminal_proof_invalid"
+      });
+    }
+    // Positive never-launched evidence: termination proved no destructive
+    // helper was launched for this child. It stands alone; a quiescence proof
+    // or an identity attached to "never launched" is a contradiction and is
+    // refused rather than stored.
+    if (evidence.launched === false) {
+      if (evidence.closeProven === true || evidence.helper !== undefined) {
+        throw new WriteCustodyError("Destructive helper evidence contradicts itself.", {
+          code: "write_custody_terminal_proof_invalid"
+        });
+      }
+      return Object.freeze({ launched: false });
+    }
+    if (evidence.launched !== true) {
+      throw new WriteCustodyError("Destructive helper evidence must state whether a helper was launched.", {
         code: "write_custody_terminal_proof_invalid"
       });
     }
@@ -586,6 +636,56 @@ export class DurableWriteCustodyManager {
       normalized.helper = durableProcessIdentity(evidence.helper);
     }
     return Object.freeze(normalized);
+  }
+
+  /**
+   * Records, in memory only, what this coordinator's termination flow reported
+   * about a destructive helper it may have launched for one supervised
+   * execution.
+   *
+   * A cancelled request may no longer mutate durable state, so when its record
+   * stays TERMINATING this note is the only channel by which the launch fact
+   * reaches a later same-session reclaim. It is a union: reports accumulate
+   * per execution, a launch is never un-reported, and helper identities
+   * accumulate rather than overwrite.
+   *
+   * Total: anything malformed - including a bad execution or repository key -
+   * is ignored and reported as false rather than throwing, because a memory
+   * hint must never break retention. Absence of a note is fail-closed
+   * downstream: reclaim treats unknown helper state as unproven.
+   */
+  noteDestructiveHelperEvidence({ executionId, canonicalRootKey, destructiveHelper } = {}) {
+    try {
+      const validId = validExecutionId(executionId);
+      const validRootKey = validIdentityString("canonicalRootKey", canonicalRootKey);
+      const normalized = this.#normalizeDestructiveHelper(destructiveHelper);
+      const repositoryId = repositoryIdForCanonicalRootKey(validRootKey);
+      const previous = this.#helperNotes.get(repositoryId);
+      const helpers = [];
+      const seen = new Set();
+      const collect = (helper) => {
+        if (!helper) return;
+        const key = helper.pid + "\0" + helper.startTime + "\0" + helper.source;
+        if (seen.has(key)) return;
+        seen.add(key);
+        helpers.push(helper);
+      };
+      if (previous && previous.executionId === validId) {
+        for (const helper of previous.helpers) collect(helper);
+      }
+      collect(normalized.helper);
+      this.#helperNotes.set(repositoryId, Object.freeze({
+        executionId: validId,
+        launched: normalized.launched === true ||
+          (previous?.executionId === validId && previous.launched === true),
+        closeProven: normalized.closeProven === true ||
+          (previous?.executionId === validId && previous.closeProven === true),
+        helpers: Object.freeze(helpers)
+      }));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -606,42 +706,86 @@ export class DurableWriteCustodyManager {
    * coordinator can fabricate. The record must name the child it activated. And
    * the exact durable identity - PID together with start time - must be
    * observed gone, so a reused PID reads as reuse rather than as survival; an
-   * ambiguous observation proves nothing and is refused. Finally, no launched
-   * destructive helper may remain unproven: either none was ever launched, its
-   * close was proven before the orphan was recorded, or its own durable
-   * identity is observed gone now.
+   * ambiguous observation proves nothing and is refused. Finally, the helper
+   * side must be settled by positive evidence - a never-launched report, a
+   * proven close, or every known helper identity observed gone - read from the
+   * durable record together with this coordinator's in-memory termination
+   * notes. Unknown helper state refuses: a missing helper field proves nothing.
    *
    * The release is pinned to the execution, repository and revision it was
    * asked about, so it can never reach work that started afterwards.
    */
   /**
-   * Refuses a reclaim while a launched destructive helper may still be
-   * acting. Custody may release only when the exact Claude child is proven
-   * terminated AND no launched taskkill helper remains unproven: either none
-   * was ever launched, its close was proven before the orphan was recorded,
-   * or its durable identity is observed gone now. A launched helper without
-   * an observable identity, or one still alive or ambiguous, keeps the
-   * orphan. Returns undefined when no helper blocks the reclaim.
+   * Refuses a reclaim while a destructive helper may still be acting.
+   *
+   * Custody may release only when the exact Claude child is proven terminated
+   * AND the helper side is settled: the helper was never launched, its close
+   * was proven, or every known exact helper identity is proven gone now.
+   *
+   * Absence of evidence is not evidence of absence. A TERMINATING record
+   * carries no helper field at all, and an orphan may have lost its evidence,
+   * yet a taskkill helper may have been launched in either case - so unknown
+   * helper state refuses. Only a positive never-launched report, a proven
+   * close, or an exact gone-observation releases, consulting both the durable
+   * record and this coordinator's in-memory termination notes as a
+   * fail-closed union: a launch reported by either side counts, and every
+   * known identity must be proven gone.
+   *
+   * The one structural exception is the platform itself: this coordinator only
+   * ever launches taskkill helpers on Windows, so off Windows "never launched"
+   * is a positive fact about this process, not an inference from a missing
+   * field. Returns undefined when no helper blocks the reclaim.
    */
-  async #refuseUnquiescedHelper(evidence, mutationSignal) {
-    if (!evidence || evidence.launched !== true || evidence.closeProven === true) return undefined;
-    if (!evidence.helper) {
+  async #refuseUnquiescedHelper(snapshot, mutationSignal) {
+    const durable = snapshot.destructiveHelper;
+    // A record that claims never-launched while carrying quiescence proof or
+    // an identity contradicts itself; ambiguity refuses, never releases.
+    if (
+      durable?.launched === false &&
+      (durable.closeProven === true || durable.helper !== undefined)
+    ) {
+      return Object.freeze({ released: false, reason: "destructive-helper-evidence-contradictory" });
+    }
+    const memory = this.#helperNotes.get(snapshot.repositoryId);
+    const memoryApplies = memory?.executionId === snapshot.executionId ? memory : undefined;
+    const launched = durable?.launched === true || memoryApplies?.launched === true;
+    if (!launched) {
+      const neverLaunched = durable?.launched === false ||
+        memoryApplies?.launched === false ||
+        this.#platform !== "win32";
+      if (neverLaunched) return undefined;
+      return Object.freeze({ released: false, reason: "destructive-helper-launch-unproven" });
+    }
+    const closeProven = durable?.closeProven === true || memoryApplies?.closeProven === true;
+    if (closeProven) return undefined;
+    const helpers = [];
+    const seen = new Set();
+    for (const helper of [durable?.helper, ...(memoryApplies?.helpers ?? [])]) {
+      if (!helper) continue;
+      const key = helper.pid + "\0" + helper.startTime + "\0" + helper.source;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      helpers.push(helper);
+    }
+    if (helpers.length === 0) {
       return Object.freeze({ released: false, reason: "destructive-helper-evidence-unknown" });
     }
-    const helper = await compareProcessIdentity(evidence.helper, {
-      inspectProcess: this.#inspectProcess,
-      abortSignal: mutationSignal
-    });
-    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-    if (
-      helper.status === PROCESS_IDENTITY_MATCH.SAME_PROCESS ||
-      helper.status === PROCESS_IDENTITY_MATCH.AMBIGUOUS
-    ) {
-      return Object.freeze({
-        released: false,
-        reason: "destructive-helper-quiescence-unproven",
-        helper: helper.status
+    for (const helper of helpers) {
+      const comparison = await compareProcessIdentity(helper, {
+        inspectProcess: this.#inspectProcess,
+        abortSignal: mutationSignal
       });
+      if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+      if (
+        comparison.status === PROCESS_IDENTITY_MATCH.SAME_PROCESS ||
+        comparison.status === PROCESS_IDENTITY_MATCH.AMBIGUOUS
+      ) {
+        return Object.freeze({
+          released: false,
+          reason: "destructive-helper-quiescence-unproven",
+          helper: comparison.status
+        });
+      }
     }
     return undefined;
   }
@@ -684,7 +828,7 @@ export class DurableWriteCustodyManager {
       // Still running, or unknowable. Neither is proof, so the orphan stays.
       return Object.freeze({ released: false, reason: "claude-not-proven-gone", claude: claude.status });
     }
-    const helperRefusal = await this.#refuseUnquiescedHelper(snapshot.destructiveHelper, mutationSignal);
+    const helperRefusal = await this.#refuseUnquiescedHelper(snapshot, mutationSignal);
     if (helperRefusal) return helperRefusal;
 
     return await this.#withRepositoryMutation(validRootKey, async ({ publicationGuard }) => {
@@ -712,9 +856,11 @@ export class DurableWriteCustodyManager {
 
   async getWriteAccess(canonicalRootKey) {
     return await this.#withRepositoryMutation(canonicalRootKey, async () => {
-      const ownershipDirectory = ownershipDirectoryIn(this.repositoryStateDirectory(canonicalRootKey));
-      if (!(await exists(ownershipDirectory))) return undefined;
-      return recordSnapshot(await readAuthoritativeRecord(ownershipDirectory));
+      return await readOwnershipSnapshot(
+        this.repositoryStateDirectory(canonicalRootKey),
+        canonicalRootKey,
+        this.#readSeams()
+      );
     });
   }
 
@@ -829,6 +975,7 @@ export class DurableWriteCustodyManager {
     const released = await this.#archive(current, options);
     this.#liveIdentities.delete(current.repositoryId);
     this.#supervisedSpawns.delete(current.repositoryId);
+    this.#helperNotes.delete(current.repositoryId);
     return released;
   }
 
@@ -838,7 +985,8 @@ export class DurableWriteCustodyManager {
       record,
       mutationSignal,
       publicationGuard,
-      ...this.#publicationSeams()
+      ...this.#publicationSeams(),
+      ...this.#readSeams()
     });
   }
 
@@ -904,7 +1052,8 @@ export class DurableWriteCustodyManager {
       afterPublicationIssued: this.#afterPublicationIssued,
       mutationSignal,
       publicationGuard,
-      ...this.#publicationSeams()
+      ...this.#publicationSeams(),
+      ...this.#readSeams()
     });
   }
 
@@ -912,12 +1061,13 @@ export class DurableWriteCustodyManager {
     const validId = validExecutionId(executionId);
     const validRootKey = validIdentityString("canonicalRootKey", canonicalRootKey);
     const ownershipDirectory = ownershipDirectoryIn(this.repositoryStateDirectory(validRootKey));
-    if (!(await exists(ownershipDirectory))) {
+    const slot = await readOwnershipSlot(ownershipDirectory, this.#readSeams());
+    if (!slot.found) {
       throw new WriteCustodyError("No durable write custody exists for the requested repository.", {
         code: "write_custody_missing"
       });
     }
-    const record = await readAuthoritativeRecord(ownershipDirectory);
+    const record = slot.record;
     if (record.executionId !== validId || record.canonicalRootKey !== validRootKey) {
       throw new WriteCustodyError("Only the owning execution may change durable write custody.", {
         code: "write_custody_owner_mismatch"
@@ -929,7 +1079,8 @@ export class DurableWriteCustodyManager {
   async #ownershipSnapshot(canonicalRootKey) {
     return await readOwnershipSnapshot(
       this.repositoryStateDirectory(canonicalRootKey),
-      canonicalRootKey
+      canonicalRootKey,
+      this.#readSeams()
     );
   }
 

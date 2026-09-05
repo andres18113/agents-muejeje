@@ -710,13 +710,21 @@ function failedStatus(error) {
 
 /**
  * Carries taskkill-helper evidence from a termination result into the orphan
- * record, so same-session reclaim can later observe the helper's quiescence
- * instead of assuming it. Absent unless a helper was actually launched; the
- * custody manager treats absent as never-launched and a launched-but-unproven
- * helper without an observable identity as fail-closed.
+ * record and the coordinator's memory, so same-session reclaim can later
+ * observe the helper's quiescence instead of assuming it.
+ *
+ * Three outcomes, never two. A result that launched a helper carries that
+ * launch with its quiescence proof or its re-observable identity. A final
+ * result that launched no helper is positive never-launched evidence: this
+ * coordinator's only taskkill launcher is the termination call this result
+ * settles, and the default adapter begins no destructive action after it
+ * settles (an outer timeout aborts the inner call first, and an aborted call
+ * must not launch). No result at all means no termination knowledge, which
+ * stays absent - unknown, never never-launched - and fails closed downstream.
  */
 function destructiveHelperEvidenceFromTermination(terminationResult) {
-  if (terminationResult?.taskkillLaunched !== true) return undefined;
+  if (!terminationResult || typeof terminationResult !== "object") return undefined;
+  if (terminationResult.taskkillLaunched !== true) return { launched: false };
   return {
     launched: true,
     closeProven: terminationResult.taskkillHelperQuiescenceProven === true,
@@ -1757,7 +1765,15 @@ export async function delegateAgent(input, dependencies = {}) {
           cancel: dependencies.cancelTerminalSettlement
         })
       : undefined;
-    lifecycleEvidence = error;
+    // A request stop replaces the runner's own outcome with the stop itself,
+    // but the settled runner attempt above may still carry the termination the
+    // runner reached while reacting to that stop. That settled result - when
+    // one exists - is authoritative for retention: it settles whether a
+    // destructive helper was launched. The stop error itself says nothing
+    // about termination, so it must not erase a settled answer.
+    lifecycleEvidence = error?.terminationResult !== undefined
+      ? error
+      : (runnerEvidence?.terminationResult !== undefined ? runnerEvidence : error);
     lateTerminalRecoveryAllowed = error?.lateRecoveryAllowed === true;
     if (!executionWorkspace.workspaceRoot && typeof error?.worktreeRoot === "string") {
       retainedWorktreeRoot = error.worktreeRoot;
@@ -1965,13 +1981,27 @@ export async function delegateAgent(input, dependencies = {}) {
       lateReviewReleaseArmed = Boolean(lateReviewPublicationSettlement);
       if (outcome) outcome.custodyState = custodyState;
     };
+    // The helper launch fact is noted in memory before any retention mutation
+    // runs, so it survives every path below: a cancelled request whose record
+    // stays TERMINATING can no longer write durably, yet its termination
+    // result - when one exists - still settles whether a helper was launched.
+    // A later same-session reclaim reads this note together with the durable
+    // record. Custody doubles without the channel simply skip it.
+    const helperEvidence = destructiveHelperEvidenceFromTermination(lifecycleEvidence?.terminationResult);
+    if (helperEvidence !== undefined) {
+      writeCustody.noteDestructiveHelperEvidence?.({
+        executionId,
+        canonicalRootKey: workspace.canonicalRepositoryKey,
+        destructiveHelper: helperEvidence
+      });
+    }
     const markOrphaned = async (reason) => await requestContext.observe("custody-retention", () =>
       writeCustody.markOrphanedWriteAccess({
         executionId,
         canonicalRootKey: workspace.canonicalRepositoryKey,
         processIdentity: writerProcessIdentity,
         reason,
-        destructiveHelper: destructiveHelperEvidenceFromTermination(lifecycleEvidence?.terminationResult),
+        destructiveHelper: helperEvidence,
         mutationSignal: requestContext.abortSignal
       })
     );

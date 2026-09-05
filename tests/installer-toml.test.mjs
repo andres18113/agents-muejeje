@@ -5,9 +5,27 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { MINIMUM_RESTRICTED_CLAUDE_VERSION } from "../src/claude-preflight.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installerScriptPath = path.join(repoRoot, "install-codex.ps1");
+
+let cachedPwshAvailable;
+function pwshAvailable() {
+  if (cachedPwshAvailable === undefined) {
+    try {
+      const probe = spawnSync("pwsh", ["-NoProfile", "-Command", "'ok'"], {
+        encoding: "utf8",
+        timeout: 30_000,
+        windowsHide: true
+      });
+      cachedPwshAvailable = probe.status === 0 && probe.stdout.trim() === "ok";
+    } catch {
+      cachedPwshAvailable = false;
+    }
+  }
+  return cachedPwshAvailable;
+}
 
 async function extractUpdateFunction() {
   const scriptContent = await readFile(installerScriptPath, "utf8");
@@ -204,5 +222,58 @@ test("installer TOML: repeated execution is strictly idempotent", async () => {
     assert.equal(thirdPass, firstPass, "Third run must be byte-identical to first run");
   } finally {
     await rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("installer Claude floor matches the preflight minimum version", async () => {
+  // The installer is PowerShell and cannot import the module, so the literal
+  // is duplicated - and pinned here so the two cannot skew silently.
+  const scriptContent = await readFile(installerScriptPath, "utf8");
+  const match = scriptContent.match(/\$ClaudeMinimumVersion = "([^"]+)"/);
+  assert.ok(match, "install-codex.ps1 must declare $ClaudeMinimumVersion");
+  assert.equal(match[1], MINIMUM_RESTRICTED_CLAUDE_VERSION);
+  assert.ok(
+    scriptContent.includes("or newer is required for --restricted"),
+    "the installer must refuse a Claude below the floor instead of only printing its version"
+  );
+});
+
+async function extractVersionGateFunction() {
+  const scriptContent = await readFile(installerScriptPath, "utf8");
+  const match = scriptContent.match(/function Test-ClaudeMinimumVersion\s*\{[\s\S]*?\n\}/);
+  assert.ok(match, "Test-ClaudeMinimumVersion function definition must exist in install-codex.ps1");
+  return match[0];
+}
+
+function runPowerShellVersionGate({ fnDef, versionLine, minimum }) {
+  const literal = (value) => "'" + String(value).replaceAll("'", "''") + "'";
+  const psScript = `
+${fnDef}
+Test-ClaudeMinimumVersion -VersionLine ${literal(versionLine)} -Minimum ${literal(minimum)}
+`;
+  const res = spawnSync("pwsh", ["-NoProfile", "-Command", psScript], {
+    encoding: "utf8",
+    windowsHide: true
+  });
+  assert.equal(res.status, 0, "PowerShell execution failed: " + res.stderr);
+  return res.stdout.trim();
+}
+
+// The gate's logic runs in PowerShell, so this case matrix needs a pwsh to
+// execute it; the literal pin above still runs everywhere.
+test("installer Claude floor compares numerically and never guesses", { skip: !pwshAvailable() }, async () => {
+  const fnDef = await extractVersionGateFunction();
+  const check = (versionLine, minimum, expected) =>
+    assert.equal(runPowerShellVersionGate({ fnDef, versionLine, minimum }), expected, versionLine);
+  check("2.1.248 (Claude Code)", "2.1.248", "ok");
+  check("2.1.260 (Claude Code)", "2.1.248", "ok");
+  check("10.0.0", "2.1.248", "ok");
+  // The case a string comparison gets wrong.
+  check("2.1.9 (Claude Code)", "2.1.248", "below");
+  check("2.1.247 (Claude Code)", "2.1.248", "below");
+  check("1.9.9 (Claude Code)", "2.1.248", "below");
+  // Unparsable is unknown, never ok and never below.
+  for (const versionLine of ["", "unknown", "Claude Code", "v2"]) {
+    check(versionLine, "2.1.248", "unknown");
   }
 });

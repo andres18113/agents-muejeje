@@ -174,6 +174,13 @@ export function createReviewBinder({
         repositoryRoot: workspace.repositoryRoot,
         repositoryId: repositoryIdForCanonicalRootKey(workspace.canonicalRepositoryKey),
         target: { spec: targetSpec },
+        // BEFORE's exact captures, frozen: the evidence must derive from
+        // these OIDs rather than re-resolving the mutable refs, or a ref
+        // that moves between the two resolutions corrupts the bound subject.
+        frozen: {
+          headCommit: current.descriptor.head.commit ?? null,
+          baseCommit: current.descriptor.target.commit ?? null
+        },
         requestContext
       });
     } catch (error) {

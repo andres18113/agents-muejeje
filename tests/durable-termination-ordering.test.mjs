@@ -739,3 +739,168 @@ test("execution deadline during SPAWNING to ACTIVE publication cancels activatio
     assert.ok(child.killCalls >= 1);
   });
 });
+
+/**
+ * P1-5: the taskkill helper's PID+StartTime identity is captured immediately
+ * after spawn, before the close wait consumes the deadline. A helper that
+ * outlives the synchronous bound keeps that spawn-time identity, so a later
+ * exact observation can still prove it gone; reclaim then waits for that
+ * proof instead of releasing on the target's death or refusing forever.
+ */
+function terminateWithNeverClosingHelper({ helperPid, helperInspect, clock = manualClock() }) {
+  const child = stalledChild();
+  const identity = childIdentityFor(child);
+  const terminalObserver = observeChildTerminal(child, identity);
+  const inspectProcess = async (pid) => (
+    pid === helperPid ? helperInspect(pid) : aliveObservation(pid, String(pid * 100))
+  );
+  const helper = new EventEmitter();
+  helper.pid = helperPid;
+  const terminationContext = {};
+  const promise = terminateClaudeChild(child, {
+    platform: "win32",
+    spawnTerminator: () => helper,
+    terminalObserver,
+    processIdentity: identity,
+    terminationContext,
+    inspectProcess,
+    now: clock.now,
+    schedule: clock.schedule,
+    cancelSchedule: clock.cancelSchedule
+  });
+  return { promise, terminationContext, clock };
+}
+
+test("a helper that outlives the close wait keeps the identity captured at spawn", async () => {
+  const helperPid = 80_001;
+  const helperStartTime = "8000100";
+  const clock = manualClock();
+  const spawnTime = clock.now();
+  let helperObservations = 0;
+  const { promise } = terminateWithNeverClosingHelper({
+    clock,
+    helperPid,
+    helperInspect: async () => {
+      helperObservations += 1;
+      // Alive at spawn, gone once the close wait consumed the deadline: a
+      // capture started only after that wait observes DEAD and loses the
+      // identity reclaim needs. The manual clock only moves on advanceTo, so
+      // reading it here distinguishes spawn-time from post-wait observation.
+      return clock.now() === spawnTime
+        ? aliveObservation(helperPid, helperStartTime)
+        : Object.freeze({ status: "dead" });
+    }
+  });
+
+  // Let the identity gate, the launch, and the spawn-time capture settle
+  // before expiring any deadline: a synchronous advance would win the race
+  // against their microtasks and deny the gate. Neither the target nor the
+  // helper ever closes afterwards.
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advanceTo(1_000_000);
+  const result = await promise;
+
+  assert.equal(result.method, "taskkill");
+  assert.equal(result.taskkillLaunched, true);
+  assert.equal(result.taskkillHelperQuiescenceProven, false);
+  assert.deepEqual(
+    { ...result.taskkillHelperIdentity },
+    { pid: helperPid, startTime: helperStartTime, source: identitySource }
+  );
+  assert.equal(helperObservations, 1, "the helper is observed once, at spawn - never re-queried after the wait");
+});
+
+test("an ambiguous spawn-time helper observation leaves the helper unobservable", async () => {
+  const helperPid = 80_002;
+  const { promise, clock } = terminateWithNeverClosingHelper({
+    helperPid,
+    helperInspect: async () => Object.freeze({ status: "ambiguous", reason: "query-failed" })
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advanceTo(1_000_000);
+  const result = await promise;
+
+  assert.equal(result.taskkillLaunched, true);
+  assert.equal(result.taskkillHelperQuiescenceProven, false);
+  assert.equal(
+    result.taskkillHelperIdentity,
+    undefined,
+    "ambiguity establishes no identity; reclaim must stay fail-closed"
+  );
+});
+
+test("an outer termination timeout keeps a spawn-time identity that already resolved", async () => {
+  const clock = manualClock();
+  const child = stalledChild();
+  const helperIdentity = Object.freeze({ pid: 80_003, startTime: "8000300", source: identitySource });
+  const initialTime = clock.now();
+  const error = await (async () => {
+    const promise = terminateStartedChild({
+      child,
+      processIdentity: undefined,
+      terminalObserver: observeChildTerminal(child, undefined),
+      originalError: new ClaudeTimeoutError(1_000),
+      terminateChild: (target, options) => {
+        // The inner termination launched a helper and published its
+        // spawn-time capture, then stalled past the outer bound.
+        options.terminationContext.taskkillLaunched = true;
+        options.terminationContext.taskkillHelperCloseProven = false;
+        options.terminationContext.taskkillHelperIdentityCapture = Object.freeze({
+          promise: Promise.resolve(helperIdentity),
+          getResolved: () => helperIdentity,
+          cancel: () => {}
+        });
+        return new Promise(() => {});
+      },
+      terminationTimeoutMs: 200,
+      inspectProcess: inspectAlive,
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancelSchedule
+    });
+    clock.advanceTo(initialTime + 200);
+    return await promise;
+  })();
+
+  assert.equal(error.code, "claude_termination_unproven");
+  assert.equal(error.terminationResult.taskkillLaunched, true);
+  assert.deepEqual({ ...error.terminationResult.taskkillHelperIdentity }, { ...helperIdentity });
+});
+
+test("an outer termination timeout does not wait for a still-pending identity capture", async () => {
+  const clock = manualClock();
+  const child = stalledChild();
+  const initialTime = clock.now();
+  const error = await (async () => {
+    const promise = terminateStartedChild({
+      child,
+      processIdentity: undefined,
+      terminalObserver: observeChildTerminal(child, undefined),
+      originalError: new ClaudeTimeoutError(1_000),
+      terminateChild: (target, options) => {
+        options.terminationContext.taskkillLaunched = true;
+        options.terminationContext.taskkillHelperCloseProven = false;
+        options.terminationContext.taskkillHelperIdentityCapture = Object.freeze({
+          promise: new Promise(() => {}),
+          getResolved: () => undefined,
+          cancel: () => {}
+        });
+        return new Promise(() => {});
+      },
+      terminationTimeoutMs: 200,
+      inspectProcess: inspectAlive,
+      now: clock.now,
+      schedule: clock.schedule,
+      cancelSchedule: clock.cancelSchedule
+    });
+    // The expired deadline alone settles the report; nothing waits for the
+    // capture, and no identity is invented for it.
+    clock.advanceTo(initialTime + 200);
+    return await promise;
+  })();
+
+  assert.equal(error.code, "claude_termination_unproven");
+  assert.equal(error.terminationResult.taskkillLaunched, true);
+  assert.equal(error.terminationResult.taskkillHelperIdentity, undefined);
+});

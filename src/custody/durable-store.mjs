@@ -100,13 +100,33 @@ export async function exists(pathname, { mutationSignal } = {}) {
   }
 }
 
-async function requirePlainDirectory(pathname, description) {
-  const details = await lstat(pathname);
+async function requirePlainDirectory(pathname, description, lstatFn = lstat) {
+  const details = await lstatFn(pathname);
   if (!details.isDirectory() || details.isSymbolicLink()) {
     throw new WriteCustodyError(description + " is not a plain directory.", {
       code: "write_custody_state_ambiguous"
     });
   }
+}
+
+/**
+ * Reads the raw record bytes out of an ownership or history directory once.
+ *
+ * A vanishing slot surfaces as a raw ENOENT so the stable loop can tell "gone
+ * mid-read, observe again" apart from "stably invalid". Anything else
+ * unexpected - a symlink, an oversized file - is ambiguous state rather than
+ * "no owner", because "no owner" would admit a second writer.
+ */
+async function readSlotBytes(ownershipDirectory, { lstatFn, readFileFn }) {
+  await requirePlainDirectory(ownershipDirectory, "Durable ownership state", lstatFn);
+  const recordPath = path.join(ownershipDirectory, RECORD_FILE_NAME);
+  const details = await lstatFn(recordPath);
+  if (!details.isFile() || details.isSymbolicLink() || details.size <= 0 || details.size > MAX_RECORD_BYTES) {
+    throw new WriteCustodyError("Durable ownership record is not a plain file.", {
+      code: "write_custody_state_ambiguous"
+    });
+  }
+  return await readFileFn(recordPath, "utf8");
 }
 
 /**
@@ -118,15 +138,9 @@ async function requirePlainDirectory(pathname, description) {
  */
 export async function readAuthoritativeRecord(ownershipDirectory) {
   try {
-    await requirePlainDirectory(ownershipDirectory, "Durable ownership state");
-    const recordPath = path.join(ownershipDirectory, RECORD_FILE_NAME);
-    const details = await lstat(recordPath);
-    if (!details.isFile() || details.isSymbolicLink() || details.size <= 0 || details.size > MAX_RECORD_BYTES) {
-      throw new WriteCustodyError("Durable ownership record is not a plain file.", {
-        code: "write_custody_state_ambiguous"
-      });
-    }
-    const record = normalizeOwnershipRecord(JSON.parse(await readFile(recordPath, "utf8")));
+    const record = normalizeOwnershipRecord(
+      JSON.parse(await readSlotBytes(ownershipDirectory, { lstatFn: lstat, readFileFn: readFile }))
+    );
     if (!record) throw new Error("invalid ownership schema");
     return record;
   } catch (error) {
@@ -136,6 +150,98 @@ export async function readAuthoritativeRecord(ownershipDirectory) {
       cause: error
     });
   }
+}
+
+export const STABLE_READ_MAX_ATTEMPTS = 3;
+
+async function lstatOrUndefined(pathname, lstatFn) {
+  try {
+    return await lstatFn(pathname);
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function malformedSlotError(cause) {
+  return new WriteCustodyError("Durable ownership state is missing or malformed; write admission is blocked.", {
+    code: "write_custody_state_ambiguous",
+    cause
+  });
+}
+
+/**
+ * Reads one ownership slot as a coherent snapshot.
+ *
+ * An exists-then-read sequence is a race: the slot may be renamed away
+ * (archived) or replaced (published) between the probe and the read, and the
+ * resulting ENOENT is then evidence of a concurrent handoff, not of a free
+ * repository. Turning that transient ENOENT into "free" would admit a second
+ * writer; turning it directly into "ambiguous" blocks admission on a race the
+ * store itself created.
+ *
+ * So the observation restarts instead. Absence is reported only when it is
+ * stable across two probes, and a record is returned only when two full reads
+ * agree byte for byte. Revisions are monotonic, so equal bytes rule out an
+ * interleaving publication - there is no ABA at byte level. A stably invalid
+ * record (unparsable, wrong shape, not a plain file) is ambiguous
+ * immediately: publications land atomically, so transient malformation is
+ * impossible and retrying it would only launder a real inconsistency. A slot
+ * that keeps changing past the bounded attempts is ambiguous too, rather than
+ * retried without limit.
+ *
+ * Stability here is best-effort within the read; the compare-and-set on
+ * revision before every publication remains the authoritative guard against a
+ * change that lands after this function returns.
+ */
+export async function readOwnershipSlot(
+  ownershipDirectory,
+  { lstatFn = lstat, readFileFn = readFile, mutationSignal } = {}
+) {
+  for (let attempt = 1; attempt <= STABLE_READ_MAX_ATTEMPTS; attempt += 1) {
+    if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
+    if ((await lstatOrUndefined(ownershipDirectory, lstatFn)) === undefined) {
+      // Only stable absence is "free": confirm the slot did not appear during
+      // this very observation.
+      if ((await lstatOrUndefined(ownershipDirectory, lstatFn)) === undefined) {
+        return { found: false };
+      }
+      continue;
+    }
+    let recordBytes;
+    try {
+      recordBytes = await readSlotBytes(ownershipDirectory, { lstatFn, readFileFn });
+    } catch (error) {
+      // The slot vanished mid-read: a concurrent handoff, not a free
+      // repository and not an inconsistency. Observe again.
+      if (error?.code === "ENOENT") continue;
+      if (error instanceof WriteCustodyError) throw error;
+      throw malformedSlotError(error);
+    }
+    let record;
+    try {
+      record = normalizeOwnershipRecord(JSON.parse(recordBytes));
+    } catch (error) {
+      throw malformedSlotError(error);
+    }
+    if (!record) throw malformedSlotError(new Error("invalid ownership schema"));
+    let confirmBytes;
+    try {
+      confirmBytes = await readSlotBytes(ownershipDirectory, { lstatFn, readFileFn });
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      if (error instanceof WriteCustodyError) throw error;
+      throw malformedSlotError(error);
+    }
+    // Changed during the read: restart the observation rather than returning
+    // a record that is already stale.
+    if (confirmBytes !== recordBytes) continue;
+    return { found: true, record };
+  }
+  throw new WriteCustodyError(
+    "Durable ownership state changed during a bounded read; write admission is blocked.",
+    { code: "write_custody_state_ambiguous" }
+  );
 }
 
 async function writeFileDurably(pathname, text, { mutationSignal } = {}) {
@@ -376,7 +482,9 @@ export async function publishRecord({
   mutationSignal,
   publicationGuard,
   renamePath = rename,
-  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
+  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY,
+  lstatFn = lstat,
+  readFileFn = readFile
 }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   if (
@@ -403,7 +511,13 @@ export async function publishRecord({
     }
     await withBoundedPublicationRetry(async () => {
       if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
-      const current = await readAuthoritativeRecord(ownershipDirectory);
+      const slot = await readOwnershipSlot(ownershipDirectory, { lstatFn, readFileFn, mutationSignal });
+      if (!slot.found) {
+        throw new WriteCustodyError("Durable ownership changed before this mutation could publish.", {
+          code: "write_custody_stale_mutation"
+        });
+      }
+      const current = slot.record;
       if (current.executionId !== record.executionId) {
         throw new WriteCustodyError("Only the durable owning execution may update custody.", {
           code: "write_custody_owner_mismatch"
@@ -469,7 +583,9 @@ export async function archiveOwnership({
   mutationSignal,
   publicationGuard,
   renamePath = rename,
-  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY
+  retryPolicy = DEFAULT_PUBLICATION_RETRY_POLICY,
+  lstatFn = lstat,
+  readFileFn = readFile
 }) {
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
   const historyDirectory = executionHistoryDirectoryIn(repositoryState, record.executionId);
@@ -477,13 +593,16 @@ export async function archiveOwnership({
   await mkdir(path.dirname(historyDirectory), { recursive: true });
   if (mutationWasCancelled(mutationSignal)) throw cancelledMutationError();
   // An archive that already exists is accepted only on exact evidence, never on
-  // the mere fact that the destination path is occupied.
+  // the mere fact that the destination path is occupied. Both slots are read
+  // as coherent snapshots: a rename landing between two probes must restart
+  // the observation, never read as a half-moved state.
   const settledArchive = async () => {
-    if (!(await exists(historyDirectory, { mutationSignal }))) return undefined;
-    if (await exists(ownershipDirectory, { mutationSignal })) return undefined;
-    const archived = await readAuthoritativeRecord(historyDirectory);
-    if (!samePublicationAuthority(archived, record) || archived.state !== "RELEASED") return undefined;
-    return recordSnapshot(archived);
+    const history = await readOwnershipSlot(historyDirectory, { lstatFn, readFileFn, mutationSignal });
+    if (!history.found) return undefined;
+    const ownership = await readOwnershipSlot(ownershipDirectory, { lstatFn, readFileFn, mutationSignal });
+    if (ownership.found) return undefined;
+    if (!samePublicationAuthority(history.record, record) || history.record.state !== "RELEASED") return undefined;
+    return recordSnapshot(history.record);
   };
   if (await exists(historyDirectory, { mutationSignal })) {
     const alreadyArchived = await settledArchive();
@@ -507,7 +626,18 @@ export async function archiveOwnership({
           });
         }
       }
-      const current = await readAuthoritativeRecord(ownershipDirectory);
+      const slot = await readOwnershipSlot(ownershipDirectory, { lstatFn, readFileFn, mutationSignal });
+      if (!slot.found) {
+        // The slot moved while this archive was authorizing. Either our own
+        // previous attempt already landed it - settled below - or another
+        // writer moved the record first.
+        const alreadyArchived = await settledArchive();
+        if (alreadyArchived) return alreadyArchived;
+        throw new WriteCustodyError("Durable ownership changed before release could be archived.", {
+          code: "write_custody_stale_mutation"
+        });
+      }
+      const current = slot.record;
       if (current.executionId !== record.executionId) {
         throw new WriteCustodyError("Only the durable owning execution may archive custody.", {
           code: "write_custody_owner_mismatch"
@@ -552,15 +682,19 @@ export async function archiveOwnership({
  * The record must name the repository it was found under; a mismatch means the
  * state tree itself is inconsistent and must block rather than be trusted.
  */
-export async function readOwnershipSnapshot(repositoryState, canonicalRootKey) {
+export async function readOwnershipSnapshot(
+  repositoryState,
+  canonicalRootKey,
+  { lstatFn = lstat, readFileFn = readFile } = {}
+) {
   validIdentityString("canonicalRootKey", canonicalRootKey);
   const ownershipDirectory = ownershipDirectoryIn(repositoryState);
-  if (!(await exists(ownershipDirectory))) return undefined;
-  const record = await readAuthoritativeRecord(ownershipDirectory);
-  if (record.canonicalRootKey !== canonicalRootKey) {
+  const slot = await readOwnershipSlot(ownershipDirectory, { lstatFn, readFileFn });
+  if (!slot.found) return undefined;
+  if (slot.record.canonicalRootKey !== canonicalRootKey) {
     throw new WriteCustodyError("Durable ownership repository identity is inconsistent.", {
       code: "write_custody_state_ambiguous"
     });
   }
-  return recordSnapshot(record);
+  return recordSnapshot(slot.record);
 }

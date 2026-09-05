@@ -71,6 +71,33 @@ function commandOutput(commands, args) {
   return undefined;
 }
 
+/**
+ * The exit status plus the combined output of one probe invocation. The
+ * preflight needs both: a clean exit means the flag was accepted, while a
+ * rejection needs a non-zero exit together with the diagnostic naming the
+ * flag. Anything unobservable - a missing binary, a timeout, a spawn failure -
+ * is undefined, which the preflight reads as inconclusive rather than as a
+ * verdict.
+ */
+function commandProbe(commands, args) {
+  for (const command of commands) {
+    const isWindowsCommandShim = process.platform === "win32" && command.endsWith(".cmd");
+    const executable = isWindowsCommandShim ? (process.env.ComSpec || "cmd.exe") : command;
+    const commandArgs = isWindowsCommandShim ? ["/d", "/s", "/c", command, ...args] : args;
+    const result = spawnSync(executable, commandArgs, {
+      encoding: "utf8",
+      timeout: 15_000,
+      maxBuffer: 4 * 1024 * 1024,
+      windowsHide: true,
+      shell: false
+    });
+    if (result.error?.code === "ENOENT") continue;
+    if (result.error) return undefined;
+    return { status: result.status, output: (result.stdout || "") + (result.stderr || "") };
+  }
+  return undefined;
+}
+
 function readCodexConfiguredTimeout() {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const configPath = path.join(codexHome, "config.toml");
@@ -144,19 +171,26 @@ console.log("timeout-hierarchy", timeoutSafety.safe ? "safe" : "unsafe", timeout
 
 // Presence is not readiness. Production launches with --restricted, so a
 // Claude Code that predates it fails on the first request; reporting such a
-// system as ready would be reporting a system that cannot serve one call.
+// system as ready would be reporting a system that cannot serve one call. The
+// probe asks the binary itself - the flag plus --help, so it answers without
+// doing any work - while the help text stays one-directional corroboration:
+// mentioning the flag confirms it, omitting it proves nothing.
 const claudeHelp = tools.claude.status === "available"
   ? commandOutput(claudeCandidates(), ["--help"])
   : undefined;
+const claudeFlagProbe = tools.claude.status === "available"
+  ? commandProbe(claudeCandidates(), [REQUIRED_RESTRICTED_FLAG, "--help"])
+  : undefined;
 const claudePreflight = evaluateClaudePreflight({
   versionText: tools.claude.status === "available" ? tools.claude.version : undefined,
-  helpText: claudeHelp
+  helpText: claudeHelp,
+  flagProbe: claudeFlagProbe
 });
 console.log(
   "claude-runtime",
   claudePreflight.status,
   claudePreflight.message + (claudePreflight.ready && !claudePreflight.capabilityVerified
-    ? " (version checked; " + REQUIRED_RESTRICTED_FLAG + " not confirmed from help output)"
+    ? " (version checked; " + REQUIRED_RESTRICTED_FLAG + " confirmed by neither the flag probe nor help output)"
     : "")
 );
 console.log("claude-minimum-version", MINIMUM_RESTRICTED_CLAUDE_VERSION);

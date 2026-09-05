@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { delegateAgent } from "../src/delegate-agent.mjs";
-import { EVIDENCE_COMPLETENESS } from "../src/review/committed-evidence.mjs";
+import { EVIDENCE_COMPLETENESS, collectCommittedReviewEvidence } from "../src/review/committed-evidence.mjs";
 import { ReviewReceiptStore } from "../src/review/receipt-store.mjs";
 import { validateReviewReceipt } from "../src/review/receipt-schema.mjs";
 import { DurableWriteCustodyManager } from "../src/write-custody.mjs";
@@ -102,6 +102,11 @@ async function withCommittedRepository(callback) {
     git(repository, ["config", "core.autocrlf", "false"]);
 
     // Commit A, then branch `base` at A, then commit B changing bug.js.
+    // The base branch stays fixed inside each fixture below because those
+    // fixtures pin one frozen delta's shape, identity, and receipt - not ref
+    // mobility. Mobility is covered explicitly, by moving the branch, in the
+    // ABA and moving-target tests: a documented mobile branch must never be
+    // replaced by a silently immobile one where movement is the subject.
     await writeFile(path.join(repository, "bug.js"), "export const answer = 41;\n", "utf8");
     git(repository, ["add", "-A"]);
     git(repository, ["commit", "-m", "A"]);
@@ -254,5 +259,76 @@ test("a committed review whose basis is incomplete refuses to bind a receipt", a
     const codes = outcome.reviewBinding.reasons.map((reason) => reason.code);
     assert.ok(codes.includes("insufficient_review_scope"), codes.join(","));
     assert.match(captured.prompts[0], /Do not report a clean or complete review/u);
+  });
+});
+
+/**
+ * P1-2 end to end, with real Git and a deterministic interleaving: the target
+ * ref moves A->B between BEFORE's resolution and evidence collection and back
+ * B->A before AFTER. The evidence must still describe BEFORE's frozen delta
+ * (base A with the real patch), never the moved ref - and the receipt binds
+ * that frozen delta, not a false FRESH over B.
+ */
+test("a ref that moves between BEFORE and evidence collection still binds BEFORE's frozen delta", async () => {
+  await withCommittedRepository(async ({ repository, stateRoot, base: A }) => {
+    const { outcome, captured } = await reviewCommitted({
+      repository,
+      stateRoot,
+      extra: {
+        collectCommittedEvidence: async (args) => {
+          git(repository, ["branch", "-f", "base", "HEAD"]);
+          try {
+            return await collectCommittedReviewEvidence(args);
+          } finally {
+            git(repository, ["update-ref", "refs/heads/base", A]);
+          }
+        }
+      }
+    });
+    assert.equal(outcome.status, "completed", JSON.stringify(outcome.error ?? null));
+    assert.equal(outcome.reviewBinding.status, "bound", JSON.stringify(outcome.reviewBinding.reasons));
+    const prompt = captured.prompts[0];
+    assert.match(prompt, new RegExp("Base: refs/heads/base at " + A, "u"));
+    assert.match(prompt, /-export const answer = 41;/u, "the reviewer must see the frozen delta, not an empty diff");
+    assert.match(prompt, /\+export const answer = 42;/u);
+  });
+});
+
+/**
+ * P1-6: the documented target is a mobile branch, so the flow is exercised
+ * with a branch that actually moves. A target that advances while the
+ * reviewer works changes the subject: AFTER no longer matches BEFORE, and
+ * the receipt is refused rather than bound to a delta the review did not
+ * cover.
+ */
+test("a target that moves during the review unbinds the receipt", async () => {
+  await withCommittedRepository(async ({ repository, stateRoot }) => {
+    const captured = { prompts: [], repositoryRoots: [], repository };
+    const writeCustody = new DurableWriteCustodyManager({ stateRoot, inspectProcess });
+    const receiptStore = new ReviewReceiptStore({ stateRoot });
+    const reviewer = capturingReviewer(captured);
+    const outcome = await delegateAgent(
+      {
+        agentType: "code-review",
+        task: "review the committed delta",
+        cwd: repository,
+        targetRef: "refs/heads/base"
+      },
+      {
+        env: {},
+        writeCustody,
+        receiptStore,
+        runAgent: async (args) => {
+          // The target branch advances to HEAD while the reviewer works.
+          git(repository, ["branch", "-f", "base", "HEAD"]);
+          return await reviewer(args);
+        }
+      }
+    );
+    assert.equal(outcome.status, "completed", JSON.stringify(outcome.error ?? null));
+    assert.equal(outcome.reviewBinding.status, "unbound");
+    const codes = outcome.reviewBinding.reasons.map((reason) => reason.code);
+    assert.ok(codes.includes("workspace_mutated_during_review"), codes.join(","));
+    assert.equal(outcome.reviewBinding.reviewId, undefined);
   });
 });

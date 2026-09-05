@@ -6,6 +6,30 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Server = Join-Path $Root "src\index.mjs"
 
+# Must match MINIMUM_RESTRICTED_CLAUDE_VERSION in src/claude-preflight.mjs;
+# pinned equal by tests/installer-toml.test.mjs. Production launches every
+# delegation with --restricted, so a Claude Code that predates the flag fails
+# on the first request and must not be registered as ready.
+$ClaudeMinimumVersion = "2.1.248"
+
+function Test-ClaudeMinimumVersion {
+    param(
+        [string]$VersionLine,
+        [string]$Minimum
+    )
+    $match = [regex]::Match($VersionLine, '(\d+)\.(\d+)\.(\d+)')
+    if (-not $match.Success) { return "unknown" }
+    $minMatch = [regex]::Match($Minimum, '(\d+)\.(\d+)\.(\d+)')
+    if (-not $minMatch.Success) { return "unknown" }
+    foreach ($i in 1..3) {
+        $have = [int]$match.Groups[$i].Value
+        $want = [int]$minMatch.Groups[$i].Value
+        if ($have -gt $want) { return "ok" }
+        if ($have -lt $want) { return "below" }
+    }
+    return "ok"
+}
+
 Write-Host "Checking prerequisites..."
 $Node = (Get-Command node -ErrorAction Stop).Source
 $Npm = (Get-Command npm.cmd -ErrorAction Stop).Source
@@ -25,6 +49,13 @@ if ($NodeMajor -lt 20) {
 $NpmVersion = (& $Npm --version).Trim()
 $CodexVersion = (& $Codex --version | Select-Object -First 1)
 $ClaudeVersion = (& $Claude --version | Select-Object -First 1)
+$ClaudeFloor = Test-ClaudeMinimumVersion -VersionLine $ClaudeVersion -Minimum $ClaudeMinimumVersion
+if ($ClaudeFloor -eq "below") {
+    throw "Claude Code $ClaudeMinimumVersion or newer is required for --restricted; found $ClaudeVersion at $Claude"
+}
+if ($ClaudeFloor -eq "unknown") {
+    Write-Warning "Could not parse a version from '$ClaudeVersion'; continuing without a minimum-version check"
+}
 
 if (-not (Test-Path (Join-Path $Root "node_modules"))) {
     throw "node_modules not found. Run: npm.cmd ci; then run: npm.cmd run ci"

@@ -1,4 +1,5 @@
 import { ClaudeRunnerError } from "./claude-errors.mjs";
+import { REQUIRED_RESTRICTED_FLAG } from "./claude-preflight.mjs";
 
 /**
  * The contract for invoking the Claude CLI: what a runtime policy must contain,
@@ -77,7 +78,9 @@ export function buildClaudeArgs(runtime, settingsPath) {
     "--strict-mcp-config",
     "--settings",
     settingsPath,
-    "--restricted",
+    // The same constant the preflight probes for: the runtime requirement and
+    // the readiness check cannot skew on which flag production needs.
+    REQUIRED_RESTRICTED_FLAG,
     "--no-session-persistence",
     "--no-chrome",
     "--output-format",
